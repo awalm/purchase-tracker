@@ -25,9 +25,10 @@ A buying group tracking application replacing the current Excel-based system.
 | **DB Access** | SQLx | Compile-time SQL verification |
 | **Auth** | JWT + Argon2 | Authentication (backend only) |
 | **Database** | PostgreSQL 15+ | Partitioning, financial data |
-| **Excel Import** | calamine | Rust Excel parsing |
 
 **Security:** React never accesses the database directly. All data flows through authenticated API endpoints.
+
+**Data Import:** Export Excel sheets to CSV, then import via API. No Excel parsing library needed.
 
 ---
 
@@ -463,7 +464,11 @@ Audit:
   GET    /api/audit?table=&record_id=
 
 Import:
-  POST   /api/import/excel
+  POST   /api/import/csv/vendors
+  POST   /api/import/csv/items
+  POST   /api/import/csv/invoices
+  POST   /api/import/csv/purchases
+  POST   /api/import/csv/payouts
 
 Reports:
   GET    /api/reports/summary
@@ -538,7 +543,7 @@ async fn update_purchase(&self, id: Uuid, update: PurchaseUpdate, user_id: Uuid)
 - [ ] Invoice management
 - [ ] Item catalog with date ranges
 - [ ] Payout configuration with date ranges
-- [ ] Excel import functionality
+- [ ] CSV import (one endpoint per table)
 
 ### Phase 3: Polish
 - [ ] Reports and dashboards
