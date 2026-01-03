@@ -713,7 +713,133 @@ async fn update_purchase(&self, id: Uuid, update: PurchaseUpdate, user_id: Uuid)
 
 ---
 
-## 10. Future Extensibility
+## 10. Testing Strategy
+
+### 10.1 Testing Philosophy
+
+**Focus on backend.** Frontend is simple CRUD UI - manual testing is sufficient.
+
+Backend correctness matters because:
+- Financial calculations must be accurate
+- Audit trail must be complete
+- Views must return correct derived data
+- Constraints must prevent bad data
+
+### 10.2 Backend Integration Tests (Primary)
+
+Use `testcontainers-rs` to spin up real Postgres per test run.
+
+```rust
+#[tokio::test]
+async fn test_purchase_creates_audit_log() {
+    let pool = setup_test_db().await;  // spins up Postgres container
+    let service = PurchaseService::new(pool.clone());
+    
+    let purchase = service.create_purchase(CreatePurchase { ... }, user_id).await.unwrap();
+    
+    let audit = sqlx::query_as::<_, AuditLog>(
+        "SELECT * FROM audit_log WHERE record_id = $1"
+    )
+    .bind(purchase.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    
+    assert_eq!(audit.operation, "create");
+    assert_eq!(audit.table_name, "purchases");
+}
+
+#[tokio::test]
+async fn test_purchase_economics_view_calculates_profit() {
+    let pool = setup_test_db().await;
+    
+    // Setup: vendor, item ($50), destination, payout ($75)
+    let vendor_id = create_vendor(&pool, "Best Buy").await;
+    let dest_id = create_destination(&pool, "CBG").await;
+    let item_id = create_item(&pool, "Widget", vendor_id, dec!(50.00)).await;
+    create_payout(&pool, item_id, dest_id, dec!(75.00)).await;
+    
+    // Create purchase
+    let purchase_id = create_purchase(&pool, item_id, dest_id, 2, dec!(50.00)).await;
+    
+    // Query view
+    let economics = sqlx::query_as::<_, PurchaseEconomics>(
+        "SELECT * FROM v_purchase_economics WHERE purchase_id = $1"
+    )
+    .bind(purchase_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    
+    assert_eq!(economics.unit_profit, dec!(25.00));   // 75 - 50
+    assert_eq!(economics.total_profit, dec!(50.00));  // 25 * 2
+}
+```
+
+### 10.3 Test Categories
+
+| Category | Priority | What to Test |
+|----------|----------|--------------|
+| **Views** | High | `v_purchase_economics` profit calculations |
+| **Views** | High | `v_invoice_reconciliation` matching logic |
+| **Views** | High | `v_active_items` / `v_active_payouts` date filtering |
+| **Audit** | High | Every create/update/delete creates audit entry |
+| **Constraints** | Medium | Date range exclusion prevents overlaps |
+| **Constraints** | Medium | FK constraints prevent orphans |
+| **CRUD** | Medium | Basic create, read, update for each entity |
+| **Auth** | Medium | JWT validation, protected routes reject unauthorized |
+| **Import** | Low | CSV parsing, validation errors |
+
+### 10.4 Database Constraint Tests
+
+```rust
+#[tokio::test]
+async fn test_overlapping_item_date_ranges_rejected() {
+    let pool = setup_test_db().await;
+    let vendor_id = create_vendor(&pool, "Best Buy").await;
+    
+    // Create item valid from 2025-01-01 to 2025-06-30
+    create_item_with_dates(&pool, "Widget", vendor_id, "2025-01-01", Some("2025-06-30")).await;
+    
+    // Try to create overlapping item (should fail)
+    let result = create_item_with_dates(&pool, "Widget", vendor_id, "2025-03-01", None).await;
+    
+    assert!(result.is_err());  // Exclusion constraint violation
+}
+```
+
+### 10.5 Test Fixtures
+
+```rust
+// tests/fixtures/mod.rs
+pub async fn setup_test_db() -> PgPool {
+    let container = Postgres::default().start().await;
+    let pool = PgPool::connect(&container.connection_string()).await.unwrap();
+    sqlx::migrate!().run(&pool).await.unwrap();
+    pool
+}
+
+pub async fn seed_realistic_data(pool: &PgPool) {
+    // Mirror original Excel structure
+    // - 5 vendors (Best Buy, Amazon, etc.)
+    // - 2 destinations (CBG, BSC)
+    // - Sample items with payouts
+    // - Mix of reconciled and unreconciled invoices
+}
+```
+
+### 10.6 Frontend Testing (Minimal)
+
+**Skip for v1.** Frontend is simple CRUD forms + TanStack Table grids.
+
+If needed later:
+- Vitest for utility functions only
+- Manual testing for UI flows
+- No E2E (high maintenance, low value for this app)
+
+---
+
+## 11. Future Extensibility
 
 Out of scope for initial release:
 - Webhook automation
