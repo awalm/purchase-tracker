@@ -5,11 +5,12 @@
 A buying group tracking application replacing the current Excel-based system.
 
 **Key Design Decisions:**
-- Payout-driven workflow (payouts inform buying decisions)
-- Catalog-first (items must exist before purchases)
-- API-level audit logging (all mutations tracked)
-- Partitioned tables for scalability and archival
-- Two entity types: Vendors (buy FROM) vs Destinations (sell/ship TO)
+- **Single source of truth:** Tables store raw data only; all derived/computed data lives in VIEWs
+- **Payout-driven workflow:** Payouts inform buying decisions
+- **Catalog-first:** Items must exist before purchases
+- **API-level audit logging:** All mutations tracked (audit_log partitioned monthly)
+- **Two entity types:** Vendors (buy FROM) vs Destinations (sell/ship TO)
+- **Business logic in Rust:** SQL helpers for validation only, decisions computed in application layer
 
 ---
 
@@ -58,7 +59,7 @@ A buying group tracking application replacing the current Excel-based system.
 ```
 ┌─────────────┐     ┌─────────────────┐     ┌──────────────┐
 │   vendors   │     │  incoming_      │     │ destinations │
-│─────────────│     │  invoices ◄P►   │     │──────────────│
+│─────────────│     │  invoices       │     │──────────────│
 │ id (PK)     │◄────│─────────────────│     │ id (PK)      │
 │ name        │     │ id (PK)         │     │ code         │
 │ created_at  │     │ vendor_id (FK)  │     │ name         │
@@ -67,13 +68,13 @@ A buying group tracking application replacing the current Excel-based system.
                     │ invoice_date    │     │ updated_at   │
                     │ total           │     └──────────────┘
                     │ notes           │            ▲
-                    │ created_at ◄────┼── partition key
+                    │ created_at      │            │
                     │ updated_at      │            │
                     └────────┬────────┘            │
                              │                     │
                              ▼                     │
 ┌─────────────┐     ┌─────────────────┐     ┌──────┴───────┐
-│   items     │     │ purchases ◄P►   │     │   payouts    │
+│   items     │     │   purchases     │     │   payouts    │
 │─────────────│     │─────────────────│     │──────────────│
 │ id (PK)     │◄────│ id (PK)         │     │ id (PK)      │
 │ name        │     │ item_id (FK)    │     │ destination_ │
@@ -84,43 +85,82 @@ A buying group tracking application replacing the current Excel-based system.
 │ default_    │     │ status          │     │ end_date     │
 │ destination │     │ delivery_date   │     │ notes        │
 │ notes       │     │ notes           │     │ created_at   │
-│ created_at  │     │ created_at ◄────┼── partition key
-│ updated_at  │     │ updated_at      │     │ updated_at   │
-└─────────────┘     └─────────────────┘     └──────────────┘
+│ created_at  │     │ created_at      │     │ updated_at   │
+│ updated_at  │     │ updated_at      │     └──────────────┘
+└─────────────┘     └─────────────────┘
 
-                    ┌─────────────────┐
-                    │ audit_log ◄P►   │
-                    │─────────────────│
-                    │ id (PK)         │
-                    │ table_name      │
-                    │ record_id       │
-                    │ operation       │
-                    │ old_data (JSONB)│
-                    │ new_data (JSONB)│
-                    │ user_id         │
-                    │ created_at ◄────┼── partition key
-                    └─────────────────┘
+◄P► = Partitioned          VIEWS (derived data)
+                    ┌─────────────────┐     ┌──────────────────┐
+                    │ audit_log ◄P►   │     │ v_purchase_      │
+                    │─────────────────│     │ economics        │
+                    │ id (PK)         │     │──────────────────│
+                    │ table_name      │     │ purchase_id      │
+                    │ record_id       │     │ item_name        │
+                    │ operation       │     │ vendor_name      │
+                    │ old_data (JSONB)│     │ quantity         │
+                    │ new_data (JSONB)│     │ unit_cost        │
+                    │ user_id         │     │ payout_price     │
+                    │ created_at ◄────┼─┐   │ unit_profit      │
+                    └─────────────────┘ │   │ total_profit     │
+                                        │   │ destination      │
+                    partition key ──────┘   │ status           │
+                                            └──────────────────┘
+                                      
+                                            ┌──────────────────┐
+                                            │ v_invoice_       │
+                                            │ reconciliation   │
+                                            │──────────────────│
+                                            │ invoice_id       │
+                                            │ invoice_total    │
+                                            │ purchases_total  │
+                                            │ difference       │
+                                            │ is_matched       │
+                                            └──────────────────┘
 
-◄P► = Partitioned by month (created_at)
+                                            ┌──────────────────┐
+                                            │ v_active_items   │
+                                            │──────────────────│
+                                            │ (items where     │
+                                            │  end_date IS NULL│
+                                            │  or >= today)    │
+                                            └──────────────────┘
+
+                                            ┌──────────────────┐
+                                            │ v_active_payouts │
+                                            │──────────────────│
+                                            │ (payouts where   │
+                                            │  end_date IS NULL│
+                                            │  or >= today)    │
+                                            └──────────────────┘
 ```
 
 ### 3.2 Partitioning Strategy
 
-| Table | Partitioned? | Partition Key | Frequency |
-|-------|--------------|---------------|-----------|
-| `purchases` | ✅ Yes | `created_at` | Monthly |
-| `incoming_invoices` | ✅ Yes | `created_at` | Monthly |
-| `audit_log` | ✅ Yes | `created_at` | Monthly |
-| `items` | ❌ No | - | Small catalog |
-| `payouts` | ❌ No | - | Uses date ranges |
-| `vendors` | ❌ No | - | Tiny, static |
-| `destinations` | ❌ No | - | Tiny, static |
+| Table | Partitioned? | Notes |
+|-------|--------------|-------|
+| `audit_log` | ✅ Yes (monthly) | Grows unbounded, perfect for partitioning |
+| `purchases` | ❌ No (v1) | Can add later via `ATTACH PARTITION` |
+| `incoming_invoices` | ❌ No (v1) | Can add later via `ATTACH PARTITION` |
+| `items` | ❌ No | Small catalog |
+| `payouts` | ❌ No | Uses date ranges |
+| `vendors` | ❌ No | Tiny, static |
+| `destinations` | ❌ No | Tiny, static |
 
-### 3.3 SQL Schema
+### 3.3 Views (Derived Data)
+
+| View | Purpose | Source Tables |
+|------|---------|---------------|
+| `v_purchase_economics` | Profit calculations per purchase | purchases, payouts, items |
+| `v_invoice_reconciliation` | Invoice vs purchases matching | incoming_invoices, purchases |
+| `v_active_items` | Currently valid items | items (filtered by date) |
+| `v_active_payouts` | Currently valid payouts | payouts (filtered by date) |
+| `v_destination_summary` | Totals by destination | purchases, destinations |
+
+### 3.4 SQL Schema
 
 ```sql
 -- ============================================
--- Reference Tables (non-partitioned)
+-- TABLES (Source of Truth - raw data only)
 -- ============================================
 
 -- Vendors (who you BUY from: Best Buy, Amazon, etc.)
@@ -180,10 +220,6 @@ CREATE TABLE payouts (
     )
 );
 
--- ============================================
--- Partitioned Tables
--- ============================================
-
 -- Delivery Status Enum
 CREATE TYPE delivery_status AS ENUM (
     'pending',
@@ -196,24 +232,22 @@ CREATE TYPE delivery_status AS ENUM (
 
 -- Incoming Invoices (from vendors, for reconciliation)
 CREATE TABLE incoming_invoices (
-    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     vendor_id UUID NOT NULL REFERENCES vendors(id),
     invoice_number VARCHAR(100) NOT NULL,
     order_number VARCHAR(100),
     invoice_date DATE NOT NULL,
     total DECIMAL(12, 4) NOT NULL,
-    is_reconciled BOOLEAN NOT NULL DEFAULT FALSE,
     notes TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (id, created_at)
-) PARTITION BY RANGE (created_at);
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- Purchases (main tracking table - replaces BG_Tracking)
 CREATE TABLE purchases (
-    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     item_id UUID NOT NULL REFERENCES items(id),
-    invoice_id UUID,  -- Optional, linked when invoice arrives
+    invoice_id UUID REFERENCES incoming_invoices(id),
     quantity INTEGER NOT NULL CHECK (quantity > 0),
     unit_cost DECIMAL(10, 4) NOT NULL,  -- Snapshot from items at purchase time
     destination_id UUID REFERENCES destinations(id),
@@ -221,11 +255,10 @@ CREATE TABLE purchases (
     delivery_date DATE,
     notes TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (id, created_at)
-) PARTITION BY RANGE (created_at);
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
--- Audit Log (API-level change tracking)
+-- Audit Log (partitioned - grows unbounded)
 CREATE TABLE audit_log (
     id UUID NOT NULL DEFAULT gen_random_uuid(),
     table_name VARCHAR(50) NOT NULL,
@@ -238,24 +271,7 @@ CREATE TABLE audit_log (
     PRIMARY KEY (id, created_at)
 ) PARTITION BY RANGE (created_at);
 
--- ============================================
--- Initial Partitions (2025-2026)
--- ============================================
-
-CREATE TABLE incoming_invoices_2025_11 PARTITION OF incoming_invoices
-    FOR VALUES FROM ('2025-11-01') TO ('2025-12-01');
-CREATE TABLE incoming_invoices_2025_12 PARTITION OF incoming_invoices
-    FOR VALUES FROM ('2025-12-01') TO ('2026-01-01');
-CREATE TABLE incoming_invoices_2026_01 PARTITION OF incoming_invoices
-    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
-
-CREATE TABLE purchases_2025_11 PARTITION OF purchases
-    FOR VALUES FROM ('2025-11-01') TO ('2025-12-01');
-CREATE TABLE purchases_2025_12 PARTITION OF purchases
-    FOR VALUES FROM ('2025-12-01') TO ('2026-01-01');
-CREATE TABLE purchases_2026_01 PARTITION OF purchases
-    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
-
+-- Initial audit_log partitions
 CREATE TABLE audit_log_2025_11 PARTITION OF audit_log
     FOR VALUES FROM ('2025-11-01') TO ('2025-12-01');
 CREATE TABLE audit_log_2025_12 PARTITION OF audit_log
@@ -264,25 +280,144 @@ CREATE TABLE audit_log_2026_01 PARTITION OF audit_log
     FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
 
 -- ============================================
+-- VIEWS (Derived Data - computed, never stored)
+-- ============================================
+
+-- Active items (currently valid pricing)
+CREATE VIEW v_active_items AS
+SELECT 
+    i.id,
+    i.name,
+    i.vendor_id,
+    v.name AS vendor_name,
+    i.unit_cost,
+    i.default_destination_id,
+    d.code AS default_destination_code,
+    i.notes
+FROM items i
+JOIN vendors v ON v.id = i.vendor_id
+LEFT JOIN destinations d ON d.id = i.default_destination_id
+WHERE i.start_date <= CURRENT_DATE
+  AND (i.end_date IS NULL OR i.end_date >= CURRENT_DATE);
+
+-- Active payouts (currently valid payout prices)
+CREATE VIEW v_active_payouts AS
+SELECT 
+    p.id,
+    p.item_id,
+    i.name AS item_name,
+    p.destination_id,
+    d.code AS destination_code,
+    p.payout_price,
+    p.notes
+FROM payouts p
+JOIN items i ON i.id = p.item_id
+JOIN destinations d ON d.id = p.destination_id
+WHERE p.start_date <= CURRENT_DATE
+  AND (p.end_date IS NULL OR p.end_date >= CURRENT_DATE);
+
+-- Purchase economics (profit calculations)
+CREATE VIEW v_purchase_economics AS
+SELECT 
+    p.id AS purchase_id,
+    p.created_at AS purchase_date,
+    i.name AS item_name,
+    v.name AS vendor_name,
+    d.code AS destination_code,
+    p.quantity,
+    p.unit_cost,
+    py.payout_price,
+    (py.payout_price - p.unit_cost) AS unit_profit,
+    (py.payout_price - p.unit_cost) * p.quantity AS total_profit,
+    p.quantity * p.unit_cost AS total_cost,
+    p.quantity * COALESCE(py.payout_price, 0) AS total_revenue,
+    p.status,
+    p.delivery_date,
+    p.invoice_id
+FROM purchases p
+JOIN items i ON i.id = p.item_id
+JOIN vendors v ON v.id = i.vendor_id
+LEFT JOIN destinations d ON d.id = p.destination_id
+LEFT JOIN payouts py ON py.item_id = p.item_id 
+    AND py.destination_id = p.destination_id
+    AND py.start_date <= p.created_at::date
+    AND (py.end_date IS NULL OR py.end_date >= p.created_at::date);
+
+-- Invoice reconciliation (compare invoice total vs sum of purchases)
+CREATE VIEW v_invoice_reconciliation AS
+SELECT 
+    inv.id AS invoice_id,
+    inv.invoice_number,
+    v.name AS vendor_name,
+    inv.invoice_date,
+    inv.total AS invoice_total,
+    COALESCE(SUM(p.quantity * p.unit_cost), 0) AS purchases_total,
+    inv.total - COALESCE(SUM(p.quantity * p.unit_cost), 0) AS difference,
+    ABS(inv.total - COALESCE(SUM(p.quantity * p.unit_cost), 0)) < 0.01 AS is_matched,
+    COUNT(p.id) AS purchase_count
+FROM incoming_invoices inv
+JOIN vendors v ON v.id = inv.vendor_id
+LEFT JOIN purchases p ON p.invoice_id = inv.id
+GROUP BY inv.id, inv.invoice_number, v.name, inv.invoice_date, inv.total;
+
+-- Destination summary (totals by destination)
+CREATE VIEW v_destination_summary AS
+SELECT 
+    d.id AS destination_id,
+    d.code AS destination_code,
+    d.name AS destination_name,
+    COUNT(p.id) AS total_purchases,
+    SUM(p.quantity) AS total_quantity,
+    SUM(p.quantity * p.unit_cost) AS total_cost,
+    SUM(pe.total_profit) AS total_profit
+FROM destinations d
+LEFT JOIN purchases p ON p.destination_id = d.id
+LEFT JOIN v_purchase_economics pe ON pe.purchase_id = p.id
+GROUP BY d.id, d.code, d.name;
+
+-- Vendor summary (totals by vendor)
+CREATE VIEW v_vendor_summary AS
+SELECT 
+    v.id AS vendor_id,
+    v.name AS vendor_name,
+    COUNT(DISTINCT inv.id) AS total_invoices,
+    COUNT(p.id) AS total_purchases,
+    SUM(p.quantity) AS total_quantity,
+    SUM(p.quantity * p.unit_cost) AS total_spent
+FROM vendors v
+LEFT JOIN items i ON i.vendor_id = v.id
+LEFT JOIN purchases p ON p.item_id = i.id
+LEFT JOIN incoming_invoices inv ON inv.vendor_id = v.id
+GROUP BY v.id, v.name;
+
+-- ============================================
 -- Indexes
 -- ============================================
 
-CREATE INDEX idx_items_name_vendor ON items(name, vendor_id);
+-- Items: lookup by vendor, date range filtering
 CREATE INDEX idx_items_vendor ON items(vendor_id);
-CREATE INDEX idx_items_date_range ON items(start_date, end_date);
+CREATE INDEX idx_items_active ON items(vendor_id) 
+    WHERE end_date IS NULL OR end_date >= CURRENT_DATE;
 
+-- Payouts: lookup by item+destination, date range filtering  
 CREATE INDEX idx_payouts_item_destination ON payouts(item_id, destination_id);
-CREATE INDEX idx_payouts_date_range ON payouts(start_date, end_date);
+CREATE INDEX idx_payouts_active ON payouts(item_id, destination_id) 
+    WHERE end_date IS NULL OR end_date >= CURRENT_DATE;
 
+-- Purchases: common query patterns
 CREATE INDEX idx_purchases_item ON purchases(item_id);
 CREATE INDEX idx_purchases_invoice ON purchases(invoice_id);
 CREATE INDEX idx_purchases_destination ON purchases(destination_id);
 CREATE INDEX idx_purchases_status ON purchases(status);
+CREATE INDEX idx_purchases_created ON purchases(created_at);
 
-CREATE INDEX idx_incoming_invoices_vendor ON incoming_invoices(vendor_id);
-CREATE INDEX idx_incoming_invoices_number ON incoming_invoices(invoice_number);
+-- Invoices: lookup patterns
+CREATE INDEX idx_invoices_vendor ON incoming_invoices(vendor_id);
+CREATE INDEX idx_invoices_number ON incoming_invoices(invoice_number);
+CREATE INDEX idx_invoices_date ON incoming_invoices(invoice_date);
 
-CREATE INDEX idx_audit_log_table_record ON audit_log(table_name, record_id);
+-- Audit log: lookup by table+record
+CREATE INDEX idx_audit_table_record ON audit_log(table_name, record_id);
 
 -- ============================================
 -- Triggers
@@ -310,36 +445,39 @@ CREATE TRIGGER update_purchases_updated_at BEFORE UPDATE ON purchases
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================
--- Helper Functions
+-- Helper Functions (validation only - business logic in Rust)
 -- ============================================
 
-CREATE OR REPLACE FUNCTION get_item_cost(
-    p_item_name VARCHAR,
-    p_vendor_id UUID,
+-- Check if item is valid for a given date (use for validation, not business logic)
+CREATE OR REPLACE FUNCTION is_item_valid(
+    p_item_id UUID,
     p_date DATE DEFAULT CURRENT_DATE
-) RETURNS DECIMAL AS $$
-    SELECT unit_cost FROM items
-    WHERE name = p_item_name
-      AND vendor_id = p_vendor_id
-      AND start_date <= p_date
-      AND (end_date IS NULL OR end_date >= p_date)
-    LIMIT 1;
+) RETURNS BOOLEAN AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM items
+        WHERE id = p_item_id
+          AND start_date <= p_date
+          AND (end_date IS NULL OR end_date >= p_date)
+    );
 $$ LANGUAGE SQL;
 
-CREATE OR REPLACE FUNCTION get_payout_price(
+-- Check if payout exists for item/destination on date
+CREATE OR REPLACE FUNCTION has_payout(
     p_item_id UUID,
     p_destination_id UUID,
     p_date DATE DEFAULT CURRENT_DATE
-) RETURNS DECIMAL AS $$
-    SELECT payout_price FROM payouts
-    WHERE item_id = p_item_id
-      AND destination_id = p_destination_id
-      AND start_date <= p_date
-      AND (end_date IS NULL OR end_date >= p_date)
-    LIMIT 1;
+) RETURNS BOOLEAN AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM payouts
+        WHERE item_id = p_item_id
+          AND destination_id = p_destination_id
+          AND start_date <= p_date
+          AND (end_date IS NULL OR end_date >= p_date)
+    );
 $$ LANGUAGE SQL;
 
-CREATE OR REPLACE FUNCTION create_monthly_partitions(p_year INT, p_month INT)
+-- Create audit_log partition for a month
+CREATE OR REPLACE FUNCTION create_audit_partition(p_year INT, p_month INT)
 RETURNS VOID AS $$
 DECLARE
     start_date DATE;
@@ -350,14 +488,6 @@ BEGIN
     end_date := start_date + INTERVAL '1 month';
     partition_suffix := to_char(start_date, 'YYYY_MM');
     
-    EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS incoming_invoices_%s PARTITION OF incoming_invoices FOR VALUES FROM (%L) TO (%L)',
-        partition_suffix, start_date, end_date
-    );
-    EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS purchases_%s PARTITION OF purchases FOR VALUES FROM (%L) TO (%L)',
-        partition_suffix, start_date, end_date
-    );
     EXECUTE format(
         'CREATE TABLE IF NOT EXISTS audit_log_%s PARTITION OF audit_log FOR VALUES FROM (%L) TO (%L)',
         partition_suffix, start_date, end_date
@@ -510,22 +640,27 @@ async fn update_purchase(&self, id: Uuid, update: PurchaseUpdate, user_id: Uuid)
 ## 7. Key Features
 
 ### 7.1 Purchases View (Main Grid)
-- Data grid mirroring current Excel `BG_Tracking` sheet
+- Query `v_purchase_economics` for display (all profit calculations derived)
 - Filtering by vendor, destination, status, date range
 - Bulk status updates
-- Export to CSV/Excel
+- Export to CSV
 
 ### 7.2 Invoice Management
-- Invoice list with reconciliation status
-- Auto-reconciliation (sum of linked purchases vs invoice total)
+- Query `v_invoice_reconciliation` for matching status
+- Auto-reconciliation computed from view (never stored)
 
 ### 7.3 Item Catalog
-- Per-vendor pricing with date ranges
-- Default destination assignment
+- Query `v_active_items` for currently valid items
+- Historical items visible by querying `items` table directly
 
 ### 7.4 Payout Configuration
-- Payout prices per destination with date ranges
-- Historical payout tracking
+- Query `v_active_payouts` for currently valid payouts
+- Historical payouts visible by querying `payouts` table directly
+
+### 7.5 Reports
+- Query `v_destination_summary` for destination totals
+- Query `v_vendor_summary` for vendor totals
+- All aggregations computed on-demand from views
 
 ---
 
@@ -553,10 +688,36 @@ async fn update_purchase(&self, id: Uuid, update: PurchaseUpdate, user_id: Uuid)
 
 ---
 
-## 9. Future Extensibility
+## 9. Design Principles
+
+### 9.1 Single Source of Truth
+- **Tables** store raw, user-entered data only
+- **Views** compute all derived/calculated values
+- **Never** store computed values in tables (no `is_reconciled` flag, no `total_profit` column)
+
+### 9.2 SQL vs Rust Responsibilities
+
+| Responsibility | Where | Example |
+|----------------|-------|---------|
+| Data storage | Tables | `purchases`, `items`, `payouts` |
+| Computed display | Views | `v_purchase_economics`, `v_invoice_reconciliation` |
+| Validation | SQL functions | `is_item_valid()`, `has_payout()` |
+| Business decisions | Rust | "Should I buy this item?", "What-if scenarios" |
+| Audit logging | Rust | Write to `audit_log` in same transaction |
+
+### 9.3 Rust Best Practices
+- Keep Axum handlers thin (delegate to `services/`)
+- Write integration tests that spin up Postgres via Docker
+- Avoid over-abstracting with traits early
+- Avoid building a generic repository layer
+
+---
+
+## 10. Future Extensibility
 
 Out of scope for initial release:
 - Webhook automation
-- Outgoing invoice generation
+- Outgoing invoice generation  
 - Email notifications
 - Tax tracking details
+- Partitioning for `purchases`/`incoming_invoices` (add via `ATTACH PARTITION` when needed)
