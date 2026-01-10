@@ -1,0 +1,106 @@
+import { Routes, Route, Navigate } from "react-router-dom"
+import { useAuth } from "@/AuthContext"
+import { Layout } from "@/components/Layout"
+import LoginPage from "@/pages/LoginPage"
+import DashboardPage from "@/pages/DashboardPage"
+import VendorsPage from "@/pages/VendorsPage"
+import DestinationsPage from "@/pages/DestinationsPage"
+import ItemsPage from "@/pages/ItemsPage"
+import PayoutsPage from "@/pages/PayoutsPage"
+import InvoicesPage from "@/pages/InvoicesPage"
+import PurchasesPage from "@/pages/PurchasesPage"
+
+function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  const { user, isLoading } = useAuth()
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <p className="text-muted-foreground">Loading...</p>
+      </div>
+    )
+  }
+
+  if (!user) {
+    return <Navigate to="/login" replace />
+  }
+
+  return <Layout>{children}</Layout>
+}
+
+export default function App() {
+  const { user, isLoading } = useAuth()
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <p className="text-muted-foreground">Loading...</p>
+      </div>
+    )
+  }
+
+  return (
+    <Routes>
+      <Route
+        path="/login"
+        element={user ? <Navigate to="/" replace /> : <LoginPage />}
+      />
+      <Route
+        path="/"
+        element={
+          <ProtectedRoute>
+            <DashboardPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/vendors"
+        element={
+          <ProtectedRoute>
+            <VendorsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/destinations"
+        element={
+          <ProtectedRoute>
+            <DestinationsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/items"
+        element={
+          <ProtectedRoute>
+            <ItemsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/payouts"
+        element={
+          <ProtectedRoute>
+            <PayoutsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/invoices"
+        element={
+          <ProtectedRoute>
+            <InvoicesPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/purchases"
+        element={
+          <ProtectedRoute>
+            <PurchasesPage />
+          </ProtectedRoute>
+        }
+      />
+    </Routes>
+  )
+}

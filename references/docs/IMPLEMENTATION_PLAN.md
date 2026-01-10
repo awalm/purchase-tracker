@@ -498,6 +498,103 @@ $$ LANGUAGE plpgsql;
 
 ---
 
+### 3.5 SQLx Compile-Time Verification Guidelines
+
+SQLx provides compile-time SQL verification by checking queries against the actual database schema. This catches SQL errors at compile time rather than runtime.
+
+#### Environment Setup
+
+```bash
+# Required for SQLx compile-time checking
+export DATABASE_URL="postgresql://bgtracker:bgtracker@localhost:5432/bgtracker"
+
+# Or use a .env file in the backend directory
+echo 'DATABASE_URL=postgresql://bgtracker:bgtracker@localhost:5432/bgtracker' > backend/.env
+```
+
+#### View Columns and Nullable Types
+
+When querying from SQL views, SQLx treats all columns as potentially nullable because view columns don't inherit `NOT NULL` constraints from base tables. Use the `"column_name!"` syntax to assert non-null:
+
+```rust
+// ❌ WRONG: SQLx sees view columns as nullable
+sqlx::query_as!(
+    MyStruct,
+    r#"SELECT id, name FROM v_my_view"#
+)
+
+// ✅ CORRECT: Assert non-null columns with "column!"
+sqlx::query_as!(
+    MyStruct,
+    r#"SELECT 
+        id as "id!",
+        name as "name!",
+        optional_field  -- leave as-is for nullable
+    FROM v_my_view"#
+)
+```
+
+#### Enum Types
+
+For PostgreSQL enums, use the type annotation syntax:
+
+```rust
+sqlx::query_as!(
+    Purchase,
+    r#"SELECT 
+        status as "status: DeliveryStatus",
+        -- or for non-null assertion from views:
+        status as "status!: DeliveryStatus"
+    FROM purchases"#
+)
+```
+
+#### Generic Type Inference for Option<T>
+
+When passing `None` to generic functions, Rust needs type hints:
+
+```rust
+// ❌ WRONG: Type cannot be inferred
+AuditService::log(pool, "table", id, "create", None, Some(&data), user_id)
+
+// ✅ CORRECT: Provide type annotation
+AuditService::log(pool, "table", id, "create", None::<&MyType>, Some(&data), user_id)
+```
+
+#### Development Workflow
+
+```bash
+# 1. Start the database
+docker compose up -d db
+
+# 2. Run migrations (database must be running)
+cd backend && sqlx migrate run
+
+# 3. Build (requires running database for compile-time checks)
+cargo build
+
+# 4. If offline mode is needed (CI/CD):
+cargo sqlx prepare  # Generates .sqlx/ directory with query metadata
+```
+
+#### Partial Index Limitations
+
+Partial indexes with `CURRENT_DATE` cannot be used because `CURRENT_DATE` is not immutable. Use explicit date filtering in queries instead:
+
+```sql
+-- ❌ WRONG: Partial index with CURRENT_DATE (won't work)
+CREATE INDEX idx_items_active ON items(vendor_id) 
+    WHERE end_date IS NULL OR end_date >= CURRENT_DATE;
+
+-- ✅ CORRECT: Regular index, filter in query
+CREATE INDEX idx_items_active ON items(vendor_id);
+
+-- Then in Rust:
+sqlx::query!("SELECT * FROM items WHERE end_date IS NULL OR end_date >= CURRENT_DATE")
+```
+
+---
+
 ## 4. Project Structure
 
 ```
