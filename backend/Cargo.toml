@@ -5,10 +5,11 @@ edition = "2021"
 
 [dependencies]
 # Web framework
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+tempfile = "3"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "rust_decimal", "json"] }
@@ -24,7 +25,7 @@ argon2 = "0.5"
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-rust_decimal = { version = "1", features = ["serde"] }
+rust_decimal = { version = "1", features = ["serde", "macros"] }
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"

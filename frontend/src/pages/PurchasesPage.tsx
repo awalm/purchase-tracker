@@ -1,4 +1,5 @@
 import { useState } from "react"
+import { useQueryClient } from "@tanstack/react-query"
 import {
   usePurchases,
   useCreatePurchase,
@@ -8,6 +9,7 @@ import {
   useDestinations,
   useInvoices,
 } from "@/hooks/useApi"
+import { importApi, type PurchasePreview, type PreviewRow } from "@/api"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -34,15 +36,51 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Plus, Trash2 } from "lucide-react"
+import { ImportDialog } from "@/components/ImportDialog"
+import { ExportCsvButton } from "@/components/ExportCsvButton"
+import { StatusSelect } from "@/components/StatusSelect"
+import { EmptyTableRow } from "@/components/EmptyTableRow"
+import { Plus, Trash2, Pencil } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
-import { StatusBadge } from "@/components/ui/status-badge"
+import { PURCHASE_STATUSES } from "@/lib/constants"
 
-const STATUSES = ["pending", "in_transit", "delivered", "damaged", "returned", "lost"]
+function PurchasePreviewTable({ rows }: { rows: PreviewRow<PurchasePreview>[] }) {
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="w-12">Row</TableHead>
+          <TableHead>Item</TableHead>
+          <TableHead>Vendor</TableHead>
+          <TableHead>Qty</TableHead>
+          <TableHead>Cost</TableHead>
+          <TableHead>Dest</TableHead>
+          <TableHead>Date</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {rows.map((row) => (
+          <TableRow key={row.row}>
+            <TableCell className="text-muted-foreground">{row.row}</TableCell>
+            <TableCell>{row.data.item_name}</TableCell>
+            <TableCell>{row.data.vendor_name}</TableCell>
+            <TableCell>{row.data.quantity}</TableCell>
+            <TableCell>${row.data.purchase_cost}</TableCell>
+            <TableCell className="font-mono">{row.data.destination_code || "-"}</TableCell>
+            <TableCell>{row.data.date}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  )
+}
+
 
 export default function PurchasesPage() {
+  const queryClient = useQueryClient()
   const [statusFilter, setStatusFilter] = useState<string>("")
   const [destFilter, setDestFilter] = useState<string>("")
+  const [isImporting, setIsImporting] = useState(false)
   
   const { data: purchases = [], isLoading } = usePurchases({
     status: statusFilter || undefined,
@@ -57,34 +95,68 @@ export default function PurchasesPage() {
   const deletePurchase = useDeletePurchase()
 
   const [isOpen, setIsOpen] = useState(false)
+  const [editingPurchaseId, setEditingPurchaseId] = useState<string | null>(null)
   const [itemId, setItemId] = useState("")
   const [quantity, setQuantity] = useState("1")
-  const [unitCost, setUnitCost] = useState("")
+  const [purchaseCost, setPurchaseCost] = useState("")
+  const [sellingPrice, setSellingPrice] = useState("")
   const [destinationId, setDestinationId] = useState("")
   const [invoiceId, setInvoiceId] = useState("")
   const [notes, setNotes] = useState("")
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    await createPurchase.mutateAsync({
-      item_id: itemId,
-      quantity: parseInt(quantity),
-      unit_cost: unitCost,
-      destination_id: destinationId || undefined,
-      invoice_id: invoiceId || undefined,
-      notes: notes || undefined,
-    })
+    if (editingPurchaseId) {
+      await updatePurchase.mutateAsync({
+        id: editingPurchaseId,
+        item_id: itemId,
+        quantity: parseInt(quantity),
+        purchase_cost: purchaseCost,
+        selling_price: sellingPrice || undefined,
+        destination_id: destinationId || undefined,
+        invoice_id: invoiceId || undefined,
+        clear_invoice: !invoiceId,
+        notes: notes || undefined,
+      })
+    } else {
+      await createPurchase.mutateAsync({
+        item_id: itemId,
+        quantity: parseInt(quantity),
+        purchase_cost: purchaseCost,
+        selling_price: sellingPrice || undefined,
+        destination_id: destinationId || undefined,
+        invoice_id: invoiceId || undefined,
+        notes: notes || undefined,
+      })
+    }
+    queryClient.invalidateQueries({ queryKey: ["invoices"] })
     setIsOpen(false)
     resetForm()
   }
 
   const resetForm = () => {
+    setEditingPurchaseId(null)
     setItemId("")
     setQuantity("1")
-    setUnitCost("")
+    setPurchaseCost("")
+    setSellingPrice("")
     setDestinationId("")
     setInvoiceId("")
     setNotes("")
+  }
+
+  const handleEdit = (p: typeof purchases[0]) => {
+    setEditingPurchaseId(p.purchase_id)
+    const matchedItem = items.find((i) => i.name === p.item_name)
+    setItemId(matchedItem?.id || "")
+    setQuantity(String(p.quantity))
+    setPurchaseCost(p.purchase_cost)
+    setSellingPrice(p.selling_price || "")
+    const matchedDest = destinations.find((d) => d.code === p.destination_code)
+    setDestinationId(matchedDest?.id || "")
+    setInvoiceId(p.invoice_id || "")
+    setNotes("")
+    setIsOpen(true)
   }
 
   const handleStatusChange = async (purchaseId: string, newStatus: string) => {
@@ -102,7 +174,7 @@ export default function PurchasesPage() {
     setItemId(id)
     const item = items.find((i) => i.id === id)
     if (item) {
-      setUnitCost(item.unit_cost)
+      setPurchaseCost(item.purchase_cost)
       if (item.default_destination_id) {
         setDestinationId(item.default_destination_id)
       }
@@ -115,19 +187,63 @@ export default function PurchasesPage() {
     <div className="space-y-6">
       <div className="flex justify-between items-center">
         <h1 className="text-2xl font-bold">Purchases</h1>
-        <Dialog open={isOpen} onOpenChange={(open) => {
-          setIsOpen(open)
-          if (!open) resetForm()
-        }}>
-          <DialogTrigger asChild>
-            <Button>
-              <Plus className="h-4 w-4 mr-2" />
-              Add Purchase
-            </Button>
-          </DialogTrigger>
+        <div className="flex gap-2">
+          <ExportCsvButton
+            filename="purchases"
+            columns={[
+              { header: "Date", accessor: (p) => p.purchase_date?.split("T")[0] },
+              { header: "Item", accessor: (p) => p.item_name },
+              { header: "Vendor", accessor: (p) => p.vendor_name },
+              { header: "Destination", accessor: (p) => p.destination_code },
+              { header: "Quantity", accessor: (p) => p.quantity },
+              { header: "Purchase Cost", accessor: (p) => p.purchase_cost },
+              { header: "Total Cost", accessor: (p) => p.total_cost },
+              { header: "Selling Price", accessor: (p) => p.selling_price },
+              { header: "Total Price", accessor: (p) => p.total_selling },
+              { header: "Commission", accessor: (p) => p.total_commission },
+              { header: "Status", accessor: (p) => p.status },
+              { header: "Delivery Date", accessor: (p) => p.delivery_date },
+            ]}
+            data={purchases}
+          />
+          <ImportDialog<PurchasePreview>
+            entityName="Purchases"
+            columns={[
+              { name: "item", required: true, description: "Item name (must exist)" },
+              { name: "quantity", required: true, description: "Quantity purchased" },
+              { name: "purchase_cost", required: true, description: "Cost per unit" },
+              { name: "destination", required: false, description: "Destination code" },
+              { name: "date", required: false, description: "Purchase date (YYYY-MM-DD)" },
+              { name: "invoice", required: false, description: "Invoice number" },
+              { name: "notes", required: false, description: "Optional notes" },
+            ]}
+            exampleCsv="item,quantity,purchase_cost,destination,date\nWidget A,10,9.99,CBG,2024-01-15"
+            onPreview={importApi.purchasesPreview}
+            onImport={async (csv) => {
+              setIsImporting(true)
+              try {
+                return await importApi.purchases(csv)
+              } finally {
+                setIsImporting(false)
+              }
+            }}
+            renderPreviewTable={(rows) => <PurchasePreviewTable rows={rows} />}
+            isPending={isImporting}
+            onSuccess={() => queryClient.invalidateQueries({ queryKey: ["purchases"] })}
+          />
+          <Dialog open={isOpen} onOpenChange={(open) => {
+            setIsOpen(open)
+            if (!open) resetForm()
+          }}>
+            <DialogTrigger asChild>
+              <Button>
+                <Plus className="h-4 w-4 mr-2" />
+                Add Purchase
+              </Button>
+            </DialogTrigger>
           <DialogContent className="max-w-md">
             <DialogHeader>
-              <DialogTitle>Add Purchase</DialogTitle>
+              <DialogTitle>{editingPurchaseId ? "Edit Purchase" : "Add Purchase"}</DialogTitle>
             </DialogHeader>
             <form onSubmit={handleSubmit} className="space-y-4">
               <div className="space-y-2">
@@ -139,7 +255,7 @@ export default function PurchasesPage() {
                   <SelectContent>
                     {items.map((i) => (
                       <SelectItem key={i.id} value={i.id}>
-                        {i.name} ({i.vendor_name}) - {formatCurrency(i.unit_cost)}
+                        {i.name} ({i.vendor_name}) - {formatCurrency(i.purchase_cost)}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -151,24 +267,34 @@ export default function PurchasesPage() {
                   <Input
                     id="quantity"
                     type="number"
-                    min="1"
                     value={quantity}
                     onChange={(e) => setQuantity(e.target.value)}
                     required
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="unitCost">Unit Cost</Label>
+                  <Label htmlFor="purchaseCost">Purchase Cost</Label>
                   <Input
-                    id="unitCost"
+                    id="purchaseCost"
                     type="number"
                     step="0.01"
-                    value={unitCost}
-                    onChange={(e) => setUnitCost(e.target.value)}
+                    value={purchaseCost}
+                    onChange={(e) => setPurchaseCost(e.target.value)}
                     placeholder="0.00"
                     required
                   />
                 </div>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="sellingPrice">Selling Price (optional)</Label>
+                <Input
+                  id="sellingPrice"
+                  type="number"
+                  step="0.01"
+                  value={sellingPrice}
+                  onChange={(e) => setSellingPrice(e.target.value)}
+                  placeholder="0.00"
+                />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="destination">Destination</Label>
@@ -187,11 +313,14 @@ export default function PurchasesPage() {
               </div>
               <div className="space-y-2">
                 <Label htmlFor="invoice">Invoice (optional)</Label>
-                <Select value={invoiceId} onValueChange={setInvoiceId}>
+                <Select value={invoiceId || "__none__"} onValueChange={(v) => setInvoiceId(v === "__none__" ? "" : v)}>
                   <SelectTrigger>
                     <SelectValue placeholder="Select invoice" />
                   </SelectTrigger>
                   <SelectContent>
+                    <SelectItem value="__none__">
+                      <span className="text-muted-foreground">— No invoice</span>
+                    </SelectItem>
                     {invoices.map((inv) => (
                       <SelectItem key={inv.id} value={inv.id}>
                         {inv.invoice_number} - {formatCurrency(inv.total)}
@@ -213,13 +342,14 @@ export default function PurchasesPage() {
                 <Button type="button" variant="outline" onClick={() => setIsOpen(false)}>
                   Cancel
                 </Button>
-                <Button type="submit" disabled={createPurchase.isPending}>
-                  Create
+                <Button type="submit" disabled={createPurchase.isPending || updatePurchase.isPending}>
+                  {editingPurchaseId ? "Save Changes" : "Create"}
                 </Button>
               </div>
             </form>
           </DialogContent>
         </Dialog>
+        </div>
       </div>
 
       {/* Filters */}
@@ -228,13 +358,13 @@ export default function PurchasesPage() {
           <div className="flex gap-4">
             <div className="w-48">
               <Label className="mb-2 block">Status</Label>
-              <Select value={statusFilter} onValueChange={setStatusFilter}>
+              <Select value={statusFilter || "all"} onValueChange={(v) => setStatusFilter(v === "all" ? "" : v)}>
                 <SelectTrigger>
                   <SelectValue placeholder="All statuses" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="">All statuses</SelectItem>
-                  {STATUSES.map((s) => (
+                  <SelectItem value="all">All statuses</SelectItem>
+                  {PURCHASE_STATUSES.map((s) => (
                     <SelectItem key={s} value={s}>
                       {s.replace("_", " ")}
                     </SelectItem>
@@ -244,12 +374,12 @@ export default function PurchasesPage() {
             </div>
             <div className="w-48">
               <Label className="mb-2 block">Destination</Label>
-              <Select value={destFilter} onValueChange={setDestFilter}>
+              <Select value={destFilter || "all"} onValueChange={(v) => setDestFilter(v === "all" ? "" : v)}>
                 <SelectTrigger>
                   <SelectValue placeholder="All destinations" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="">All destinations</SelectItem>
+                  <SelectItem value="all">All destinations</SelectItem>
                   {destinations.map((d) => (
                     <SelectItem key={d.id} value={d.id}>
                       {d.code}
@@ -276,12 +406,13 @@ export default function PurchasesPage() {
                 <TableHead>Item</TableHead>
                 <TableHead>Vendor</TableHead>
                 <TableHead>Dest</TableHead>
+                <TableHead>Invoice</TableHead>
                 <TableHead className="text-right">Qty</TableHead>
                 <TableHead className="text-right">Cost</TableHead>
-                <TableHead className="text-right">Payout</TableHead>
-                <TableHead className="text-right">Profit</TableHead>
+                <TableHead className="text-right">Selling</TableHead>
+                <TableHead className="text-right">Commission</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead className="w-16">Actions</TableHead>
+                <TableHead className="w-20">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -291,56 +422,49 @@ export default function PurchasesPage() {
                   <TableCell className="font-medium">{p.item_name}</TableCell>
                   <TableCell>{p.vendor_name}</TableCell>
                   <TableCell>{p.destination_code || "-"}</TableCell>
-                  <TableCell className="text-right">{p.quantity}</TableCell>
-                  <TableCell className="text-right">{formatCurrency(p.total_cost)}</TableCell>
-                  <TableCell className="text-right">
-                    {p.payout_price ? formatCurrency(p.total_revenue) : "-"}
+                  <TableCell>
+                    {p.invoice_id ? (
+                      <span className="text-xs font-mono text-blue-600">
+                        {invoices.find(inv => inv.id === p.invoice_id)?.invoice_number || "linked"}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground">—</span>
+                    )}
                   </TableCell>
-                  <TableCell
-                    className={`text-right font-medium ${
-                      parseFloat(p.total_profit || "0") >= 0
-                        ? "text-green-600"
-                        : "text-red-600"
-                    }`}
-                  >
-                    {p.total_profit ? formatCurrency(p.total_profit) : "-"}
+                  <TableCell className="text-right">{p.quantity}</TableCell>
+                  <TableCell className="text-right text-muted-foreground">{formatCurrency(p.total_cost)}</TableCell>
+                  <TableCell className="text-right">{p.total_selling ? formatCurrency(p.total_selling) : "-"}</TableCell>
+                  <TableCell className={`text-right ${p.total_commission ? (parseFloat(p.total_commission) >= 0 ? "text-green-600" : "text-red-600") : ""}`}>
+                    {p.total_commission ? formatCurrency(p.total_commission) : "-"}
                   </TableCell>
                   <TableCell>
-                    <Select
+                    <StatusSelect
                       value={p.status}
                       onValueChange={(value) => handleStatusChange(p.purchase_id, value)}
-                    >
-                      <SelectTrigger className="w-28 h-8">
-                        <StatusBadge status={p.status} />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {STATUSES.map((s) => (
-                          <SelectItem key={s} value={s}>
-                            {s.replace("_", " ")}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                    />
                   </TableCell>
                   <TableCell>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="text-red-600"
-                      onClick={() => handleDelete(p.purchase_id)}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
+                    <div className="flex gap-1">
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => handleEdit(p)}
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="text-red-600"
+                        onClick={() => handleDelete(p.purchase_id)}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}
-              {purchases.length === 0 && (
-                <TableRow>
-                  <TableCell colSpan={10} className="text-center text-muted-foreground">
-                    No purchases yet
-                  </TableCell>
-                </TableRow>
-              )}
+              {purchases.length === 0 && <EmptyTableRow colSpan={11} message="No purchases yet" />}
             </TableBody>
           </Table>
         </CardContent>

@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
-import { vendors, destinations, items, payouts, invoices, purchases, reports } from "@/api"
+import { vendors, destinations, items, invoices, purchases, reports } from "@/api"
 
 // ============================================
 // Vendors
@@ -86,8 +86,9 @@ export function useCreateItem() {
     mutationFn: (data: {
       name: string
       vendor_id: string
-      unit_cost: string
+      purchase_cost: string
       start_date: string
+      end_date?: string
       default_destination_id?: string
       notes?: string
     }) => items.create(data),
@@ -112,38 +113,6 @@ export function useDeleteItem() {
 }
 
 // ============================================
-// Payouts
-// ============================================
-export function usePayouts() {
-  return useQuery({
-    queryKey: ["payouts"],
-    queryFn: payouts.list,
-  })
-}
-
-export function useCreatePayout() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (data: {
-      destination_id: string
-      item_id: string
-      payout_price: string
-      start_date: string
-      notes?: string
-    }) => payouts.create(data),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["payouts"] }),
-  })
-}
-
-export function useDeletePayout() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (id: string) => payouts.delete(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["payouts"] }),
-  })
-}
-
-// ============================================
 // Invoices
 // ============================================
 export function useInvoices() {
@@ -153,17 +122,43 @@ export function useInvoices() {
   })
 }
 
+export function useInvoice(id: string) {
+  return useQuery({
+    queryKey: ["invoices", id],
+    queryFn: () => invoices.get(id),
+    enabled: !!id,
+  })
+}
+
+export function useInvoicePurchases(id: string) {
+  return useQuery({
+    queryKey: ["invoices", id, "purchases"],
+    queryFn: () => invoices.purchases(id),
+    enabled: !!id,
+  })
+}
+
 export function useCreateInvoice() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (data: {
-      vendor_id: string
+      destination_id: string
       invoice_number: string
       order_number?: string
       invoice_date: string
-      total: string
+      subtotal: string
+      tax_rate?: string
       notes?: string
     }) => invoices.create(data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["invoices"] }),
+  })
+}
+
+export function useUpdateInvoice() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...data }: { id: string } & Record<string, unknown>) =>
+      invoices.update(id, data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["invoices"] }),
   })
 }
@@ -192,9 +187,11 @@ export function useCreatePurchase() {
     mutationFn: (data: {
       item_id: string
       quantity: number
-      unit_cost: string
+      purchase_cost: string
+      selling_price?: string
       destination_id?: string
       invoice_id?: string
+      status?: string
       notes?: string
     }) => purchases.create(data),
     onSuccess: () => {

@@ -95,16 +95,18 @@ export const items = {
       name: string;
       vendor_id: string;
       vendor_name: string;
-      unit_cost: string;
+      purchase_cost: string;
       default_destination_id: string | null;
       default_destination_code: string | null;
       notes: string | null;
-    }[]>('/items'),
+      created_at: string;
+    }[]>('/items/active'),
   create: (data: {
     name: string;
     vendor_id: string;
-    unit_cost: string;
+    purchase_cost: string;
     start_date: string;
+    end_date?: string;
     default_destination_id?: string;
     notes?: string;
   }) =>
@@ -121,59 +123,107 @@ export const items = {
     request<void>(`/items/${id}`, { method: 'DELETE' }),
 };
 
-// Payouts
-export const payouts = {
-  list: () =>
-    request<{
-      id: string;
-      item_id: string;
-      item_name: string;
-      destination_id: string;
-      destination_code: string;
-      payout_price: string;
-      notes: string | null;
-    }[]>('/payouts'),
-  create: (data: {
-    destination_id: string;
-    item_id: string;
-    payout_price: string;
-    start_date: string;
-    notes?: string;
-  }) =>
-    request<{ id: string }>('/payouts', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    }),
-  delete: (id: string) =>
-    request<void>(`/payouts/${id}`, { method: 'DELETE' }),
-};
-
 // Invoices
 export const invoices = {
   list: () =>
     request<{
       id: string;
-      vendor_id: string;
+      destination_id: string;
+      destination_code: string;
+      destination_name: string;
       invoice_number: string;
       order_number: string | null;
       invoice_date: string;
+      subtotal: string;
+      tax_rate: string;
       total: string;
+      has_pdf: boolean | null;
       notes: string | null;
+      created_at: string;
+      updated_at: string;
+      purchase_count: number | null;
+      purchases_total: string | null;
+      total_cost: string | null;
+      total_commission: string | null;
     }[]>('/invoices'),
+  get: (id: string) =>
+    request<{
+      id: string;
+      destination_id: string;
+      destination_code: string;
+      destination_name: string;
+      invoice_number: string;
+      order_number: string | null;
+      invoice_date: string;
+      subtotal: string;
+      tax_rate: string;
+      total: string;
+      has_pdf: boolean | null;
+      notes: string | null;
+      created_at: string;
+      updated_at: string;
+      purchase_count: number | null;
+      purchases_total: string | null;
+      total_cost: string | null;
+      total_commission: string | null;
+    }>(`/invoices/${id}`),
+  purchases: (id: string) =>
+    request<{
+      purchase_id: string;
+      purchase_date: string;
+      item_name: string;
+      vendor_name: string;
+      destination_code: string | null;
+      quantity: number;
+      purchase_cost: string;
+      total_cost: string | null;
+      selling_price: string | null;
+      total_selling: string | null;
+      unit_commission: string | null;
+      total_commission: string | null;
+      tax_paid: string | null;
+      tax_owed: string | null;
+      status: string;
+      delivery_date: string | null;
+      invoice_id: string | null;
+    }[]>(`/invoices/${id}/purchases`),
   create: (data: {
-    vendor_id: string;
+    destination_id: string;
     invoice_number: string;
     order_number?: string;
     invoice_date: string;
-    total: string;
+    subtotal: string;
+    tax_rate?: string;
     notes?: string;
   }) =>
     request<{ id: string }>('/invoices', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  update: (id: string, data: Record<string, unknown>) =>
+    request<{ id: string }>(`/invoices/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
   delete: (id: string) =>
     request<void>(`/invoices/${id}`, { method: 'DELETE' }),
+  uploadPdf: async (id: string, file: File): Promise<void> => {
+    const token = localStorage.getItem('token');
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await fetch(`${API_BASE}/invoices/${id}/document`, {
+      method: 'POST',
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: formData,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new ApiError(response.status, text || response.statusText);
+    }
+  },
+  downloadPdfUrl: (id: string) => `${API_BASE}/invoices/${id}/document`,
 };
 
 // Purchases
@@ -190,23 +240,27 @@ export const purchases = {
       vendor_name: string;
       destination_code: string | null;
       quantity: number;
-      unit_cost: string;
-      payout_price: string | null;
-      unit_profit: string | null;
-      total_profit: string | null;
+      purchase_cost: string;
       total_cost: string | null;
-      total_revenue: string | null;
+      selling_price: string | null;
+      total_selling: string | null;
+      unit_commission: string | null;
+      total_commission: string | null;
+      tax_paid: string | null;
+      tax_owed: string | null;
       status: string;
       delivery_date: string | null;
       invoice_id: string | null;
-    }[]>(`/purchases${query ? `?${query}` : ''}`);
+    }[]>(`/purchases/economics${query ? `?${query}` : ''}`);
   },
   create: (data: {
     item_id: string;
     quantity: number;
-    unit_cost: string;
+    purchase_cost: string;
+    selling_price?: string;
     destination_id?: string;
     invoice_id?: string;
+    status?: string;
     notes?: string;
   }) =>
     request<{ id: string }>('/purchases', {
@@ -228,7 +282,6 @@ export const reports = {
     request<{
       vendor_id: string;
       vendor_name: string;
-      total_invoices: number | null;
       total_purchases: number | null;
       total_quantity: number | null;
       total_spent: string | null;
@@ -238,9 +291,139 @@ export const reports = {
       destination_id: string;
       destination_code: string;
       destination_name: string;
+      total_invoices: number | null;
       total_purchases: number | null;
       total_quantity: number | null;
       total_cost: string | null;
-      total_profit: string | null;
+      total_revenue: string | null;
+      total_commission: string | null;
+      total_tax_paid: string | null;
+      total_tax_owed: string | null;
     }[]>('/reports/destinations'),
 };
+
+// Import
+type ImportResult = {
+  success_count: number;
+  error_count: number;
+  duplicate_count: number;
+  errors: { row: number; message: string; original_data: string }[];
+  failed_rows_csv: string;
+};
+
+type PreviewRow<T> = {
+  row: number;
+  data: T;
+  is_duplicate: boolean;
+};
+
+type PreviewResult<T> = {
+  valid_rows: PreviewRow<T>[];
+  error_rows: { row: number; message: string; original_data: string }[];
+  total_count: number;
+  valid_count: number;
+  error_count: number;
+  duplicate_count: number;
+};
+
+export type VendorPreview = { name: string };
+export type DestinationPreview = { code: string; name: string };
+export type ItemPreview = {
+  name: string;
+  vendor_name: string;
+  purchase_cost: string;
+  destination_code: string | null;
+  notes: string | null;
+};
+export type PurchasePreview = {
+  item_name: string;
+  vendor_name: string;
+  destination_code: string | null;
+  quantity: number;
+  purchase_cost: string;
+  date: string;
+  invoice_number: string | null;
+  notes: string | null;
+};
+
+export type { PreviewResult, PreviewRow };
+
+export const importApi = {
+  vendors: (csvData: string) =>
+    request<ImportResult>('/import/vendors', {
+      method: 'POST',
+      body: JSON.stringify({ csv_data: csvData }),
+    }),
+  vendorsPreview: (csvData: string) =>
+    request<PreviewResult<VendorPreview>>('/import/vendors/preview', {
+      method: 'POST',
+      body: JSON.stringify({ csv_data: csvData }),
+    }),
+  destinations: (csvData: string) =>
+    request<ImportResult>('/import/destinations', {
+      method: 'POST',
+      body: JSON.stringify({ csv_data: csvData }),
+    }),
+  destinationsPreview: (csvData: string) =>
+    request<PreviewResult<DestinationPreview>>('/import/destinations/preview', {
+      method: 'POST',
+      body: JSON.stringify({ csv_data: csvData }),
+    }),
+  items: (csvData: string) =>
+    request<ImportResult>('/import/items', {
+      method: 'POST',
+      body: JSON.stringify({ csv_data: csvData }),
+    }),
+  itemsPreview: (csvData: string) =>
+    request<PreviewResult<ItemPreview>>('/import/items/preview', {
+      method: 'POST',
+      body: JSON.stringify({ csv_data: csvData }),
+    }),
+  purchases: (csvData: string) =>
+    request<ImportResult>('/import/purchases', {
+      method: 'POST',
+      body: JSON.stringify({ csv_data: csvData }),
+    }),
+  purchasesPreview: (csvData: string) =>
+    request<PreviewResult<PurchasePreview>>('/import/purchases/preview', {
+      method: 'POST',
+      body: JSON.stringify({ csv_data: csvData }),
+    }),
+  invoicePdf: async (file: File): Promise<ParsedInvoice> => {
+    const token = localStorage.getItem('token');
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await fetch(`${API_BASE}/import/invoice-pdf`, {
+      method: 'POST',
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: formData,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new ApiError(response.status, text || response.statusText);
+    }
+    return response.json();
+  },
+};
+
+// Parsed invoice types
+export interface ParsedInvoiceLineItem {
+  description: string;
+  qty: number;
+  selling_price: string;
+  subtotal: string;
+}
+
+export interface ParsedInvoice {
+  invoice_number: string | null;
+  invoice_date: string | null;
+  bill_to: string | null;
+  line_items: ParsedInvoiceLineItem[];
+  subtotal: string | null;
+  tax_rate: string | null;
+  tax_amount: string | null;
+  total: string | null;
+  notes: string | null;
+}

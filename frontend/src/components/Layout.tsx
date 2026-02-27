@@ -5,7 +5,6 @@ import {
   Store,
   MapPin,
   Package,
-  DollarSign,
   FileText,
   ShoppingCart,
   LogOut,
@@ -18,7 +17,6 @@ const navItems = [
   { to: "/vendors", icon: Store, label: "Vendors" },
   { to: "/destinations", icon: MapPin, label: "Destinations" },
   { to: "/items", icon: Package, label: "Items" },
-  { to: "/payouts", icon: DollarSign, label: "Payouts" },
   { to: "/invoices", icon: FileText, label: "Invoices" },
   { to: "/purchases", icon: ShoppingCart, label: "Purchases" },
 ]

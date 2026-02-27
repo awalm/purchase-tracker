@@ -97,7 +97,6 @@ pub async fn get_vendor_summary(pool: &PgPool) -> Result<Vec<VendorSummary>, sql
         r#"SELECT 
             vendor_id as "vendor_id!",
             vendor_name as "vendor_name!",
-            total_invoices,
             total_purchases,
             total_quantity,
             total_spent
@@ -245,10 +244,14 @@ pub async fn get_destination_summary(pool: &PgPool) -> Result<Vec<DestinationSum
             destination_id as "destination_id!",
             destination_code as "destination_code!",
             destination_name as "destination_name!",
+            total_invoices,
             total_purchases,
             total_quantity,
             total_cost,
-            total_profit
+            total_revenue,
+            total_commission,
+            total_tax_paid,
+            total_tax_owed
         FROM v_destination_summary
         ORDER BY destination_code"#
     )
@@ -267,7 +270,7 @@ pub async fn get_all_items(pool: &PgPool, query: ItemQuery) -> Result<Vec<Item>,
     if active_only {
         sqlx::query_as!(
             Item,
-            r#"SELECT id, name, vendor_id, unit_cost, start_date, end_date, 
+            r#"SELECT id, name, vendor_id, purchase_cost, start_date, end_date, 
                       default_destination_id, notes, created_at, updated_at
                FROM items
                WHERE ($1::uuid IS NULL OR vendor_id = $1)
@@ -282,7 +285,7 @@ pub async fn get_all_items(pool: &PgPool, query: ItemQuery) -> Result<Vec<Item>,
     } else {
         sqlx::query_as!(
             Item,
-            r#"SELECT id, name, vendor_id, unit_cost, start_date, end_date, 
+            r#"SELECT id, name, vendor_id, purchase_cost, start_date, end_date, 
                       default_destination_id, notes, created_at, updated_at
                FROM items
                WHERE ($1::uuid IS NULL OR vendor_id = $1)
@@ -298,16 +301,21 @@ pub async fn get_active_items(pool: &PgPool) -> Result<Vec<ActiveItem>, sqlx::Er
     sqlx::query_as!(
         ActiveItem,
         r#"SELECT 
-            id as "id!",
-            name as "name!",
-            vendor_id as "vendor_id!",
-            vendor_name as "vendor_name!",
-            unit_cost as "unit_cost!",
-            default_destination_id,
-            default_destination_code,
-            notes
-        FROM v_active_items
-        ORDER BY name"#
+            i.id as "id!",
+            i.name as "name!",
+            i.vendor_id as "vendor_id!",
+            v.name as "vendor_name!",
+            i.purchase_cost as "purchase_cost!",
+            i.default_destination_id,
+            d.code as default_destination_code,
+            i.notes,
+            i.created_at as "created_at!"
+        FROM items i
+        JOIN vendors v ON v.id = i.vendor_id
+        LEFT JOIN destinations d ON d.id = i.default_destination_id
+        WHERE i.start_date <= CURRENT_DATE
+          AND (i.end_date IS NULL OR i.end_date >= CURRENT_DATE)
+        ORDER BY i.created_at DESC"#
     )
     .fetch_all(pool)
     .await
@@ -316,7 +324,7 @@ pub async fn get_active_items(pool: &PgPool) -> Result<Vec<ActiveItem>, sqlx::Er
 pub async fn get_item_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Item>, sqlx::Error> {
     sqlx::query_as!(
         Item,
-        r#"SELECT id, name, vendor_id, unit_cost, start_date, end_date, 
+        r#"SELECT id, name, vendor_id, purchase_cost, start_date, end_date, 
                   default_destination_id, notes, created_at, updated_at
            FROM items WHERE id = $1"#,
         id
@@ -332,13 +340,13 @@ pub async fn create_item(
 ) -> Result<Item, sqlx::Error> {
     let item = sqlx::query_as!(
         Item,
-        r#"INSERT INTO items (name, vendor_id, unit_cost, start_date, end_date, default_destination_id, notes) 
+        r#"INSERT INTO items (name, vendor_id, purchase_cost, start_date, end_date, default_destination_id, notes) 
            VALUES ($1, $2, $3, $4, $5, $6, $7) 
-           RETURNING id, name, vendor_id, unit_cost, start_date, end_date, 
+           RETURNING id, name, vendor_id, purchase_cost, start_date, end_date, 
                      default_destination_id, notes, created_at, updated_at"#,
         data.name,
         data.vendor_id,
-        data.unit_cost,
+        data.purchase_cost,
         data.start_date,
         data.end_date,
         data.default_destination_id,
@@ -364,16 +372,16 @@ pub async fn update_item(
             Item,
             r#"UPDATE items SET 
                 name = COALESCE($2, name),
-                unit_cost = COALESCE($3, unit_cost),
+                purchase_cost = COALESCE($3, purchase_cost),
                 end_date = COALESCE($4, end_date),
                 default_destination_id = COALESCE($5, default_destination_id),
                 notes = COALESCE($6, notes)
                WHERE id = $1 
-               RETURNING id, name, vendor_id, unit_cost, start_date, end_date, 
+               RETURNING id, name, vendor_id, purchase_cost, start_date, end_date, 
                          default_destination_id, notes, created_at, updated_at"#,
             id,
             data.name,
-            data.unit_cost,
+            data.purchase_cost,
             data.end_date,
             data.default_destination_id,
             data.notes
@@ -407,164 +415,15 @@ pub async fn delete_item(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bool,
 }
 
 // ============================================
-// Payouts
-// ============================================
-
-pub async fn get_all_payouts(pool: &PgPool, query: PayoutQuery) -> Result<Vec<Payout>, sqlx::Error> {
-    let date = query.date.unwrap_or_else(|| chrono::Utc::now().date_naive());
-    let active_only = query.active_only.unwrap_or(false);
-
-    if active_only {
-        sqlx::query_as!(
-            Payout,
-            r#"SELECT id, destination_id, item_id, payout_price, start_date, end_date, 
-                      notes, created_at, updated_at
-               FROM payouts
-               WHERE ($1::uuid IS NULL OR destination_id = $1)
-                 AND ($2::uuid IS NULL OR item_id = $2)
-                 AND start_date <= $3
-                 AND (end_date IS NULL OR end_date >= $3)
-               ORDER BY start_date DESC"#,
-            query.destination_id,
-            query.item_id,
-            date
-        )
-        .fetch_all(pool)
-        .await
-    } else {
-        sqlx::query_as!(
-            Payout,
-            r#"SELECT id, destination_id, item_id, payout_price, start_date, end_date, 
-                      notes, created_at, updated_at
-               FROM payouts
-               WHERE ($1::uuid IS NULL OR destination_id = $1)
-                 AND ($2::uuid IS NULL OR item_id = $2)
-               ORDER BY start_date DESC"#,
-            query.destination_id,
-            query.item_id
-        )
-        .fetch_all(pool)
-        .await
-    }
-}
-
-pub async fn get_active_payouts(pool: &PgPool) -> Result<Vec<ActivePayout>, sqlx::Error> {
-    sqlx::query_as!(
-        ActivePayout,
-        r#"SELECT 
-            id as "id!",
-            item_id as "item_id!",
-            item_name as "item_name!",
-            destination_id as "destination_id!",
-            destination_code as "destination_code!",
-            payout_price as "payout_price!",
-            notes
-        FROM v_active_payouts
-        ORDER BY item_name, destination_code"#
-    )
-    .fetch_all(pool)
-    .await
-}
-
-pub async fn get_payout_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Payout>, sqlx::Error> {
-    sqlx::query_as!(
-        Payout,
-        r#"SELECT id, destination_id, item_id, payout_price, start_date, end_date, 
-                  notes, created_at, updated_at
-           FROM payouts WHERE id = $1"#,
-        id
-    )
-    .fetch_optional(pool)
-    .await
-}
-
-pub async fn create_payout(
-    pool: &PgPool,
-    data: CreatePayout,
-    user_id: Uuid,
-) -> Result<Payout, sqlx::Error> {
-    let payout = sqlx::query_as!(
-        Payout,
-        r#"INSERT INTO payouts (destination_id, item_id, payout_price, start_date, end_date, notes) 
-           VALUES ($1, $2, $3, $4, $5, $6) 
-           RETURNING id, destination_id, item_id, payout_price, start_date, end_date, 
-                     notes, created_at, updated_at"#,
-        data.destination_id,
-        data.item_id,
-        data.payout_price,
-        data.start_date,
-        data.end_date,
-        data.notes
-    )
-    .fetch_one(pool)
-    .await?;
-
-    AuditService::log(pool, "payouts", payout.id, "create", None::<&Payout>, Some(&payout), user_id).await?;
-    Ok(payout)
-}
-
-pub async fn update_payout(
-    pool: &PgPool,
-    id: Uuid,
-    data: UpdatePayout,
-    user_id: Uuid,
-) -> Result<Option<Payout>, sqlx::Error> {
-    let old = get_payout_by_id(pool, id).await?;
-
-    if let Some(ref old_payout) = old {
-        let payout = sqlx::query_as!(
-            Payout,
-            r#"UPDATE payouts SET 
-                payout_price = COALESCE($2, payout_price),
-                end_date = COALESCE($3, end_date),
-                notes = COALESCE($4, notes)
-               WHERE id = $1 
-               RETURNING id, destination_id, item_id, payout_price, start_date, end_date, 
-                         notes, created_at, updated_at"#,
-            id,
-            data.payout_price,
-            data.end_date,
-            data.notes
-        )
-        .fetch_optional(pool)
-        .await?;
-
-        if let Some(ref p) = payout {
-            AuditService::log(pool, "payouts", id, "update", Some(old_payout), Some(p), user_id)
-                .await?;
-        }
-        return Ok(payout);
-    }
-    Ok(None)
-}
-
-pub async fn delete_payout(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bool, sqlx::Error> {
-    let old = get_payout_by_id(pool, id).await?;
-
-    let result = sqlx::query!(r#"DELETE FROM payouts WHERE id = $1"#, id)
-        .execute(pool)
-        .await?;
-
-    if result.rows_affected() > 0 {
-        if let Some(ref p) = old {
-            AuditService::log(pool, "payouts", id, "delete", Some(p), None::<&Payout>, user_id)
-                .await?;
-        }
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-// ============================================
 // Incoming Invoices
 // ============================================
 
-pub async fn get_all_invoices(pool: &PgPool) -> Result<Vec<IncomingInvoice>, sqlx::Error> {
+pub async fn get_all_invoices(pool: &PgPool) -> Result<Vec<Invoice>, sqlx::Error> {
     sqlx::query_as!(
-        IncomingInvoice,
-        r#"SELECT id, vendor_id, invoice_number, order_number, invoice_date, 
-                  total, notes, created_at, updated_at
-           FROM incoming_invoices ORDER BY invoice_date DESC"#
+        Invoice,
+        r#"SELECT id, destination_id, invoice_number, order_number, invoice_date, 
+                  subtotal, tax_rate, total, notes, created_at, updated_at
+           FROM invoices ORDER BY invoice_date DESC"#
     )
     .fetch_all(pool)
     .await
@@ -573,12 +432,12 @@ pub async fn get_all_invoices(pool: &PgPool) -> Result<Vec<IncomingInvoice>, sql
 pub async fn get_invoice_by_id(
     pool: &PgPool,
     id: Uuid,
-) -> Result<Option<IncomingInvoice>, sqlx::Error> {
+) -> Result<Option<Invoice>, sqlx::Error> {
     sqlx::query_as!(
-        IncomingInvoice,
-        r#"SELECT id, vendor_id, invoice_number, order_number, invoice_date, 
-                  total, notes, created_at, updated_at
-           FROM incoming_invoices WHERE id = $1"#,
+        Invoice,
+        r#"SELECT id, destination_id, invoice_number, order_number, invoice_date, 
+                  subtotal, tax_rate, total, notes, created_at, updated_at
+           FROM invoices WHERE id = $1"#,
         id
     )
     .fetch_optional(pool)
@@ -589,18 +448,22 @@ pub async fn create_invoice(
     pool: &PgPool,
     data: CreateInvoice,
     user_id: Uuid,
-) -> Result<IncomingInvoice, sqlx::Error> {
+) -> Result<Invoice, sqlx::Error> {
+    let tax_rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00
+    let total = data.subtotal * (Decimal::ONE + tax_rate / Decimal::new(100, 0));
     let invoice = sqlx::query_as!(
-        IncomingInvoice,
-        r#"INSERT INTO incoming_invoices (vendor_id, invoice_number, order_number, invoice_date, total, notes) 
-           VALUES ($1, $2, $3, $4, $5, $6) 
-           RETURNING id, vendor_id, invoice_number, order_number, invoice_date, 
-                     total, notes, created_at, updated_at"#,
-        data.vendor_id,
+        Invoice,
+        r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, subtotal, tax_rate, total, notes) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
+           RETURNING id, destination_id, invoice_number, order_number, invoice_date, 
+                     subtotal, tax_rate, total, notes, created_at, updated_at"#,
+        data.destination_id,
         data.invoice_number,
         data.order_number,
         data.invoice_date,
-        data.total,
+        data.subtotal,
+        tax_rate,
+        total,
         data.notes
     )
     .fetch_one(pool)
@@ -608,10 +471,10 @@ pub async fn create_invoice(
 
     AuditService::log(
         pool,
-        "incoming_invoices",
+        "invoices",
         invoice.id,
         "create",
-        None::<&IncomingInvoice>,
+        None::<&Invoice>,
         Some(&invoice),
         user_id,
     )
@@ -624,26 +487,29 @@ pub async fn update_invoice(
     id: Uuid,
     data: UpdateInvoice,
     user_id: Uuid,
-) -> Result<Option<IncomingInvoice>, sqlx::Error> {
+) -> Result<Option<Invoice>, sqlx::Error> {
     let old = get_invoice_by_id(pool, id).await?;
 
     if let Some(ref old_inv) = old {
         let invoice = sqlx::query_as!(
-            IncomingInvoice,
-            r#"UPDATE incoming_invoices SET 
+            Invoice,
+            r#"UPDATE invoices SET 
                 invoice_number = COALESCE($2, invoice_number),
                 order_number = COALESCE($3, order_number),
                 invoice_date = COALESCE($4, invoice_date),
-                total = COALESCE($5, total),
-                notes = COALESCE($6, notes)
+                subtotal = COALESCE($5, subtotal),
+                tax_rate = COALESCE($6, tax_rate),
+                total = COALESCE($5, subtotal) * (1 + COALESCE($6, tax_rate) / 100),
+                notes = COALESCE($7, notes)
                WHERE id = $1 
-               RETURNING id, vendor_id, invoice_number, order_number, invoice_date, 
-                         total, notes, created_at, updated_at"#,
+               RETURNING id, destination_id, invoice_number, order_number, invoice_date, 
+                         subtotal, tax_rate, total, notes, created_at, updated_at"#,
             id,
             data.invoice_number,
             data.order_number,
             data.invoice_date,
-            data.total,
+            data.subtotal,
+            data.tax_rate,
             data.notes
         )
         .fetch_optional(pool)
@@ -652,7 +518,7 @@ pub async fn update_invoice(
         if let Some(ref inv) = invoice {
             AuditService::log(
                 pool,
-                "incoming_invoices",
+                "invoices",
                 id,
                 "update",
                 Some(old_inv),
@@ -669,7 +535,7 @@ pub async fn update_invoice(
 pub async fn delete_invoice(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bool, sqlx::Error> {
     let old = get_invoice_by_id(pool, id).await?;
 
-    let result = sqlx::query!(r#"DELETE FROM incoming_invoices WHERE id = $1"#, id)
+    let result = sqlx::query!(r#"DELETE FROM invoices WHERE id = $1"#, id)
         .execute(pool)
         .await?;
 
@@ -677,11 +543,11 @@ pub async fn delete_invoice(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bo
         if let Some(ref inv) = old {
             AuditService::log(
                 pool,
-                "incoming_invoices",
+                "invoices",
                 id,
                 "delete",
                 Some(inv),
-                None::<&IncomingInvoice>,
+                None::<&Invoice>,
                 user_id,
             )
             .await?;
@@ -689,6 +555,43 @@ pub async fn delete_invoice(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bo
         return Ok(true);
     }
     Ok(false)
+}
+
+pub async fn save_invoice_pdf(
+    pool: &PgPool,
+    id: Uuid,
+    pdf_data: &[u8],
+    filename: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query!(
+        r#"UPDATE invoices SET original_pdf = $2, original_filename = $3 WHERE id = $1"#,
+        id,
+        pdf_data,
+        filename
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn get_invoice_pdf(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<(Vec<u8>, String)>, sqlx::Error> {
+    let row = sqlx::query!(
+        r#"SELECT original_pdf, original_filename FROM invoices WHERE id = $1 AND original_pdf IS NOT NULL"#,
+        id
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.and_then(|r| {
+        match (r.original_pdf, r.original_filename) {
+            (Some(pdf), Some(name)) => Some((pdf, name)),
+            (Some(pdf), None) => Some((pdf, "invoice.pdf".to_string())),
+            _ => None,
+        }
+    }))
 }
 
 pub async fn get_invoice_reconciliation(
@@ -699,15 +602,123 @@ pub async fn get_invoice_reconciliation(
         r#"SELECT 
             invoice_id as "invoice_id!",
             invoice_number as "invoice_number!",
-            vendor_name as "vendor_name!",
+            destination_code as "destination_code!",
+            destination_name as "destination_name!",
             invoice_date as "invoice_date!",
             invoice_total as "invoice_total!",
             purchases_total as "purchases_total!",
             difference as "difference!",
             is_matched as "is_matched!",
-            purchase_count as "purchase_count!"
+            purchase_count as "purchase_count!",
+            total_cost as "total_cost!",
+            total_commission as "total_commission!"
         FROM v_invoice_reconciliation
         ORDER BY invoice_date DESC"#
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_invoice_with_destination(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<InvoiceWithDestination>, sqlx::Error> {
+    sqlx::query_as!(
+        InvoiceWithDestination,
+        r#"SELECT 
+            inv.id,
+            inv.destination_id,
+            d.code AS destination_code,
+            d.name AS destination_name,
+            inv.invoice_number,
+            inv.order_number,
+            inv.invoice_date,
+            inv.subtotal,
+            inv.tax_rate,
+            inv.total,
+            (inv.original_pdf IS NOT NULL) AS has_pdf,
+            inv.notes,
+            inv.created_at,
+            inv.updated_at,
+            COUNT(p.id) AS purchase_count,
+            COALESCE(SUM(p.quantity * COALESCE(p.selling_price, p.purchase_cost)), 0) AS purchases_total,
+            COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS total_cost,
+            COALESCE(SUM(p.quantity * (COALESCE(p.selling_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission
+        FROM invoices inv
+        JOIN destinations d ON d.id = inv.destination_id
+        LEFT JOIN purchases p ON p.invoice_id = inv.id
+        WHERE inv.id = $1
+        GROUP BY inv.id, inv.destination_id, d.code, d.name, inv.invoice_number, inv.order_number,
+                 inv.invoice_date, inv.subtotal, inv.tax_rate, inv.total, inv.original_pdf, inv.notes, inv.created_at, inv.updated_at"#,
+        id
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_invoices_with_destination(
+    pool: &PgPool,
+) -> Result<Vec<InvoiceWithDestination>, sqlx::Error> {
+    sqlx::query_as!(
+        InvoiceWithDestination,
+        r#"SELECT 
+            inv.id,
+            inv.destination_id,
+            d.code AS destination_code,
+            d.name AS destination_name,
+            inv.invoice_number,
+            inv.order_number,
+            inv.invoice_date,
+            inv.subtotal,
+            inv.tax_rate,
+            inv.total,
+            (inv.original_pdf IS NOT NULL) AS has_pdf,
+            inv.notes,
+            inv.created_at,
+            inv.updated_at,
+            COUNT(p.id) AS purchase_count,
+            COALESCE(SUM(p.quantity * COALESCE(p.selling_price, p.purchase_cost)), 0) AS purchases_total,
+            COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS total_cost,
+            COALESCE(SUM(p.quantity * (COALESCE(p.selling_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission
+        FROM invoices inv
+        JOIN destinations d ON d.id = inv.destination_id
+        LEFT JOIN purchases p ON p.invoice_id = inv.id
+        GROUP BY inv.id, inv.destination_id, d.code, d.name, inv.invoice_number, inv.order_number,
+                 inv.invoice_date, inv.subtotal, inv.tax_rate, inv.total, inv.original_pdf, inv.notes, inv.created_at, inv.updated_at
+        ORDER BY inv.invoice_date DESC"#
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_purchases_by_invoice(
+    pool: &PgPool,
+    invoice_id: Uuid,
+) -> Result<Vec<PurchaseEconomics>, sqlx::Error> {
+    sqlx::query_as!(
+        PurchaseEconomics,
+        r#"SELECT 
+            pe.purchase_id as "purchase_id!",
+            pe.purchase_date as "purchase_date!",
+            pe.item_name as "item_name!",
+            pe.vendor_name as "vendor_name!",
+            pe.destination_code,
+            pe.quantity as "quantity!",
+            pe.purchase_cost as "purchase_cost!",
+            pe.total_cost,
+            pe.selling_price,
+            pe.total_selling,
+            pe.unit_commission,
+            pe.total_commission,
+            pe.tax_paid,
+            pe.tax_owed,
+            pe.status as "status!: DeliveryStatus",
+            pe.delivery_date,
+            pe.invoice_id
+        FROM v_purchase_economics pe
+        WHERE pe.invoice_id = $1
+        ORDER BY pe.purchase_date DESC"#,
+        invoice_id
     )
     .fetch_all(pool)
     .await
@@ -723,7 +734,7 @@ pub async fn get_all_purchases(
 ) -> Result<Vec<Purchase>, sqlx::Error> {
     sqlx::query_as!(
         Purchase,
-        r#"SELECT p.id, p.item_id, p.invoice_id, p.quantity, p.unit_cost, 
+        r#"SELECT p.id, p.item_id, p.invoice_id, p.quantity, p.purchase_cost, p.selling_price,
                   p.destination_id, p.status as "status: DeliveryStatus", 
                   p.delivery_date, p.notes, p.created_at, p.updated_at
            FROM purchases p
@@ -751,7 +762,7 @@ pub async fn get_all_purchases(
 pub async fn get_purchase_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Purchase>, sqlx::Error> {
     sqlx::query_as!(
         Purchase,
-        r#"SELECT id, item_id, invoice_id, quantity, unit_cost, 
+        r#"SELECT id, item_id, invoice_id, quantity, purchase_cost, selling_price,
                   destination_id, status as "status: DeliveryStatus", 
                   delivery_date, notes, created_at, updated_at
            FROM purchases WHERE id = $1"#,
@@ -770,15 +781,16 @@ pub async fn create_purchase(
     
     let purchase = sqlx::query_as!(
         Purchase,
-        r#"INSERT INTO purchases (item_id, invoice_id, quantity, unit_cost, destination_id, status, delivery_date, notes) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
-           RETURNING id, item_id, invoice_id, quantity, unit_cost, 
+        r#"INSERT INTO purchases (item_id, invoice_id, quantity, purchase_cost, selling_price, destination_id, status, delivery_date, notes) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
+           RETURNING id, item_id, invoice_id, quantity, purchase_cost, selling_price,
                      destination_id, status as "status: DeliveryStatus", 
                      delivery_date, notes, created_at, updated_at"#,
         data.item_id,
         data.invoice_id,
         data.quantity,
-        data.unit_cost,
+        data.purchase_cost,
+        data.selling_price,
         data.destination_id,
         status as DeliveryStatus,
         data.delivery_date,
@@ -801,28 +813,43 @@ pub async fn update_purchase(
     let old = get_purchase_by_id(pool, id).await?;
 
     if let Some(ref old_purchase) = old {
+        // Resolve nullable fields: explicit clear wins, then new value, then keep existing
+        let invoice_id = if data.clear_invoice { None } else { data.invoice_id.or(old_purchase.invoice_id) };
+        let selling_price = if data.clear_selling_price { None } else { data.selling_price.or(old_purchase.selling_price) };
+        let item_id = data.item_id.unwrap_or(old_purchase.item_id);
+        let quantity = data.quantity.unwrap_or(old_purchase.quantity);
+        let purchase_cost = data.purchase_cost.unwrap_or(old_purchase.purchase_cost);
+        let destination_id = data.destination_id.or(old_purchase.destination_id);
+        let status = data.status.unwrap_or(old_purchase.status.clone());
+        let delivery_date = data.delivery_date.or(old_purchase.delivery_date);
+        let notes = data.notes.or(old_purchase.notes.clone());
+
         let purchase = sqlx::query_as!(
             Purchase,
             r#"UPDATE purchases SET 
-                invoice_id = COALESCE($2, invoice_id),
-                quantity = COALESCE($3, quantity),
-                unit_cost = COALESCE($4, unit_cost),
-                destination_id = COALESCE($5, destination_id),
-                status = COALESCE($6, status),
-                delivery_date = COALESCE($7, delivery_date),
-                notes = COALESCE($8, notes)
+                item_id = $2,
+                invoice_id = $3,
+                quantity = $4,
+                purchase_cost = $5,
+                selling_price = $6,
+                destination_id = $7,
+                status = $8,
+                delivery_date = $9,
+                notes = $10
                WHERE id = $1 
-               RETURNING id, item_id, invoice_id, quantity, unit_cost, 
+               RETURNING id, item_id, invoice_id, quantity, purchase_cost, selling_price,
                          destination_id, status as "status: DeliveryStatus", 
                          delivery_date, notes, created_at, updated_at"#,
             id,
-            data.invoice_id,
-            data.quantity,
-            data.unit_cost,
-            data.destination_id,
-            data.status as Option<DeliveryStatus>,
-            data.delivery_date,
-            data.notes
+            item_id,
+            invoice_id,
+            quantity,
+            purchase_cost,
+            selling_price,
+            destination_id,
+            status as DeliveryStatus,
+            delivery_date,
+            notes
         )
         .fetch_optional(pool)
         .await?;
@@ -849,7 +876,7 @@ pub async fn update_purchase_status(
             Purchase,
             r#"UPDATE purchases SET status = $2
                WHERE id = $1 
-               RETURNING id, item_id, invoice_id, quantity, unit_cost, 
+               RETURNING id, item_id, invoice_id, quantity, purchase_cost, selling_price,
                          destination_id, status as "status: DeliveryStatus", 
                          delivery_date, notes, created_at, updated_at"#,
             id,
@@ -897,12 +924,14 @@ pub async fn get_purchase_economics(
             pe.vendor_name as "vendor_name!",
             pe.destination_code,
             pe.quantity as "quantity!",
-            pe.unit_cost as "unit_cost!",
-            pe.payout_price,
-            pe.unit_profit,
-            pe.total_profit,
+            pe.purchase_cost as "purchase_cost!",
             pe.total_cost,
-            pe.total_revenue,
+            pe.selling_price,
+            pe.total_selling,
+            pe.unit_commission,
+            pe.total_commission,
+            pe.tax_paid,
+            pe.tax_owed,
             pe.status as "status!: DeliveryStatus",
             pe.delivery_date,
             pe.invoice_id
@@ -947,6 +976,7 @@ pub async fn get_user_by_username(
     .await
 }
 
+#[allow(dead_code)]
 pub async fn get_user_by_id(pool: &PgPool, id: Uuid) -> Result<Option<User>, sqlx::Error> {
     sqlx::query_as!(
         User,
@@ -978,6 +1008,7 @@ pub async fn create_user(
 // Audit Log
 // ============================================
 
+#[allow(dead_code)]
 pub async fn get_audit_logs(pool: &PgPool, query: AuditQuery) -> Result<Vec<AuditLog>, sqlx::Error> {
     sqlx::query_as!(
         AuditLog,
@@ -1003,9 +1034,11 @@ pub async fn get_audit_logs(pool: &PgPool, query: AuditQuery) -> Result<Vec<Audi
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct ProfitReport {
-    pub total_revenue: Option<Decimal>,
     pub total_cost: Option<Decimal>,
-    pub total_profit: Option<Decimal>,
+    pub total_revenue: Option<Decimal>,
+    pub total_commission: Option<Decimal>,
+    pub total_tax_paid: Option<Decimal>,
+    pub total_tax_owed: Option<Decimal>,
     pub purchase_count: Option<i64>,
     pub item_count: Option<i64>,
 }
@@ -1018,9 +1051,11 @@ pub async fn get_profit_report(
     sqlx::query_as!(
         ProfitReport,
         r#"SELECT 
-            SUM(total_revenue) as total_revenue,
             SUM(total_cost) as total_cost,
-            SUM(total_profit) as total_profit,
+            SUM(total_selling) as total_revenue,
+            SUM(total_commission) as total_commission,
+            SUM(tax_paid) as total_tax_paid,
+            SUM(tax_owed) as total_tax_owed,
             COUNT(*) as purchase_count,
             COUNT(DISTINCT purchase_id) as item_count
         FROM v_purchase_economics

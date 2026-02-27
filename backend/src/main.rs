@@ -11,8 +11,6 @@ mod auth;
 mod db;
 mod services;
 
-pub use db::models;
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load environment variables from .env file

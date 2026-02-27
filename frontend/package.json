@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "check": "tsc --noEmit && npm run check:select",
+    "check:select": "! grep -rn 'SelectItem value=\"\"' src/ && echo '✅ No empty SelectItem values' || (echo '❌ Found SelectItem with value=\"\" — Radix UI does not support empty string values. Use a sentinel like __none__ instead.' && exit 1)"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.2",

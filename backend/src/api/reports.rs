@@ -20,8 +20,8 @@ pub struct DateRangeQuery {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/summary", get(get_summary))
-        .route("/by-destination", get(get_by_destination))
-        .route("/by-vendor", get(get_by_vendor))
+        .route("/destinations", get(get_by_destination))
+        .route("/vendors", get(get_by_vendor))
 }
 
 async fn get_summary(
