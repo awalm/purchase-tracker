@@ -43,6 +43,19 @@ export interface Invoice {
   updated_at: string;
 }
 
+export interface Receipt {
+  id: string;
+  vendor_id: string;
+  receipt_number: string;
+  receipt_date: string;
+  subtotal: string;
+  tax_rate: string;
+  total: string;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface InvoiceWithDestination {
   id: string;
   destination_id: string;
@@ -62,12 +75,32 @@ export interface InvoiceWithDestination {
   purchases_total: string | null;
 }
 
+export interface ReceiptWithVendor {
+  id: string;
+  vendor_id: string;
+  vendor_name: string;
+  receipt_number: string;
+  receipt_date: string;
+  subtotal: string;
+  tax_rate: string;
+  total: string;
+  has_pdf: boolean | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+  purchase_count: number | null;
+  purchases_total: string | null;
+  total_selling: string | null;
+  total_commission: string | null;
+}
+
 export type DeliveryStatus = 'pending' | 'in_transit' | 'delivered' | 'returned' | 'damaged' | 'lost';
 
 export interface Purchase {
   id: string;
   item_id: string;
   invoice_id: string | null;
+  receipt_id: string | null;
   quantity: number;
   purchase_cost: string;
   selling_price: string | null;
@@ -110,11 +143,15 @@ export interface PurchaseEconomics {
   status: DeliveryStatus;
   delivery_date: string | null;
   invoice_id: string | null;
+  receipt_id: string | null;
+  receipt_number: string | null;
+  invoice_number: string | null;
 }
 
 export interface VendorSummary {
   vendor_id: string;
   vendor_name: string;
+  total_receipts: number | null;
   total_purchases: number | null;
   total_quantity: number | null;
   total_spent: string | null;

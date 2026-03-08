@@ -1,5 +1,5 @@
 import { useState, useRef } from "react"
-import { useParams, useNavigate } from "react-router-dom"
+import { useParams, useNavigate, Link } from "react-router-dom"
 import { useQueryClient } from "@tanstack/react-query"
 import {
   useInvoice,
@@ -482,6 +482,7 @@ export default function InvoiceDetailPage() {
                 <TableRow>
                   <TableHead>Item</TableHead>
                   <TableHead>Dest</TableHead>
+                  <TableHead>Receipt</TableHead>
                   <TableHead className="text-right">Qty</TableHead>
                   <TableHead className="text-right">Purchase Cost</TableHead>
                   <TableHead className="text-right">Selling Price</TableHead>
@@ -496,6 +497,21 @@ export default function InvoiceDetailPage() {
                   <TableRow key={p.purchase_id}>
                     <TableCell className="font-medium">{p.item_name}</TableCell>
                     <TableCell className="font-mono">{p.destination_code || "-"}</TableCell>
+                    <TableCell>
+                      {p.receipt_id ? (
+                        <Link
+                          to={`/receipts/${p.receipt_id}`}
+                          className="text-xs font-mono text-emerald-600 hover:underline"
+                        >
+                          {p.receipt_number || "linked"}
+                        </Link>
+                      ) : (
+                        <span className="text-red-500 text-xs flex items-center gap-1">
+                          <AlertCircle className="h-3 w-3" />
+                          unlinked
+                        </span>
+                      )}
+                    </TableCell>
                     <TableCell className="text-right">{p.quantity}</TableCell>
                     <TableCell className="text-right text-muted-foreground">{formatCurrency(p.purchase_cost)}</TableCell>
                     <TableCell className="text-right">{p.selling_price ? formatCurrency(p.selling_price) : "-"}</TableCell>
@@ -531,7 +547,7 @@ export default function InvoiceDetailPage() {
                   </TableRow>
                 ))}
                 {purchases.length === 0 && (
-                  <EmptyTableRow colSpan={9}>
+                  <EmptyTableRow colSpan={10}>
                     <div className="flex flex-col items-center gap-2 py-4">
                       <Package className="h-8 w-8" />
                       <p>No purchases linked to this invoice yet</p>

@@ -97,6 +97,7 @@ pub async fn get_vendor_summary(pool: &PgPool) -> Result<Vec<VendorSummary>, sql
         r#"SELECT 
             vendor_id as "vendor_id!",
             vendor_name as "vendor_name!",
+            total_receipts,
             total_purchases,
             total_quantity,
             total_spent
@@ -714,7 +715,10 @@ pub async fn get_purchases_by_invoice(
             pe.tax_owed,
             pe.status as "status!: DeliveryStatus",
             pe.delivery_date,
-            pe.invoice_id
+            pe.invoice_id,
+            pe.receipt_id,
+            pe.receipt_number,
+            pe.invoice_number
         FROM v_purchase_economics pe
         WHERE pe.invoice_id = $1
         ORDER BY pe.purchase_date DESC"#,
@@ -734,7 +738,7 @@ pub async fn get_all_purchases(
 ) -> Result<Vec<Purchase>, sqlx::Error> {
     sqlx::query_as!(
         Purchase,
-        r#"SELECT p.id, p.item_id, p.invoice_id, p.quantity, p.purchase_cost, p.selling_price,
+        r#"SELECT p.id, p.item_id, p.invoice_id, p.receipt_id, p.quantity, p.purchase_cost, p.selling_price,
                   p.destination_id, p.status as "status: DeliveryStatus", 
                   p.delivery_date, p.notes, p.created_at, p.updated_at
            FROM purchases p
@@ -762,7 +766,7 @@ pub async fn get_all_purchases(
 pub async fn get_purchase_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Purchase>, sqlx::Error> {
     sqlx::query_as!(
         Purchase,
-        r#"SELECT id, item_id, invoice_id, quantity, purchase_cost, selling_price,
+        r#"SELECT id, item_id, invoice_id, receipt_id, quantity, purchase_cost, selling_price,
                   destination_id, status as "status: DeliveryStatus", 
                   delivery_date, notes, created_at, updated_at
            FROM purchases WHERE id = $1"#,
@@ -781,13 +785,14 @@ pub async fn create_purchase(
     
     let purchase = sqlx::query_as!(
         Purchase,
-        r#"INSERT INTO purchases (item_id, invoice_id, quantity, purchase_cost, selling_price, destination_id, status, delivery_date, notes) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
-           RETURNING id, item_id, invoice_id, quantity, purchase_cost, selling_price,
+        r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, selling_price, destination_id, status, delivery_date, notes) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) 
+           RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, selling_price,
                      destination_id, status as "status: DeliveryStatus", 
                      delivery_date, notes, created_at, updated_at"#,
         data.item_id,
         data.invoice_id,
+        data.receipt_id,
         data.quantity,
         data.purchase_cost,
         data.selling_price,
@@ -815,6 +820,7 @@ pub async fn update_purchase(
     if let Some(ref old_purchase) = old {
         // Resolve nullable fields: explicit clear wins, then new value, then keep existing
         let invoice_id = if data.clear_invoice { None } else { data.invoice_id.or(old_purchase.invoice_id) };
+        let receipt_id = if data.clear_receipt { None } else { data.receipt_id.or(old_purchase.receipt_id) };
         let selling_price = if data.clear_selling_price { None } else { data.selling_price.or(old_purchase.selling_price) };
         let item_id = data.item_id.unwrap_or(old_purchase.item_id);
         let quantity = data.quantity.unwrap_or(old_purchase.quantity);
@@ -829,20 +835,22 @@ pub async fn update_purchase(
             r#"UPDATE purchases SET 
                 item_id = $2,
                 invoice_id = $3,
-                quantity = $4,
-                purchase_cost = $5,
-                selling_price = $6,
-                destination_id = $7,
-                status = $8,
-                delivery_date = $9,
-                notes = $10
+                receipt_id = $4,
+                quantity = $5,
+                purchase_cost = $6,
+                selling_price = $7,
+                destination_id = $8,
+                status = $9,
+                delivery_date = $10,
+                notes = $11
                WHERE id = $1 
-               RETURNING id, item_id, invoice_id, quantity, purchase_cost, selling_price,
+               RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, selling_price,
                          destination_id, status as "status: DeliveryStatus", 
                          delivery_date, notes, created_at, updated_at"#,
             id,
             item_id,
             invoice_id,
+            receipt_id,
             quantity,
             purchase_cost,
             selling_price,
@@ -876,7 +884,7 @@ pub async fn update_purchase_status(
             Purchase,
             r#"UPDATE purchases SET status = $2
                WHERE id = $1 
-               RETURNING id, item_id, invoice_id, quantity, purchase_cost, selling_price,
+               RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, selling_price,
                          destination_id, status as "status: DeliveryStatus", 
                          delivery_date, notes, created_at, updated_at"#,
             id,
@@ -934,7 +942,10 @@ pub async fn get_purchase_economics(
             pe.tax_owed,
             pe.status as "status!: DeliveryStatus",
             pe.delivery_date,
-            pe.invoice_id
+            pe.invoice_id,
+            pe.receipt_id,
+            pe.receipt_number,
+            pe.invoice_number
         FROM v_purchase_economics pe
         JOIN purchases p ON p.id = pe.purchase_id
         JOIN items i ON i.id = p.item_id
@@ -1023,6 +1034,257 @@ pub async fn get_audit_logs(pool: &PgPool, query: AuditQuery) -> Result<Vec<Audi
         query.record_id,
         query.limit,
         query.offset
+    )
+    .fetch_all(pool)
+    .await
+}
+
+// ============================================
+// Receipts
+// ============================================
+
+pub async fn get_all_receipts(pool: &PgPool) -> Result<Vec<Receipt>, sqlx::Error> {
+    sqlx::query_as!(
+        Receipt,
+        r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, 
+                  notes, created_at, updated_at
+           FROM receipts ORDER BY receipt_date DESC"#
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_receipt_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Receipt>, sqlx::Error> {
+    sqlx::query_as!(
+        Receipt,
+        r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, 
+                  notes, created_at, updated_at
+           FROM receipts WHERE id = $1"#,
+        id
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn create_receipt(
+    pool: &PgPool,
+    data: CreateReceipt,
+    user_id: Uuid,
+) -> Result<Receipt, sqlx::Error> {
+    let tax_rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00
+    let total = data.subtotal * (Decimal::ONE + tax_rate / Decimal::new(100, 0));
+    let receipt = sqlx::query_as!(
+        Receipt,
+        r#"INSERT INTO receipts (vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, notes) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7) 
+           RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, 
+                     notes, created_at, updated_at"#,
+        data.vendor_id,
+        data.receipt_number,
+        data.receipt_date,
+        data.subtotal,
+        tax_rate,
+        total,
+        data.notes
+    )
+    .fetch_one(pool)
+    .await?;
+
+    AuditService::log(pool, "receipts", receipt.id, "create", None::<&Receipt>, Some(&receipt), user_id).await?;
+    Ok(receipt)
+}
+
+pub async fn update_receipt(
+    pool: &PgPool,
+    id: Uuid,
+    data: UpdateReceipt,
+    user_id: Uuid,
+) -> Result<Option<Receipt>, sqlx::Error> {
+    let old = get_receipt_by_id(pool, id).await?;
+
+    if let Some(ref old_receipt) = old {
+        let receipt = sqlx::query_as!(
+            Receipt,
+            r#"UPDATE receipts SET 
+                receipt_number = COALESCE($2, receipt_number),
+                receipt_date = COALESCE($3, receipt_date),
+                subtotal = COALESCE($4, subtotal),
+                tax_rate = COALESCE($5, tax_rate),
+                total = COALESCE($4, subtotal) * (1 + COALESCE($5, tax_rate) / 100),
+                notes = COALESCE($6, notes)
+               WHERE id = $1 
+               RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
+                         notes, created_at, updated_at"#,
+            id,
+            data.receipt_number,
+            data.receipt_date,
+            data.subtotal,
+            data.tax_rate,
+            data.notes
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(ref r) = receipt {
+            AuditService::log(pool, "receipts", id, "update", Some(old_receipt), Some(r), user_id).await?;
+        }
+        return Ok(receipt);
+    }
+    Ok(None)
+}
+
+pub async fn delete_receipt(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    let old = get_receipt_by_id(pool, id).await?;
+
+    let result = sqlx::query!(r#"DELETE FROM receipts WHERE id = $1"#, id)
+        .execute(pool)
+        .await?;
+
+    if result.rows_affected() > 0 {
+        if let Some(ref r) = old {
+            AuditService::log(pool, "receipts", id, "delete", Some(r), None::<&Receipt>, user_id).await?;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+pub async fn save_receipt_pdf(
+    pool: &PgPool,
+    id: Uuid,
+    pdf_data: &[u8],
+    filename: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query!(
+        r#"UPDATE receipts SET original_pdf = $2, original_filename = $3 WHERE id = $1"#,
+        id,
+        pdf_data,
+        filename
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn get_receipt_pdf(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<(Vec<u8>, String)>, sqlx::Error> {
+    let row = sqlx::query!(
+        r#"SELECT original_pdf, original_filename FROM receipts WHERE id = $1 AND original_pdf IS NOT NULL"#,
+        id
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.and_then(|r| {
+        match (r.original_pdf, r.original_filename) {
+            (Some(pdf), Some(name)) => Some((pdf, name)),
+            (Some(pdf), None) => Some((pdf, "receipt.pdf".to_string())),
+            _ => None,
+        }
+    }))
+}
+
+pub async fn get_receipt_with_vendor(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<ReceiptWithVendor>, sqlx::Error> {
+    sqlx::query_as!(
+        ReceiptWithVendor,
+        r#"SELECT 
+            r.id,
+            r.vendor_id,
+            v.name AS vendor_name,
+            r.receipt_number,
+            r.receipt_date,
+            r.subtotal,
+            r.tax_rate,
+            r.total,
+            (r.original_pdf IS NOT NULL) AS has_pdf,
+            r.notes,
+            r.created_at,
+            r.updated_at,
+            COUNT(p.id) AS purchase_count,
+            COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS purchases_total,
+            COALESCE(SUM(p.quantity * COALESCE(p.selling_price, 0)), 0) AS total_selling,
+            COALESCE(SUM(p.quantity * (COALESCE(p.selling_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission
+        FROM receipts r
+        JOIN vendors v ON v.id = r.vendor_id
+        LEFT JOIN purchases p ON p.receipt_id = r.id
+        WHERE r.id = $1
+        GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_rate, r.total,
+                 r.original_pdf, r.notes, r.created_at, r.updated_at"#,
+        id
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_receipts_with_vendor(
+    pool: &PgPool,
+) -> Result<Vec<ReceiptWithVendor>, sqlx::Error> {
+    sqlx::query_as!(
+        ReceiptWithVendor,
+        r#"SELECT 
+            r.id,
+            r.vendor_id,
+            v.name AS vendor_name,
+            r.receipt_number,
+            r.receipt_date,
+            r.subtotal,
+            r.tax_rate,
+            r.total,
+            (r.original_pdf IS NOT NULL) AS has_pdf,
+            r.notes,
+            r.created_at,
+            r.updated_at,
+            COUNT(p.id) AS purchase_count,
+            COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS purchases_total,
+            COALESCE(SUM(p.quantity * COALESCE(p.selling_price, 0)), 0) AS total_selling,
+            COALESCE(SUM(p.quantity * (COALESCE(p.selling_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission
+        FROM receipts r
+        JOIN vendors v ON v.id = r.vendor_id
+        LEFT JOIN purchases p ON p.receipt_id = r.id
+        GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_rate, r.total,
+                 r.original_pdf, r.notes, r.created_at, r.updated_at
+        ORDER BY r.receipt_date DESC"#
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_purchases_by_receipt(
+    pool: &PgPool,
+    receipt_id: Uuid,
+) -> Result<Vec<PurchaseEconomics>, sqlx::Error> {
+    sqlx::query_as!(
+        PurchaseEconomics,
+        r#"SELECT 
+            pe.purchase_id as "purchase_id!",
+            pe.purchase_date as "purchase_date!",
+            pe.item_name as "item_name!",
+            pe.vendor_name as "vendor_name!",
+            pe.destination_code,
+            pe.quantity as "quantity!",
+            pe.purchase_cost as "purchase_cost!",
+            pe.total_cost,
+            pe.selling_price,
+            pe.total_selling,
+            pe.unit_commission,
+            pe.total_commission,
+            pe.tax_paid,
+            pe.tax_owed,
+            pe.status as "status!: DeliveryStatus",
+            pe.delivery_date,
+            pe.invoice_id,
+            pe.receipt_id,
+            pe.receipt_number,
+            pe.invoice_number
+        FROM v_purchase_economics pe
+        WHERE pe.receipt_id = $1
+        ORDER BY pe.purchase_date DESC"#,
+        receipt_id
     )
     .fetch_all(pool)
     .await

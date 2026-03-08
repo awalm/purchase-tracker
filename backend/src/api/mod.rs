@@ -4,6 +4,7 @@ pub mod import;
 pub mod invoices;
 pub mod items;
 pub mod purchases;
+pub mod receipts;
 pub mod reports;
 pub mod vendors;
 
@@ -31,6 +32,7 @@ pub fn router() -> Router<AppState> {
         .nest("/items", items::router())
 
         .nest("/invoices", invoices::router())
+        .nest("/receipts", receipts::router())
         .nest("/purchases", purchases::router())
         .nest("/reports", reports::router())
         .nest("/import", import::router())

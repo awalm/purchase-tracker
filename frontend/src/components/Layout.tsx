@@ -7,6 +7,7 @@ import {
   Package,
   FileText,
   ShoppingCart,
+  Receipt,
   LogOut,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -14,11 +15,12 @@ import { Button } from "@/components/ui/button"
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "Dashboard" },
-  { to: "/vendors", icon: Store, label: "Vendors" },
-  { to: "/destinations", icon: MapPin, label: "Destinations" },
-  { to: "/items", icon: Package, label: "Items" },
+  { to: "/receipts", icon: Receipt, label: "Receipts" },
   { to: "/invoices", icon: FileText, label: "Invoices" },
   { to: "/purchases", icon: ShoppingCart, label: "Purchases" },
+  { to: "/items", icon: Package, label: "Items" },
+  { to: "/vendors", icon: Store, label: "Vendors" },
+  { to: "/destinations", icon: MapPin, label: "Destinations" },
 ]
 
 export function Layout({ children }: { children: React.ReactNode }) {

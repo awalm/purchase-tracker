@@ -675,6 +675,7 @@ async fn import_purchases(
                 // Create the purchase
                 let create_purchase = CreatePurchase {
                     item_id: item.id,
+                    receipt_id: None,
                     invoice_id,
                     quantity: row.quantity,
                     purchase_cost,

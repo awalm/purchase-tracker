@@ -1,4 +1,5 @@
 import { useState } from "react"
+import { Link } from "react-router-dom"
 import { useQueryClient } from "@tanstack/react-query"
 import {
   usePurchases,
@@ -8,6 +9,7 @@ import {
   useItems,
   useDestinations,
   useInvoices,
+  useReceipts,
 } from "@/hooks/useApi"
 import { importApi, type PurchasePreview, type PreviewRow } from "@/api"
 import { Button } from "@/components/ui/button"
@@ -40,7 +42,7 @@ import { ImportDialog } from "@/components/ImportDialog"
 import { ExportCsvButton } from "@/components/ExportCsvButton"
 import { StatusSelect } from "@/components/StatusSelect"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
-import { Plus, Trash2, Pencil } from "lucide-react"
+import { Plus, Trash2, Pencil, AlertCircle } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
 import { PURCHASE_STATUSES } from "@/lib/constants"
 
@@ -89,6 +91,7 @@ export default function PurchasesPage() {
   const { data: items = [] } = useItems()
   const { data: destinations = [] } = useDestinations()
   const { data: invoices = [] } = useInvoices()
+  const { data: allReceipts = [] } = useReceipts()
   
   const createPurchase = useCreatePurchase()
   const updatePurchase = useUpdatePurchase()
@@ -102,6 +105,7 @@ export default function PurchasesPage() {
   const [sellingPrice, setSellingPrice] = useState("")
   const [destinationId, setDestinationId] = useState("")
   const [invoiceId, setInvoiceId] = useState("")
+  const [receiptId, setReceiptId] = useState("")
   const [notes, setNotes] = useState("")
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -116,6 +120,8 @@ export default function PurchasesPage() {
         destination_id: destinationId || undefined,
         invoice_id: invoiceId || undefined,
         clear_invoice: !invoiceId,
+        receipt_id: receiptId || undefined,
+        clear_receipt: !receiptId,
         notes: notes || undefined,
       })
     } else {
@@ -126,10 +132,12 @@ export default function PurchasesPage() {
         selling_price: sellingPrice || undefined,
         destination_id: destinationId || undefined,
         invoice_id: invoiceId || undefined,
+        receipt_id: receiptId || undefined,
         notes: notes || undefined,
       })
     }
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
+    queryClient.invalidateQueries({ queryKey: ["receipts"] })
     setIsOpen(false)
     resetForm()
   }
@@ -142,6 +150,7 @@ export default function PurchasesPage() {
     setSellingPrice("")
     setDestinationId("")
     setInvoiceId("")
+    setReceiptId("")
     setNotes("")
   }
 
@@ -155,6 +164,7 @@ export default function PurchasesPage() {
     const matchedDest = destinations.find((d) => d.code === p.destination_code)
     setDestinationId(matchedDest?.id || "")
     setInvoiceId(p.invoice_id || "")
+    setReceiptId(p.receipt_id || "")
     setNotes("")
     setIsOpen(true)
   }
@@ -330,6 +340,24 @@ export default function PurchasesPage() {
                 </Select>
               </div>
               <div className="space-y-2">
+                <Label htmlFor="receipt">Receipt (optional)</Label>
+                <Select value={receiptId || "__none__"} onValueChange={(v) => setReceiptId(v === "__none__" ? "" : v)}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select receipt" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">
+                      <span className="text-muted-foreground">— No receipt</span>
+                    </SelectItem>
+                    {allReceipts.map((rec) => (
+                      <SelectItem key={rec.id} value={rec.id}>
+                        {rec.receipt_number} - {rec.vendor_name} - {formatCurrency(rec.total)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
                 <Label htmlFor="notes">Notes (optional)</Label>
                 <Input
                   id="notes"
@@ -406,6 +434,7 @@ export default function PurchasesPage() {
                 <TableHead>Item</TableHead>
                 <TableHead>Vendor</TableHead>
                 <TableHead>Dest</TableHead>
+                <TableHead>Receipt</TableHead>
                 <TableHead>Invoice</TableHead>
                 <TableHead className="text-right">Qty</TableHead>
                 <TableHead className="text-right">Cost</TableHead>
@@ -416,19 +445,42 @@ export default function PurchasesPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {purchases.map((p) => (
-                <TableRow key={p.purchase_id}>
+              {purchases.map((p) => {
+                const isUnlinked = !p.receipt_id && !p.invoice_id
+                return (
+                <TableRow key={p.purchase_id} className={isUnlinked ? "bg-red-50" : ""}>
                   <TableCell>{formatDate(p.purchase_date)}</TableCell>
                   <TableCell className="font-medium">{p.item_name}</TableCell>
                   <TableCell>{p.vendor_name}</TableCell>
                   <TableCell>{p.destination_code || "-"}</TableCell>
                   <TableCell>
-                    {p.invoice_id ? (
-                      <span className="text-xs font-mono text-blue-600">
-                        {invoices.find(inv => inv.id === p.invoice_id)?.invoice_number || "linked"}
-                      </span>
+                    {p.receipt_id ? (
+                      <Link
+                        to={`/receipts/${p.receipt_id}`}
+                        className="text-xs font-mono text-emerald-600 hover:underline"
+                      >
+                        {p.receipt_number || "linked"}
+                      </Link>
                     ) : (
-                      <span className="text-muted-foreground">—</span>
+                      <span className="text-red-500 text-xs flex items-center gap-1">
+                        <AlertCircle className="h-3 w-3" />
+                        none
+                      </span>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {p.invoice_id ? (
+                      <Link
+                        to={`/invoices/${p.invoice_id}`}
+                        className="text-xs font-mono text-blue-600 hover:underline"
+                      >
+                        {p.invoice_number || "linked"}
+                      </Link>
+                    ) : (
+                      <span className="text-red-500 text-xs flex items-center gap-1">
+                        <AlertCircle className="h-3 w-3" />
+                        none
+                      </span>
                     )}
                   </TableCell>
                   <TableCell className="text-right">{p.quantity}</TableCell>
@@ -463,8 +515,9 @@ export default function PurchasesPage() {
                     </div>
                   </TableCell>
                 </TableRow>
-              ))}
-              {purchases.length === 0 && <EmptyTableRow colSpan={11} message="No purchases yet" />}
+                )
+              })}
+              {purchases.length === 0 && <EmptyTableRow colSpan={12} message="No purchases yet" />}
             </TableBody>
           </Table>
         </CardContent>

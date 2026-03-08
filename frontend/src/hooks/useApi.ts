@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
-import { vendors, destinations, items, invoices, purchases, reports } from "@/api"
+import { vendors, destinations, items, invoices, receipts, purchases, reports } from "@/api"
 
 // ============================================
 // Vendors
@@ -172,6 +172,64 @@ export function useDeleteInvoice() {
 }
 
 // ============================================
+// Receipts
+// ============================================
+export function useReceipts() {
+  return useQuery({
+    queryKey: ["receipts"],
+    queryFn: receipts.list,
+  })
+}
+
+export function useReceipt(id: string) {
+  return useQuery({
+    queryKey: ["receipts", id],
+    queryFn: () => receipts.get(id),
+    enabled: !!id,
+  })
+}
+
+export function useReceiptPurchases(id: string) {
+  return useQuery({
+    queryKey: ["receipts", id, "purchases"],
+    queryFn: () => receipts.purchases(id),
+    enabled: !!id,
+  })
+}
+
+export function useCreateReceipt() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (data: {
+      vendor_id: string
+      receipt_number: string
+      receipt_date: string
+      subtotal: string
+      tax_rate?: string
+      notes?: string
+    }) => receipts.create(data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["receipts"] }),
+  })
+}
+
+export function useUpdateReceipt() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...data }: { id: string } & Record<string, unknown>) =>
+      receipts.update(id, data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["receipts"] }),
+  })
+}
+
+export function useDeleteReceipt() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => receipts.delete(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["receipts"] }),
+  })
+}
+
+// ============================================
 // Purchases
 // ============================================
 export function usePurchases(params?: { status?: string; destination_id?: string }) {
@@ -191,6 +249,7 @@ export function useCreatePurchase() {
       selling_price?: string
       destination_id?: string
       invoice_id?: string
+      receipt_id?: string
       status?: string
       notes?: string
     }) => purchases.create(data),

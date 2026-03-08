@@ -75,10 +75,26 @@ pub struct Invoice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Receipt {
+    pub id: Uuid,
+    pub vendor_id: Uuid,
+    pub receipt_number: String,
+    pub receipt_date: NaiveDate,
+    pub subtotal: Decimal,
+    pub tax_rate: Decimal,
+    pub total: Decimal,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    // original_pdf and original_filename are NOT included here
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Purchase {
     pub id: Uuid,
     pub item_id: Uuid,
     pub invoice_id: Option<Uuid>,
+    pub receipt_id: Option<Uuid>,
     pub quantity: i32,
     pub purchase_cost: Decimal,
     pub selling_price: Option<Decimal>,
@@ -148,6 +164,9 @@ pub struct PurchaseEconomics {
     pub status: DeliveryStatus,
     pub delivery_date: Option<NaiveDate>,
     pub invoice_id: Option<Uuid>,
+    pub receipt_id: Option<Uuid>,
+    pub receipt_number: Option<String>,
+    pub invoice_number: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -185,9 +204,31 @@ pub struct DestinationSummary {
 pub struct VendorSummary {
     pub vendor_id: Uuid,
     pub vendor_name: String,
+    pub total_receipts: Option<i64>,
     pub total_purchases: Option<i64>,
     pub total_quantity: Option<i64>,
     pub total_spent: Option<Decimal>,
+}
+
+// Receipt detail with vendor info and linked purchase economics
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ReceiptWithVendor {
+    pub id: Uuid,
+    pub vendor_id: Uuid,
+    pub vendor_name: String,
+    pub receipt_number: String,
+    pub receipt_date: NaiveDate,
+    pub subtotal: Decimal,
+    pub tax_rate: Decimal,
+    pub total: Decimal,
+    pub has_pdf: Option<bool>,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub purchase_count: Option<i64>,
+    pub purchases_total: Option<Decimal>,
+    pub total_selling: Option<Decimal>,
+    pub total_commission: Option<Decimal>,
 }
 
 // Invoice detail with destination info and linked purchase economics
@@ -283,9 +324,29 @@ pub struct UpdateInvoice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateReceipt {
+    pub vendor_id: Uuid,
+    pub receipt_number: String,
+    pub receipt_date: NaiveDate,
+    pub subtotal: Decimal,
+    pub tax_rate: Option<Decimal>,  // defaults to 13.00 if not provided
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateReceipt {
+    pub receipt_number: Option<String>,
+    pub receipt_date: Option<NaiveDate>,
+    pub subtotal: Option<Decimal>,
+    pub tax_rate: Option<Decimal>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreatePurchase {
     pub item_id: Uuid,
     pub invoice_id: Option<Uuid>,
+    pub receipt_id: Option<Uuid>,
     pub quantity: i32,
     pub purchase_cost: Decimal,
     pub selling_price: Option<Decimal>,
@@ -301,6 +362,9 @@ pub struct UpdatePurchase {
     pub invoice_id: Option<Uuid>,
     #[serde(default)]
     pub clear_invoice: bool,     // true → set invoice_id to NULL
+    pub receipt_id: Option<Uuid>,
+    #[serde(default)]
+    pub clear_receipt: bool,     // true → set receipt_id to NULL
     pub quantity: Option<i32>,
     pub purchase_cost: Option<Decimal>,
     pub selling_price: Option<Decimal>,

@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom"
 import { useVendorSummary, useDestinationSummary } from "@/hooks/useApi"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card"
 import {
@@ -170,6 +171,7 @@ export default function DashboardPage() {
             filename="dashboard_vendors"
             columns={[
               { header: "Vendor", accessor: (v) => v.vendor_name },
+              { header: "Receipts", accessor: (v) => v.total_receipts },
               { header: "Purchases", accessor: (v) => v.total_purchases },
               { header: "Quantity", accessor: (v) => v.total_quantity },
               { header: "Total Spent", accessor: (v) => v.total_spent },
@@ -184,6 +186,7 @@ export default function DashboardPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Vendor</TableHead>
+                <TableHead className="text-right">Receipts</TableHead>
                 <TableHead className="text-right">Purchases</TableHead>
                 <TableHead className="text-right">Quantity</TableHead>
                 <TableHead className="text-right">Total Spent</TableHead>
@@ -191,8 +194,17 @@ export default function DashboardPage() {
             </TableHeader>
             <TableBody>
               {vendorStats.map((v) => (
-                <TableRow key={v.vendor_id}>
-                  <TableCell>{v.vendor_name}</TableCell>
+                <TableRow key={v.vendor_id} className="cursor-pointer hover:bg-muted/50">
+                  <TableCell className="font-medium">
+                    <Link to="/vendors" className="hover:underline">
+                      {v.vendor_name}
+                    </Link>
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <Link to="/receipts" className="text-blue-600 hover:underline">
+                      {v.total_receipts || 0}
+                    </Link>
+                  </TableCell>
                   <TableCell className="text-right">{v.total_purchases || 0}</TableCell>
                   <TableCell className="text-right">{v.total_quantity || 0}</TableCell>
                   <TableCell className="text-right">

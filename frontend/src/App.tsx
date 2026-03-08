@@ -8,6 +8,8 @@ import DestinationsPage from "@/pages/DestinationsPage"
 import ItemsPage from "@/pages/ItemsPage"
 import InvoicesPage from "@/pages/InvoicesPage"
 import InvoiceDetailPage from "@/pages/InvoiceDetailPage"
+import ReceiptsPage from "@/pages/ReceiptsPage"
+import ReceiptDetailPage from "@/pages/ReceiptDetailPage"
 import PurchasesPage from "@/pages/PurchasesPage"
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -90,6 +92,22 @@ export default function App() {
         element={
           <ProtectedRoute>
             <InvoiceDetailPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/receipts"
+        element={
+          <ProtectedRoute>
+            <ReceiptsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/receipts/:id"
+        element={
+          <ProtectedRoute>
+            <ReceiptDetailPage />
           </ProtectedRoute>
         }
       />
