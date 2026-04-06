@@ -9,6 +9,9 @@ import {
   useDeletePurchase,
   useItems,
   useDestinations,
+  useReceipts,
+  useVendors,
+  useCreateReceipt,
 } from "@/hooks/useApi"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -41,7 +44,7 @@ import { StatusSelect } from "@/components/StatusSelect"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
 import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, FileDown, Upload, Loader2 } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
-import { invoices as invoicesApi } from "@/api"
+import { invoices as invoicesApi, receipts as receiptsApi } from "@/api"
 
 
 export default function InvoiceDetailPage() {
@@ -53,10 +56,13 @@ export default function InvoiceDetailPage() {
   const { data: purchases = [], isLoading: purchasesLoading } = useInvoicePurchases(id || "")
   const { data: items = [] } = useItems()
   const { data: destinations = [] } = useDestinations()
+  const { data: receipts = [] } = useReceipts()
+  const { data: vendors = [] } = useVendors()
 
   const createPurchase = useCreatePurchase()
   const updatePurchase = useUpdatePurchase()
   const deletePurchase = useDeletePurchase()
+  const createReceipt = useCreateReceipt()
 
   // PDF upload state
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -88,7 +94,74 @@ export default function InvoiceDetailPage() {
   const [purchaseCost, setPurchaseCost] = useState("")
   const [sellingPrice, setSellingPrice] = useState("")
   const [destinationId, setDestinationId] = useState("")
+  const [receiptId, setReceiptId] = useState("")
   const [notes, setNotes] = useState("")
+
+  // Receipt-link dialog (focused, not the full edit form)
+  const [linkDialogOpen, setLinkDialogOpen] = useState(false)
+  const [linkingPurchaseId, setLinkingPurchaseId] = useState<string | null>(null)
+  const [linkReceiptId, setLinkReceiptId] = useState("")
+  const [showNewReceipt, setShowNewReceipt] = useState(false)
+  const [newRcptVendorId, setNewRcptVendorId] = useState("")
+  const [newRcptNumber, setNewRcptNumber] = useState("")
+  const [newRcptDate, setNewRcptDate] = useState("")
+  const [newRcptSubtotal, setNewRcptSubtotal] = useState("")
+  const [newRcptTaxRate, setNewRcptTaxRate] = useState("13.00")
+  const [newRcptFile, setNewRcptFile] = useState<File | null>(null)
+  const [linkNotes, setLinkNotes] = useState("")
+
+  const openLinkDialog = (purchaseId: string, currentReceiptId?: string | null, currentNotes?: string | null) => {
+    setLinkingPurchaseId(purchaseId)
+    setLinkReceiptId(currentReceiptId || "")
+    setLinkNotes(currentNotes || "")
+    setShowNewReceipt(false)
+    setNewRcptFile(null)
+    setLinkDialogOpen(true)
+  }
+
+  const resetNewReceiptForm = () => {
+    setNewRcptVendorId("")
+    setNewRcptNumber("")
+    setNewRcptDate("")
+    setNewRcptSubtotal("")
+    setNewRcptTaxRate("13.00")
+    setNewRcptFile(null)
+  }
+
+  const handleCreateAndLink = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!linkingPurchaseId) return
+    const newReceipt = await createReceipt.mutateAsync({
+      vendor_id: newRcptVendorId,
+      receipt_number: newRcptNumber,
+      receipt_date: newRcptDate,
+      subtotal: newRcptSubtotal,
+      tax_rate: newRcptTaxRate,
+    })
+    await receiptsApi.uploadPdf(newReceipt.id, newRcptFile!)
+    await updatePurchase.mutateAsync({
+      id: linkingPurchaseId,
+      receipt_id: newReceipt.id,
+      notes: linkNotes || undefined,
+    })
+    queryClient.invalidateQueries({ queryKey: ["invoices"] })
+    queryClient.invalidateQueries({ queryKey: ["receipts"] })
+    setLinkDialogOpen(false)
+    resetNewReceiptForm()
+  }
+
+  const handleLinkReceipt = async () => {
+    if (!linkingPurchaseId) return
+    await updatePurchase.mutateAsync({
+      id: linkingPurchaseId,
+      receipt_id: linkReceiptId || undefined,
+      clear_receipt: !linkReceiptId,
+      notes: linkNotes || undefined,
+    })
+    queryClient.invalidateQueries({ queryKey: ["invoices"] })
+    queryClient.invalidateQueries({ queryKey: ["receipts"] })
+    setLinkDialogOpen(false)
+  }
 
   // Show all items (no vendor filtering needed for outgoing invoices)
   const availableItems = items
@@ -103,6 +176,9 @@ export default function InvoiceDetailPage() {
         purchase_cost: purchaseCost,
         selling_price: sellingPrice || undefined,
         destination_id: destinationId || undefined,
+        receipt_id: receiptId || undefined,
+        clear_receipt: !receiptId,
+        invoice_id: id,
         notes: notes || undefined,
       })
     } else {
@@ -112,12 +188,14 @@ export default function InvoiceDetailPage() {
         purchase_cost: purchaseCost,
         selling_price: sellingPrice || undefined,
         destination_id: destinationId || undefined,
+        receipt_id: receiptId || undefined,
         invoice_id: id,
         notes: notes || undefined,
       })
     }
     // Also invalidate the invoice detail to refresh counts
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
+    queryClient.invalidateQueries({ queryKey: ["receipts"] })
     setIsOpen(false)
     resetForm()
   }
@@ -129,6 +207,7 @@ export default function InvoiceDetailPage() {
     setPurchaseCost("")
     setSellingPrice("")
     setDestinationId("")
+    setReceiptId("")
     setNotes("")
   }
 
@@ -136,7 +215,6 @@ export default function InvoiceDetailPage() {
     setItemId(selectedId)
     const item = items.find((i) => i.id === selectedId)
     if (item) {
-      setPurchaseCost(item.purchase_cost)
       // Default to invoice destination if item has no default
       if (item.default_destination_id) {
         setDestinationId(item.default_destination_id)
@@ -157,6 +235,7 @@ export default function InvoiceDetailPage() {
     // Find destination by code
     const matchedDest = destinations.find((d) => d.code === p.destination_code)
     setDestinationId(matchedDest?.id || "")
+    setReceiptId(p.receipt_id || "")
     setNotes("")
     setIsOpen(true)
   }
@@ -186,6 +265,9 @@ export default function InvoiceDetailPage() {
   const totalCost = purchases.reduce((sum, p) => sum + parseFloat(p.total_cost || "0"), 0)
   const totalCommission = purchases.reduce((sum, p) => sum + parseFloat(p.total_commission || "0"), 0)
   const hasAnyPrice = purchases.some(p => p.selling_price !== null)
+  const receiptedCount = invoice.receipted_count || purchases.filter(p => p.receipt_id).length
+  const totalPurchases = purchases.length
+  const fullyReconciled = isReconciled && totalPurchases > 0 && receiptedCount === totalPurchases
 
   return (
     <div className="space-y-6">
@@ -228,7 +310,7 @@ export default function InvoiceDetailPage() {
               }}
             >
               <FileDown className="h-4 w-4 mr-2" />
-              View Receipt
+              View Invoice
             </Button>
           ) : (
             <Button
@@ -245,7 +327,7 @@ export default function InvoiceDetailPage() {
               ) : (
                 <>
                   <Upload className="h-4 w-4 mr-2" />
-                  Attach Receipt
+                  Attach Invoice
                 </>
               )}
             </Button>
@@ -260,22 +342,34 @@ export default function InvoiceDetailPage() {
               { header: "Selling Price", accessor: (p) => p.selling_price },
               { header: "Line Total", accessor: (p) => p.total_selling },
               { header: "Commission", accessor: (p) => p.total_commission },
+              { header: "Receipt", accessor: (p) => p.receipt_number },
               { header: "Status", accessor: (p) => p.status },
               { header: "Delivery Date", accessor: (p) => p.delivery_date },
+              { header: "Notes", accessor: (p) => p.notes },
             ]}
             data={purchases}
             size="sm"
           />
-          {isReconciled ? (
+          {fullyReconciled ? (
             <span className="flex items-center gap-1 text-green-600 bg-green-50 px-3 py-1.5 rounded-full text-sm font-medium">
               <CheckCircle2 className="h-4 w-4" />
               Reconciled
             </span>
           ) : (
-            <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
-              <AlertCircle className="h-4 w-4" />
-              {purchaseCount === 0 ? "No purchases linked" : `${formatCurrency(Math.abs(difference))} ${difference > 0 ? "unaccounted" : "over"}`}
-            </span>
+            <>
+              {!isReconciled && (
+                <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
+                  <AlertCircle className="h-4 w-4" />
+                  {purchaseCount === 0 ? "No purchases linked" : `${formatCurrency(Math.abs(difference))} ${difference > 0 ? "unaccounted" : "over"}`}
+                </span>
+              )}
+              {totalPurchases > 0 && receiptedCount < totalPurchases && (
+                <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
+                  <AlertCircle className="h-4 w-4" />
+                  {receiptedCount}/{totalPurchases} receipted
+                </span>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -373,13 +467,13 @@ export default function InvoiceDetailPage() {
                   <div className="space-y-2">
                     <Label htmlFor="item">Item</Label>
                     <Select value={itemId} onValueChange={handleItemChange} required>
-                      <SelectTrigger>
+                      <SelectTrigger className="truncate">
                         <SelectValue placeholder="Select item" />
                       </SelectTrigger>
                       <SelectContent>
                         {availableItems.map((i) => (
                           <SelectItem key={i.id} value={i.id}>
-                            {i.name} ({(i as { vendor_name?: string }).vendor_name || "Unknown"}) - {formatCurrency(i.purchase_cost)}
+                            <span className="truncate">{i.name}</span>
                           </SelectItem>
                         ))}
                       </SelectContent>
@@ -444,6 +538,27 @@ export default function InvoiceDetailPage() {
                       placeholder="Any notes..."
                     />
                   </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="receipt">Receipt (optional)</Label>
+                    <Select
+                      value={receiptId || "__none__"}
+                      onValueChange={(v) => setReceiptId(v === "__none__" ? "" : v)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select receipt" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__none__">
+                          <span className="text-muted-foreground">— No receipt</span>
+                        </SelectItem>
+                        {receipts.map((r) => (
+                          <SelectItem key={r.id} value={r.id}>
+                            {r.receipt_number} - {r.vendor_name} ({formatCurrency(r.total)})
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
                   {/* Live reconciliation hint */}
                   {sellingPrice && quantity && (
                     <div className="text-sm bg-muted p-3 rounded-md space-y-1">
@@ -482,7 +597,7 @@ export default function InvoiceDetailPage() {
                 <TableRow>
                   <TableHead>Item</TableHead>
                   <TableHead>Dest</TableHead>
-                  <TableHead>Receipt</TableHead>
+                  <TableHead>Receipts</TableHead>
                   <TableHead className="text-right">Qty</TableHead>
                   <TableHead className="text-right">Purchase Cost</TableHead>
                   <TableHead className="text-right">Selling Price</TableHead>
@@ -495,7 +610,11 @@ export default function InvoiceDetailPage() {
               <TableBody>
                 {purchases.map((p) => (
                   <TableRow key={p.purchase_id}>
-                    <TableCell className="font-medium">{p.item_name}</TableCell>
+                    <TableCell className="font-medium">
+                      <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
+                        {p.item_name}
+                      </Link>
+                    </TableCell>
                     <TableCell className="font-mono">{p.destination_code || "-"}</TableCell>
                     <TableCell>
                       {p.receipt_id ? (
@@ -506,10 +625,14 @@ export default function InvoiceDetailPage() {
                           {p.receipt_number || "linked"}
                         </Link>
                       ) : (
-                        <span className="text-red-500 text-xs flex items-center gap-1">
+                        <button
+                          onClick={() => openLinkDialog(p.purchase_id, p.receipt_id, p.notes)}
+                          className="text-red-500 text-xs flex items-center gap-1 hover:underline cursor-pointer"
+                          title="Click to link a receipt"
+                        >
                           <AlertCircle className="h-3 w-3" />
                           unlinked
-                        </span>
+                        </button>
                       )}
                     </TableCell>
                     <TableCell className="text-right">{p.quantity}</TableCell>
@@ -560,6 +683,122 @@ export default function InvoiceDetailPage() {
           )}
         </CardContent>
       </Card>
+
+      {/* Focused Receipt Link Dialog */}
+      <Dialog open={linkDialogOpen} onOpenChange={(open) => {
+        setLinkDialogOpen(open)
+        if (!open) { setShowNewReceipt(false); resetNewReceiptForm() }
+      }}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{showNewReceipt ? "New Receipt" : "Link Receipt"}</DialogTitle>
+          </DialogHeader>
+          {showNewReceipt ? (
+            <form onSubmit={handleCreateAndLink} className="space-y-4">
+              <div className="space-y-2">
+                <Label>Vendor</Label>
+                <Select value={newRcptVendorId} onValueChange={setNewRcptVendorId} required>
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select vendor" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {vendors.map((v) => (
+                      <SelectItem key={v.id} value={v.id}>{v.name}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Receipt Number</Label>
+                <Input value={newRcptNumber} onChange={(e) => setNewRcptNumber(e.target.value)} placeholder="REC-001" required />
+              </div>
+              <div className="space-y-2">
+                <Label>Date</Label>
+                <Input type="date" value={newRcptDate} onChange={(e) => setNewRcptDate(e.target.value)} required />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label>Subtotal</Label>
+                  <Input type="number" step="0.01" value={newRcptSubtotal} onChange={(e) => setNewRcptSubtotal(e.target.value)} placeholder="0.00" required />
+                </div>
+                <div className="space-y-2">
+                  <Label>Tax Rate %</Label>
+                  <Input type="number" step="0.01" value={newRcptTaxRate} onChange={(e) => setNewRcptTaxRate(e.target.value)} />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label>Receipt Document</Label>
+                <Input
+                  type="file"
+                  accept=".pdf,.png,.jpg,.jpeg,.webp"
+                  onChange={(e) => setNewRcptFile(e.target.files?.[0] || null)}
+                  className="cursor-pointer"
+                  required
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>Notes</Label>
+                <Input value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
+              </div>
+              <div className="flex justify-between">
+                <Button type="button" variant="link" className="px-0" onClick={() => setShowNewReceipt(false)}>
+                  ← Back
+                </Button>
+                <div className="flex gap-2">
+                  <Button type="button" variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
+                  <Button type="submit" disabled={createReceipt.isPending}>
+                    {createReceipt.isPending ? "Creating..." : "Create & Link"}
+                  </Button>
+                </div>
+              </div>
+            </form>
+          ) : (
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <Label>Receipt</Label>
+                <Select
+                  value={linkReceiptId || "__none__"}
+                  onValueChange={(v) => setLinkReceiptId(v === "__none__" ? "" : v)}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select receipt" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">
+                      <span className="text-muted-foreground">— No receipt</span>
+                    </SelectItem>
+                    {receipts.map((r) => (
+                      <SelectItem key={r.id} value={r.id}>
+                        {r.receipt_number} - {r.vendor_name} ({formatCurrency(r.total)})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Notes</Label>
+                <Input value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
+              </div>
+              <div className="flex justify-between">
+                <Button
+                  variant="link"
+                  className="px-0 text-emerald-600"
+                  onClick={() => setShowNewReceipt(true)}
+                >
+                  <Plus className="h-4 w-4 mr-1" />
+                  New Receipt
+                </Button>
+                <div className="flex gap-2">
+                  <Button variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
+                  <Button onClick={handleLinkReceipt} disabled={updatePurchase.isPending}>
+                    {updatePurchase.isPending ? "Saving..." : "Save"}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

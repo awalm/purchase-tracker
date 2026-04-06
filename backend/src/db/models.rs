@@ -46,10 +46,6 @@ pub struct Destination {
 pub struct Item {
     pub id: Uuid,
     pub name: String,
-    pub vendor_id: Uuid,
-    pub purchase_cost: Decimal,
-    pub start_date: NaiveDate,
-    pub end_date: Option<NaiveDate>,
     pub default_destination_id: Option<Uuid>,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -136,9 +132,6 @@ pub struct AuditLog {
 pub struct ActiveItem {
     pub id: Uuid,
     pub name: String,
-    pub vendor_id: Uuid,
-    pub vendor_name: String,
-    pub purchase_cost: Decimal,
     pub default_destination_id: Option<Uuid>,
     pub default_destination_code: Option<String>,
     pub notes: Option<String>,
@@ -149,8 +142,9 @@ pub struct ActiveItem {
 pub struct PurchaseEconomics {
     pub purchase_id: Uuid,
     pub purchase_date: DateTime<Utc>,
+    pub item_id: Uuid,
     pub item_name: String,
-    pub vendor_name: String,
+    pub vendor_name: Option<String>,
     pub destination_code: Option<String>,
     pub quantity: i32,
     pub purchase_cost: Decimal,
@@ -167,6 +161,7 @@ pub struct PurchaseEconomics {
     pub receipt_id: Option<Uuid>,
     pub receipt_number: Option<String>,
     pub invoice_number: Option<String>,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -229,6 +224,7 @@ pub struct ReceiptWithVendor {
     pub purchases_total: Option<Decimal>,
     pub total_selling: Option<Decimal>,
     pub total_commission: Option<Decimal>,
+    pub invoiced_count: Option<i64>,
 }
 
 // Invoice detail with destination info and linked purchase economics
@@ -252,6 +248,7 @@ pub struct InvoiceWithDestination {
     pub purchases_total: Option<Decimal>,
     pub total_cost: Option<Decimal>,
     pub total_commission: Option<Decimal>,
+    pub receipted_count: Option<i64>,
 }
 
 // ============================================
@@ -285,10 +282,6 @@ pub struct UpdateDestination {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateItem {
     pub name: String,
-    pub vendor_id: Uuid,
-    pub purchase_cost: Decimal,
-    pub start_date: NaiveDate,
-    pub end_date: Option<NaiveDate>,
     pub default_destination_id: Option<Uuid>,
     pub notes: Option<String>,
 }
@@ -296,8 +289,6 @@ pub struct CreateItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateItem {
     pub name: Option<String>,
-    pub purchase_cost: Option<Decimal>,
-    pub end_date: Option<NaiveDate>,
     pub default_destination_id: Option<Uuid>,
     pub notes: Option<String>,
 }
@@ -397,11 +388,7 @@ pub struct PurchaseQuery {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ItemQuery {
-    pub vendor_id: Option<Uuid>,
-    pub date: Option<NaiveDate>,
-    pub active_only: Option<bool>,
-}
+pub struct ItemQuery {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditQuery {
@@ -586,6 +573,7 @@ mod tests {
                 purchases_total: Some(dec!(4424.78)),
                 total_cost: Some(dec!(3500.00)),
                 total_commission: Some(dec!(924.78)),
+                receipted_count: Some(2),
             }
         }
 
@@ -731,6 +719,7 @@ mod tests {
             let summary = VendorSummary {
                 vendor_id: Uuid::new_v4(),
                 vendor_name: "Best Buy".to_string(),
+                total_receipts: Some(3),
                 total_purchases: Some(10),
                 total_quantity: Some(50),
                 total_spent: Some(dec!(3000.00)),
@@ -804,6 +793,7 @@ mod tests {
                     id: Uuid::new_v4(),
                     item_id,
                     invoice_id: Some(inv1_id),
+                    receipt_id: None,
                     quantity: 4,
                     purchase_cost,
                     selling_price: Some(dec!(12.00)),
@@ -818,6 +808,7 @@ mod tests {
                     id: Uuid::new_v4(),
                     item_id,
                     invoice_id: Some(inv2_id),
+                    receipt_id: None,
                     quantity: -1,
                     purchase_cost,
                     selling_price: Some(dec!(12.00)),
@@ -890,8 +881,9 @@ mod tests {
             let econ = PurchaseEconomics {
                 purchase_id: Uuid::new_v4(),
                 purchase_date: Utc::now(),
+                item_id: Uuid::new_v4(),
                 item_name: "Widget".to_string(),
-                vendor_name: "Best Buy".to_string(),
+                vendor_name: Some("Best Buy".to_string()),
                 destination_code: Some("BSC".to_string()),
                 quantity: -1,
                 purchase_cost: dec!(8.00),
@@ -905,6 +897,10 @@ mod tests {
                 status: DeliveryStatus::Pending,
                 delivery_date: None,
                 invoice_id: Some(Uuid::new_v4()),
+                receipt_id: None,
+                receipt_number: None,
+                invoice_number: None,
+                notes: None,
             };
 
             assert_eq!(econ.quantity, -1);
@@ -919,8 +915,9 @@ mod tests {
             let sale = PurchaseEconomics {
                 purchase_id: Uuid::new_v4(),
                 purchase_date: Utc::now(),
+                item_id: Uuid::new_v4(),
                 item_name: "Widget".to_string(),
-                vendor_name: "Best Buy".to_string(),
+                vendor_name: Some("Best Buy".to_string()),
                 destination_code: Some("BSC".to_string()),
                 quantity: 4,
                 purchase_cost: dec!(8.00),
@@ -934,13 +931,18 @@ mod tests {
                 status: DeliveryStatus::Delivered,
                 delivery_date: None,
                 invoice_id: Some(Uuid::new_v4()),
+                receipt_id: None,
+                receipt_number: None,
+                invoice_number: None,
+                notes: None,
             };
 
             let refund = PurchaseEconomics {
                 purchase_id: Uuid::new_v4(),
                 purchase_date: Utc::now(),
+                item_id: Uuid::new_v4(),
                 item_name: "Widget".to_string(),
-                vendor_name: "Best Buy".to_string(),
+                vendor_name: Some("Best Buy".to_string()),
                 destination_code: Some("BSC".to_string()),
                 quantity: -1,
                 purchase_cost: dec!(8.00),
@@ -954,6 +956,10 @@ mod tests {
                 status: DeliveryStatus::Pending,
                 delivery_date: None,
                 invoice_id: Some(Uuid::new_v4()),
+                receipt_id: None,
+                receipt_number: None,
+                invoice_number: None,
+                notes: None,
             };
 
             let items = vec![sale, refund];
@@ -1064,6 +1070,258 @@ mod tests {
             assert_eq!(query.status, Some(DeliveryStatus::Pending));
             assert_eq!(query.limit, Some(50));
             assert_eq!(query.destination_id, None);
+        }
+    }
+
+    // ==================== Item Model (no vendor) ====================
+    // These tests guarantee that Item and ActiveItem never regress back to
+    // having vendor fields. The 500 error on /api/items/active was caused
+    // by a stale query referencing vendor_id after the column was dropped.
+
+    mod item_model_tests {
+        use super::*;
+
+        #[test]
+        fn item_has_no_vendor_field() {
+            let item = Item {
+                id: Uuid::new_v4(),
+                name: "Echo Dot".to_string(),
+                default_destination_id: None,
+                notes: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let json = serde_json::to_string(&item).unwrap();
+            assert!(!json.contains("vendor_id"), "Item must not have vendor_id field");
+            assert!(!json.contains("vendor_name"), "Item must not have vendor_name field");
+        }
+
+        #[test]
+        fn active_item_has_no_vendor_field() {
+            let item = ActiveItem {
+                id: Uuid::new_v4(),
+                name: "PS5".to_string(),
+                default_destination_id: None,
+                default_destination_code: Some("BSC".to_string()),
+                notes: None,
+                created_at: Utc::now(),
+            };
+            let json = serde_json::to_string(&item).unwrap();
+            assert!(!json.contains("vendor_id"), "ActiveItem must not have vendor_id");
+            assert!(!json.contains("vendor_name"), "ActiveItem must not have vendor_name");
+        }
+
+        #[test]
+        fn create_item_has_no_vendor_field() {
+            let json = serde_json::json!({
+                "name": "Test Item",
+                "default_destination_id": null,
+                "notes": null
+            });
+            let item: CreateItem = serde_json::from_value(json).unwrap();
+            assert_eq!(item.name, "Test Item");
+            let serialized = serde_json::to_string(&item).unwrap();
+            assert!(!serialized.contains("vendor"), "CreateItem must not have any vendor field");
+        }
+
+        #[test]
+        fn create_item_minimal() {
+            // Only name is required
+            let json = r#"{"name": "Widget"}"#;
+            let item: CreateItem = serde_json::from_str(json).unwrap();
+            assert_eq!(item.name, "Widget");
+            assert_eq!(item.default_destination_id, None);
+            assert_eq!(item.notes, None);
+        }
+
+        #[test]
+        fn create_item_with_destination_and_notes() {
+            let dest_id = Uuid::new_v4();
+            let json = serde_json::json!({
+                "name": "Echo Dot",
+                "default_destination_id": dest_id,
+                "notes": "5th gen"
+            });
+            let item: CreateItem = serde_json::from_value(json).unwrap();
+            assert_eq!(item.name, "Echo Dot");
+            assert_eq!(item.default_destination_id, Some(dest_id));
+            assert_eq!(item.notes, Some("5th gen".to_string()));
+        }
+
+        #[test]
+        fn active_item_roundtrip() {
+            let item = ActiveItem {
+                id: Uuid::new_v4(),
+                name: "Switch OLED".to_string(),
+                default_destination_id: Some(Uuid::new_v4()),
+                default_destination_code: Some("CBG".to_string()),
+                notes: Some("White model".to_string()),
+                created_at: Utc::now(),
+            };
+            let json = serde_json::to_string(&item).unwrap();
+            let parsed: ActiveItem = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.id, item.id);
+            assert_eq!(parsed.name, "Switch OLED");
+            assert_eq!(parsed.default_destination_code, Some("CBG".to_string()));
+        }
+
+        #[test]
+        fn item_query_is_empty_struct() {
+            // ItemQuery should have no fields (vendor_id was removed)
+            let json = "{}";
+            let query: ItemQuery = serde_json::from_str(json).unwrap();
+            let serialized = serde_json::to_string(&query).unwrap();
+            assert_eq!(serialized, "{}");
+        }
+    }
+
+    // ==================== Zero Purchase Cost Economics ====================
+    // When purchase_cost = 0 (cost unknown), the view treats it as if
+    // cost = selling_price, so commission = 0 (break-even) instead of
+    // inflated profit. These tests validate the expected model values
+    // that the view would produce.
+
+    mod zero_cost_economics_tests {
+        use super::*;
+
+        /// Helper: builds a PurchaseEconomics with the logic the view applies
+        /// when purchase_cost = 0 (uses selling_price as effective cost).
+        fn make_zero_cost_economics(qty: i32, selling_price: Decimal) -> PurchaseEconomics {
+            PurchaseEconomics {
+                purchase_id: Uuid::new_v4(),
+                purchase_date: Utc::now(),
+                item_id: Uuid::new_v4(),
+                item_name: "Widget".to_string(),
+                vendor_name: Some("Amazon".to_string()),
+                destination_code: Some("BSC".to_string()),
+                quantity: qty,
+                purchase_cost: dec!(0),
+                // View logic: total_cost = qty * selling_price when cost = 0
+                total_cost: Some(Decimal::from(qty) * selling_price),
+                selling_price: Some(selling_price),
+                total_selling: Some(Decimal::from(qty) * selling_price),
+                // View logic: commission = 0 when cost = 0
+                unit_commission: Some(dec!(0)),
+                total_commission: Some(dec!(0)),
+                // View logic: tax_paid = qty * selling_price * 0.13 when cost = 0
+                tax_paid: Some(Decimal::from(qty) * selling_price * dec!(0.13)),
+                tax_owed: Some(dec!(0)),
+                status: DeliveryStatus::Pending,
+                delivery_date: None,
+                invoice_id: None,
+                receipt_id: None,
+                receipt_number: None,
+                invoice_number: None,
+                notes: None,
+            }
+        }
+
+        /// Helper: builds a PurchaseEconomics with normal (nonzero) cost.
+        fn make_normal_economics(qty: i32, cost: Decimal, sell: Decimal) -> PurchaseEconomics {
+            let commission = sell - cost;
+            PurchaseEconomics {
+                purchase_id: Uuid::new_v4(),
+                purchase_date: Utc::now(),
+                item_id: Uuid::new_v4(),
+                item_name: "Widget".to_string(),
+                vendor_name: Some("Amazon".to_string()),
+                destination_code: Some("BSC".to_string()),
+                quantity: qty,
+                purchase_cost: cost,
+                total_cost: Some(Decimal::from(qty) * cost),
+                selling_price: Some(sell),
+                total_selling: Some(Decimal::from(qty) * sell),
+                unit_commission: Some(commission),
+                total_commission: Some(Decimal::from(qty) * commission),
+                tax_paid: Some(Decimal::from(qty) * cost * dec!(0.13)),
+                tax_owed: Some(Decimal::from(qty) * commission * dec!(0.13)),
+                status: DeliveryStatus::Pending,
+                delivery_date: None,
+                invoice_id: None,
+                receipt_id: None,
+                receipt_number: None,
+                invoice_number: None,
+                notes: None,
+            }
+        }
+
+        #[test]
+        fn zero_cost_shows_zero_commission() {
+            let econ = make_zero_cost_economics(3, dec!(25.00));
+            assert_eq!(econ.purchase_cost, dec!(0));
+            assert_eq!(econ.unit_commission, Some(dec!(0)),
+                "Commission must be 0 when purchase cost unknown");
+            assert_eq!(econ.total_commission, Some(dec!(0)),
+                "Total commission must be 0 when purchase cost unknown");
+        }
+
+        #[test]
+        fn zero_cost_total_cost_uses_selling_price() {
+            let econ = make_zero_cost_economics(4, dec!(30.00));
+            // total_cost should be qty * selling_price = 4 * 30 = 120
+            assert_eq!(econ.total_cost, Some(dec!(120.00)),
+                "total_cost should use selling_price as effective cost");
+            assert_eq!(econ.total_selling, Some(dec!(120.00)),
+                "total_selling = qty * selling_price");
+            // total_cost == total_selling (break-even)
+            assert_eq!(econ.total_cost, econ.total_selling,
+                "When cost unknown, total_cost = total_selling (break-even)");
+        }
+
+        #[test]
+        fn zero_cost_tax_paid_uses_selling_price() {
+            let econ = make_zero_cost_economics(2, dec!(50.00));
+            // tax_paid = qty * selling_price * 0.13 = 2 * 50 * 0.13 = 13
+            assert_eq!(econ.tax_paid, Some(dec!(13.00)),
+                "tax_paid should use selling_price when cost is 0");
+        }
+
+        #[test]
+        fn zero_cost_tax_owed_is_zero() {
+            let econ = make_zero_cost_economics(2, dec!(50.00));
+            assert_eq!(econ.tax_owed, Some(dec!(0)),
+                "tax_owed should be 0 when cost unknown (no proven profit)");
+        }
+
+        #[test]
+        fn nonzero_cost_calculates_normally() {
+            let econ = make_normal_economics(3, dec!(10.00), dec!(15.00));
+            assert_eq!(econ.total_cost, Some(dec!(30.00)));
+            assert_eq!(econ.total_selling, Some(dec!(45.00)));
+            assert_eq!(econ.unit_commission, Some(dec!(5.00)));
+            assert_eq!(econ.total_commission, Some(dec!(15.00)));
+            assert_eq!(econ.tax_paid, Some(dec!(3.90))); // 30 * 0.13
+            assert_eq!(econ.tax_owed, Some(dec!(1.95))); // 15 * 0.13
+        }
+
+        #[test]
+        fn zero_cost_vs_nonzero_cost_commission_differs() {
+            let zero = make_zero_cost_economics(1, dec!(100.00));
+            let normal = make_normal_economics(1, dec!(80.00), dec!(100.00));
+
+            // Zero cost: commission = 0 (we don't know the cost)
+            assert_eq!(zero.total_commission, Some(dec!(0)));
+            // Normal: commission = 100 - 80 = 20
+            assert_eq!(normal.total_commission, Some(dec!(20.00)));
+        }
+
+        #[test]
+        fn zero_cost_single_unit() {
+            let econ = make_zero_cost_economics(1, dec!(99.99));
+            assert_eq!(econ.total_cost, Some(dec!(99.99)),
+                "Single unit: total_cost = selling_price");
+            assert_eq!(econ.total_selling, Some(dec!(99.99)));
+            assert_eq!(econ.total_commission, Some(dec!(0)));
+        }
+
+        #[test]
+        fn vendor_name_nullable_in_economics() {
+            let mut econ = make_zero_cost_economics(1, dec!(10.00));
+            econ.vendor_name = None;
+            let json = serde_json::to_string(&econ).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(parsed["vendor_name"].is_null(),
+                "vendor_name should serialize as null when no receipt linked");
         }
     }
 }

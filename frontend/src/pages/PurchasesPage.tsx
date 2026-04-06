@@ -65,7 +65,7 @@ function PurchasePreviewTable({ rows }: { rows: PreviewRow<PurchasePreview>[] })
           <TableRow key={row.row}>
             <TableCell className="text-muted-foreground">{row.row}</TableCell>
             <TableCell>{row.data.item_name}</TableCell>
-            <TableCell>{row.data.vendor_name}</TableCell>
+            <TableCell>{row.data.vendor_name || "-"}</TableCell>
             <TableCell>{row.data.quantity}</TableCell>
             <TableCell>${row.data.purchase_cost}</TableCell>
             <TableCell className="font-mono">{row.data.destination_code || "-"}</TableCell>
@@ -179,12 +179,11 @@ export default function PurchasesPage() {
     }
   }
 
-  // Auto-fill unit cost when item is selected
+  // Auto-fill destination when item is selected
   const handleItemChange = (id: string) => {
     setItemId(id)
     const item = items.find((i) => i.id === id)
     if (item) {
-      setPurchaseCost(item.purchase_cost)
       if (item.default_destination_id) {
         setDestinationId(item.default_destination_id)
       }
@@ -203,7 +202,7 @@ export default function PurchasesPage() {
             columns={[
               { header: "Date", accessor: (p) => p.purchase_date?.split("T")[0] },
               { header: "Item", accessor: (p) => p.item_name },
-              { header: "Vendor", accessor: (p) => p.vendor_name },
+              { header: "Vendor", accessor: (p) => p.vendor_name || "" },
               { header: "Destination", accessor: (p) => p.destination_code },
               { header: "Quantity", accessor: (p) => p.quantity },
               { header: "Purchase Cost", accessor: (p) => p.purchase_cost },
@@ -211,8 +210,11 @@ export default function PurchasesPage() {
               { header: "Selling Price", accessor: (p) => p.selling_price },
               { header: "Total Price", accessor: (p) => p.total_selling },
               { header: "Commission", accessor: (p) => p.total_commission },
+              { header: "Receipt", accessor: (p) => p.receipt_number },
+              { header: "Invoice", accessor: (p) => p.invoice_number },
               { header: "Status", accessor: (p) => p.status },
               { header: "Delivery Date", accessor: (p) => p.delivery_date },
+              { header: "Notes", accessor: (p) => p.notes },
             ]}
             data={purchases}
           />
@@ -224,10 +226,14 @@ export default function PurchasesPage() {
               { name: "purchase_cost", required: true, description: "Cost per unit" },
               { name: "destination", required: false, description: "Destination code" },
               { name: "date", required: false, description: "Purchase date (YYYY-MM-DD)" },
-              { name: "invoice", required: false, description: "Invoice number" },
+              { name: "invoice", required: false, description: "Invoice number (must exist)" },
+              { name: "receipt", required: false, description: "Receipt number (must exist)" },
+              { name: "selling_price", required: false, description: "Selling price per unit" },
+              { name: "status", required: false, description: "pending/in_transit/delivered/damaged/returned/lost" },
+              { name: "delivery_date", required: false, description: "Delivery date (YYYY-MM-DD)" },
               { name: "notes", required: false, description: "Optional notes" },
             ]}
-            exampleCsv="item,quantity,purchase_cost,destination,date\nWidget A,10,9.99,CBG,2024-01-15"
+            exampleCsv="item,quantity,purchase_cost,destination,date,invoice,receipt,selling_price,status\nWidget A,10,9.99,CBG,2024-01-15,INV-001,REC-001,12.99,delivered"
             onPreview={importApi.purchasesPreview}
             onImport={async (csv) => {
               setIsImporting(true)
@@ -265,7 +271,7 @@ export default function PurchasesPage() {
                   <SelectContent>
                     {items.map((i) => (
                       <SelectItem key={i.id} value={i.id}>
-                        {i.name} ({i.vendor_name}) - {formatCurrency(i.purchase_cost)}
+                        {i.name}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -450,8 +456,12 @@ export default function PurchasesPage() {
                 return (
                 <TableRow key={p.purchase_id} className={isUnlinked ? "bg-red-50" : ""}>
                   <TableCell>{formatDate(p.purchase_date)}</TableCell>
-                  <TableCell className="font-medium">{p.item_name}</TableCell>
-                  <TableCell>{p.vendor_name}</TableCell>
+                  <TableCell className="font-medium">
+                    <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
+                      {p.item_name}
+                    </Link>
+                  </TableCell>
+                  <TableCell>{p.vendor_name || "-"}</TableCell>
                   <TableCell>{p.destination_code || "-"}</TableCell>
                   <TableCell>
                     {p.receipt_id ? (

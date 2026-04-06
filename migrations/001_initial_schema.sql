@@ -173,6 +173,7 @@ CREATE VIEW v_purchase_economics AS
 SELECT 
     p.id AS purchase_id,
     p.created_at AS purchase_date,
+    p.item_id,
     i.name AS item_name,
     v.name AS vendor_name,
     d.code AS destination_code,

@@ -48,6 +48,7 @@ import {
   FileText,
   Upload,
   AlertCircle,
+  CheckCircle2,
 } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
 
@@ -150,7 +151,6 @@ export default function ReceiptDetailPage() {
     setItemId(selectedItemId)
     const item = items.find((i) => i.id === selectedItemId)
     if (item) {
-      setPurchaseCost(item.purchase_cost)
       if (item.default_destination_id) {
         setDestinationId(item.default_destination_id)
       }
@@ -161,7 +161,7 @@ export default function ReceiptDetailPage() {
     if (!id) return
     const input = document.createElement("input")
     input.type = "file"
-    input.accept = ".pdf"
+    input.accept = ".pdf,.png,.jpg,.jpeg,.webp"
     input.onchange = async () => {
       const file = input.files?.[0]
       if (file) {
@@ -190,6 +190,11 @@ export default function ReceiptDetailPage() {
     0
   )
   const unlinkedCount = purchases.filter((p) => !p.invoice_id).length
+  const receiptSubtotal = parseFloat(receipt.subtotal)
+  const costDifference = receiptSubtotal - totalCost
+  const isCostMatched = Math.abs(costDifference) < 0.01
+  const allInvoiced = purchases.length > 0 && unlinkedCount === 0
+  const fullyReconciled = isCostMatched && allInvoiced && purchases.length > 0
 
   return (
     <div className="space-y-6">
@@ -205,6 +210,29 @@ export default function ReceiptDetailPage() {
           <p className="text-muted-foreground">
             {receipt.vendor_name} • {formatDate(receipt.receipt_date)}
           </p>
+          <div className="flex gap-2 mt-2">
+            {fullyReconciled ? (
+              <span className="flex items-center gap-1 text-green-600 bg-green-50 px-3 py-1.5 rounded-full text-sm font-medium">
+                <CheckCircle2 className="h-4 w-4" />
+                Reconciled
+              </span>
+            ) : (
+              <>
+                {!isCostMatched && (
+                  <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
+                    <AlertCircle className="h-4 w-4" />
+                    {purchases.length === 0 ? "No items" : `${formatCurrency(Math.abs(costDifference))} ${costDifference > 0 ? "unaccounted" : "over"}`}
+                  </span>
+                )}
+                {purchases.length > 0 && !allInvoiced && (
+                  <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
+                    <AlertCircle className="h-4 w-4" />
+                    {purchases.length - unlinkedCount}/{purchases.length} invoiced
+                  </span>
+                )}
+              </>
+            )}
+          </div>
         </div>
         <div className="flex gap-2">
           {receipt.has_pdf ? (
@@ -215,13 +243,13 @@ export default function ReceiptDetailPage() {
                 rel="noopener"
               >
                 <FileText className="h-4 w-4 mr-2" />
-                View PDF
+                View Document
               </a>
             </Button>
           ) : (
             <Button variant="outline" onClick={handleUploadPdf}>
               <Upload className="h-4 w-4 mr-2" />
-              Upload PDF
+              Upload Document
             </Button>
           )}
         </div>
@@ -277,13 +305,6 @@ export default function ReceiptDetailPage() {
         </Card>
       </div>
 
-      {unlinkedCount > 0 && (
-        <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-sm">
-          <AlertCircle className="h-4 w-4" />
-          {unlinkedCount} item(s) not linked to an invoice
-        </div>
-      )}
-
       {/* Line Items Table */}
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
@@ -321,8 +342,7 @@ export default function ReceiptDetailPage() {
                     <SelectContent>
                       {items.map((i) => (
                         <SelectItem key={i.id} value={i.id}>
-                          {i.name} ({i.vendor_name}) -{" "}
-                          {formatCurrency(i.purchase_cost)}
+                          {i.name}
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -448,7 +468,11 @@ export default function ReceiptDetailPage() {
             <TableBody>
               {purchases.map((p) => (
                 <TableRow key={p.purchase_id}>
-                  <TableCell className="font-medium">{p.item_name}</TableCell>
+                  <TableCell className="font-medium">
+                    <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
+                      {p.item_name}
+                    </Link>
+                  </TableCell>
                   <TableCell>{p.destination_code || "—"}</TableCell>
                   <TableCell>
                     {p.invoice_id ? (

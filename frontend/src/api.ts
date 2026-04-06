@@ -93,9 +93,6 @@ export const items = {
     request<{
       id: string;
       name: string;
-      vendor_id: string;
-      vendor_name: string;
-      purchase_cost: string;
       default_destination_id: string | null;
       default_destination_code: string | null;
       notes: string | null;
@@ -103,10 +100,6 @@ export const items = {
     }[]>('/items/active'),
   create: (data: {
     name: string;
-    vendor_id: string;
-    purchase_cost: string;
-    start_date: string;
-    end_date?: string;
     default_destination_id?: string;
     notes?: string;
   }) =>
@@ -121,6 +114,40 @@ export const items = {
     }),
   delete: (id: string) =>
     request<void>(`/items/${id}`, { method: 'DELETE' }),
+  get: (id: string) =>
+    request<{
+      id: string;
+      name: string;
+      default_destination_id: string | null;
+      notes: string | null;
+      created_at: string;
+      updated_at: string;
+    }>(`/items/${id}`),
+  purchases: (id: string) =>
+    request<{
+      purchase_id: string;
+      purchase_date: string;
+      item_id: string;
+      item_name: string;
+      vendor_name: string | null;
+      destination_code: string | null;
+      quantity: number;
+      purchase_cost: string;
+      total_cost: string | null;
+      selling_price: string | null;
+      total_selling: string | null;
+      unit_commission: string | null;
+      total_commission: string | null;
+      tax_paid: string | null;
+      tax_owed: string | null;
+      status: string;
+      delivery_date: string | null;
+      invoice_id: string | null;
+      receipt_id: string | null;
+      receipt_number: string | null;
+      invoice_number: string | null;
+      notes: string | null;
+    }[]>(`/items/${id}/purchases`),
 };
 
 // Invoices
@@ -145,6 +172,7 @@ export const invoices = {
       purchases_total: string | null;
       total_cost: string | null;
       total_commission: string | null;
+      receipted_count: number | null;
     }[]>('/invoices'),
   get: (id: string) =>
     request<{
@@ -166,13 +194,15 @@ export const invoices = {
       purchases_total: string | null;
       total_cost: string | null;
       total_commission: string | null;
+      receipted_count: number | null;
     }>(`/invoices/${id}`),
   purchases: (id: string) =>
     request<{
       purchase_id: string;
       purchase_date: string;
+      item_id: string;
       item_name: string;
-      vendor_name: string;
+      vendor_name: string | null;
       destination_code: string | null;
       quantity: number;
       purchase_cost: string;
@@ -189,6 +219,7 @@ export const invoices = {
       receipt_id: string | null;
       receipt_number: string | null;
       invoice_number: string | null;
+      notes: string | null;
     }[]>(`/invoices/${id}/purchases`),
   create: (data: {
     destination_id: string;
@@ -249,6 +280,7 @@ export const receipts = {
       purchases_total: string | null;
       total_selling: string | null;
       total_commission: string | null;
+      invoiced_count: number | null;
     }[]>('/receipts'),
   get: (id: string) =>
     request<{
@@ -268,13 +300,15 @@ export const receipts = {
       purchases_total: string | null;
       total_selling: string | null;
       total_commission: string | null;
+      invoiced_count: number | null;
     }>(`/receipts/${id}`),
   purchases: (id: string) =>
     request<{
       purchase_id: string;
       purchase_date: string;
+      item_id: string;
       item_name: string;
-      vendor_name: string;
+      vendor_name: string | null;
       destination_code: string | null;
       quantity: number;
       purchase_cost: string;
@@ -291,6 +325,7 @@ export const receipts = {
       receipt_id: string | null;
       receipt_number: string | null;
       invoice_number: string | null;
+      notes: string | null;
     }[]>(`/receipts/${id}/purchases`),
   create: (data: {
     vendor_id: string;
@@ -340,8 +375,9 @@ export const purchases = {
     return request<{
       purchase_id: string;
       purchase_date: string;
+      item_id: string;
       item_name: string;
-      vendor_name: string;
+      vendor_name: string | null;
       destination_code: string | null;
       quantity: number;
       purchase_cost: string;
@@ -358,6 +394,7 @@ export const purchases = {
       receipt_id: string | null;
       receipt_number: string | null;
       invoice_number: string | null;
+      notes: string | null;
     }[]>(`/purchases/economics${query ? `?${query}` : ''}`);
   },
   create: (data: {
@@ -439,8 +476,6 @@ export type VendorPreview = { name: string };
 export type DestinationPreview = { code: string; name: string };
 export type ItemPreview = {
   name: string;
-  vendor_name: string;
-  purchase_cost: string;
   destination_code: string | null;
   notes: string | null;
 };

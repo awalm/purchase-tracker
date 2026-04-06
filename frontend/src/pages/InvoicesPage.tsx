@@ -52,6 +52,7 @@ interface Invoice {
   notes: string | null
   purchase_count: number | null
   purchases_total: string | null
+  receipted_count: number | null
 }
 
 function ReconciliationBadge({ invoice }: { invoice: Invoice }) {
@@ -59,6 +60,9 @@ function ReconciliationBadge({ invoice }: { invoice: Invoice }) {
   const purchasesTotal = parseFloat(invoice.purchases_total || "0")
   const difference = Math.abs(invoiceSubtotal - purchasesTotal)
   const count = invoice.purchase_count || 0
+  const receiptedCount = invoice.receipted_count || 0
+  const allReceipted = count > 0 && receiptedCount === count
+  const totalsMatched = difference < 0.01
 
   if (count === 0) {
     return (
@@ -69,19 +73,24 @@ function ReconciliationBadge({ invoice }: { invoice: Invoice }) {
     )
   }
 
-  if (difference < 0.01) {
+  if (totalsMatched && allReceipted) {
     return (
       <span className="inline-flex items-center gap-1 text-xs font-medium text-green-600 bg-green-50 px-2 py-1 rounded-full">
         <CheckCircle2 className="h-3 w-3" />
-        Matched
+        Reconciled
       </span>
     )
   }
 
+  // Show what's missing
+  const issues: string[] = []
+  if (!totalsMatched) issues.push(`${formatCurrency(difference)} off`)
+  if (!allReceipted) issues.push(`${receiptedCount}/${count} receipted`)
+
   return (
     <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-600 bg-amber-50 px-2 py-1 rounded-full">
       <AlertCircle className="h-3 w-3" />
-      {formatCurrency(difference)} off
+      {issues.join(" · ")}
     </span>
   )
 }
@@ -198,14 +207,14 @@ export default function InvoicesPage() {
           const item = resolveItem(li, i)
           if (!item) continue
 
-          // Create purchase using the item's vendor cost, linked to invoice
-          // selling_price comes from the invoice line item (what the destination pays)
+          // Create purchase linked to invoice
+          // purchase_cost is unknown until reconciled with a receipt — use 0 as placeholder
           try {
             setPdfCreateStatus(`Creating purchase: ${li.description} x${li.qty}...`)
             await createPurchase.mutateAsync({
               item_id: item.id,
               quantity: li.qty,
-              purchase_cost: item.purchase_cost,
+              purchase_cost: "0",
               selling_price: li.selling_price,
               destination_id: pdfDestinationId,
               invoice_id: invoiceId,
@@ -281,8 +290,12 @@ export default function InvoicesPage() {
   // Summary stats
   const totalInvoiceValue = invoices.reduce((sum, inv) => sum + parseFloat(inv.subtotal), 0)
   const unreconciledCount = invoices.filter(inv => {
+    const count = inv.purchase_count || 0
+    if (count === 0) return false // "No items" is not unreconciled, just empty
     const diff = Math.abs(parseFloat(inv.subtotal) - parseFloat(inv.purchases_total || "0"))
-    return diff >= 0.01
+    const totalsMatched = diff < 0.01
+    const allReceipted = (inv.receipted_count || 0) === count
+    return !totalsMatched || !allReceipted
   }).length
   const emptyCount = invoices.filter(inv => (inv.purchase_count || 0) === 0).length
 
@@ -334,7 +347,7 @@ export default function InvoicesPage() {
             <DialogTrigger asChild>
               <Button variant="outline">
                 <Upload className="h-4 w-4 mr-2" />
-                Upload PDF
+                Import from PDF
               </Button>
             </DialogTrigger>
             <DialogContent className="max-w-lg">
@@ -558,9 +571,7 @@ export default function InvoicesPage() {
             }}
             defaults={newItemForLineIdx !== null && parsedInvoice ? {
               name: parsedInvoice.line_items[newItemForLineIdx]?.description || "",
-              purchaseCost: parsedInvoice.line_items[newItemForLineIdx]?.selling_price || "",
               defaultDestinationId: pdfDestinationId || undefined,
-              startDate: parsedInvoice.invoice_date || undefined,
             } : undefined}
             onCreated={(newId) => {
               if (newItemForLineIdx !== null) {

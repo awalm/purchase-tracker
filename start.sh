@@ -104,13 +104,15 @@ mkdir -p backups
 DUMP=$(docker exec bg-tracker-db pg_dump -U bg_tracker bg_tracker 2>/dev/null) || true
 if [ -n "$DUMP" ]; then
   LATEST=$(ls -1t backups/bg_tracker_*.sql 2>/dev/null | head -1)
-  NEW_HASH=$(echo "$DUMP" | md5sum | awk '{print $1}')
+  NEW_HASH=$(echo "$DUMP" | grep -v '^\\restrict\|^\\unrestrict\|^-- Started on\|^-- Completed on\|^-- Dumped' | md5sum | awk '{print $1}')
   OLD_HASH=""
-  [ -n "$LATEST" ] && OLD_HASH=$(md5sum < "$LATEST" | awk '{print $1}')
+  [ -n "$LATEST" ] && OLD_HASH=$(grep -v '^\\restrict\|^\\unrestrict\|^-- Started on\|^-- Completed on\|^-- Dumped' < "$LATEST" | md5sum | awk '{print $1}')
   if [ "$NEW_HASH" != "$OLD_HASH" ]; then
     FILE="backups/bg_tracker_$(date +%Y%m%d_%H%M%S).sql"
     echo "$DUMP" > "$FILE"
     echo "💾 Backup → $FILE"
+  else
+    echo "💾 No changes since last backup, skipping"
   fi
   # Keep last 20
   ls -1t backups/bg_tracker_*.sql 2>/dev/null | tail -n +21 | xargs -r rm --
@@ -139,6 +141,23 @@ echo "   Ctrl+C to stop"
 cleanup() {
   echo "🛑 Stopping..."
   kill $BACKEND_PID $FRONTEND_PID 2>/dev/null || true
+  # Backup on close
+  echo "💾 Taking shutdown backup..."
+  DUMP=$(docker exec bg-tracker-db pg_dump -U bg_tracker bg_tracker 2>/dev/null) || true
+  if [ -n "$DUMP" ]; then
+    mkdir -p backups
+    LATEST=$(ls -1t backups/bg_tracker_*.sql 2>/dev/null | head -1)
+    NEW_HASH=$(echo "$DUMP" | grep -v '^\\restrict\|^\\unrestrict\|^-- Started on\|^-- Completed on\|^-- Dumped' | md5sum | awk '{print $1}')
+    OLD_HASH=""
+    [ -n "$LATEST" ] && OLD_HASH=$(grep -v '^\\restrict\|^\\unrestrict\|^-- Started on\|^-- Completed on\|^-- Dumped' < "$LATEST" | md5sum | awk '{print $1}')
+    if [ "$NEW_HASH" != "$OLD_HASH" ]; then
+      FILE="backups/bg_tracker_$(date +%Y%m%d_%H%M%S).sql"
+      echo "$DUMP" > "$FILE"
+      echo "💾 Shutdown backup → $FILE"
+    else
+      echo "💾 No changes since last backup, skipping"
+    fi
+  fi
   docker compose stop 2>/dev/null
   echo "✅ Stopped"
   exit 0

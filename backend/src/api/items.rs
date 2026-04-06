@@ -18,6 +18,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list_items).post(create_item))
         .route("/active", get(list_active_items))
         .route("/{id}", get(get_item).put(update_item).delete(delete_item))
+        .route("/{id}/purchases", get(list_item_purchases))
 }
 
 async fn list_items(
@@ -88,4 +89,14 @@ async fn delete_item(
     } else {
         Err((StatusCode::NOT_FOUND, "Item not found".to_string()))
     }
+}
+
+async fn list_item_purchases(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<PurchaseEconomics>>, (StatusCode, String)> {
+    let purchases = queries::get_purchases_by_item(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(purchases))
 }

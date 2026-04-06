@@ -19,7 +19,6 @@ import { ExportCsvButton } from "@/components/ExportCsvButton"
 import { RowActions } from "@/components/RowActions"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
 import { Plus, Trash2 } from "lucide-react"
-import { formatCurrency } from "@/lib/utils"
 import type { ActiveItem } from "@/types"
 
 function ItemPreviewTable({ rows }: { rows: PreviewRow<ItemPreview>[] }) {
@@ -29,8 +28,6 @@ function ItemPreviewTable({ rows }: { rows: PreviewRow<ItemPreview>[] }) {
         <TableRow>
           <TableHead className="w-12">Row</TableHead>
           <TableHead>Name</TableHead>
-          <TableHead>Vendor</TableHead>
-          <TableHead>Cost</TableHead>
           <TableHead>Dest</TableHead>
         </TableRow>
       </TableHeader>
@@ -39,8 +36,6 @@ function ItemPreviewTable({ rows }: { rows: PreviewRow<ItemPreview>[] }) {
           <TableRow key={row.row}>
             <TableCell className="text-muted-foreground">{row.row}</TableCell>
             <TableCell>{row.data.name}</TableCell>
-            <TableCell>{row.data.vendor_name}</TableCell>
-            <TableCell>${row.data.purchase_cost}</TableCell>
             <TableCell className="font-mono">{row.data.destination_code || "-"}</TableCell>
           </TableRow>
         ))}
@@ -83,8 +78,6 @@ export default function ItemsPage() {
             filename="items"
             columns={[
               { header: "Name", accessor: (i: ActiveItem) => i.name },
-              { header: "Vendor", accessor: (i: ActiveItem) => i.vendor_name },
-              { header: "Purchase Cost", accessor: (i: ActiveItem) => i.purchase_cost },
               { header: "Default Destination", accessor: (i: ActiveItem) => i.default_destination_code },
               { header: "Notes", accessor: (i: ActiveItem) => i.notes },
             ]}
@@ -104,13 +97,11 @@ export default function ItemsPage() {
             entityName="Items"
             columns={[
               { name: "name / Item", required: true, description: "Item name" },
-              { name: "vendor / Vendor", required: true, description: "Vendor name (must exist)" },
-              { name: "purchase_cost / Item Cost", required: true, description: "Cost per unit (e.g., 10.99)" },
               { name: "destination / Default Destination", required: false, description: "Default destination code" },
               { name: "notes / Notes", required: false, description: "Optional notes" },
             ]}
-            exampleCsv={`Item,Vendor,Item Cost,Default Destination,Notes
-Echo Dot,Best Buy,39.99,BSC,Sample item`}
+            exampleCsv={`Item,Default Destination,Notes
+Echo Dot,BSC,Sample item`}
             onPreview={importApi.itemsPreview}
             onImport={async (csv) => {
               setIsImporting(true)
@@ -158,10 +149,8 @@ Echo Dot,Best Buy,39.99,BSC,Sample item`}
                   />
                 </TableHead>
                 <TableHead className="w-[28%]">Name</TableHead>
-                <TableHead className="w-[14%]">Vendor</TableHead>
-                <TableHead className="w-[10%] text-right">Purchase Cost</TableHead>
-                <TableHead className="w-[10%]">Default Dest</TableHead>
-                <TableHead className="w-[22%]">Notes</TableHead>
+                <TableHead className="w-[14%]">Default Dest</TableHead>
+                <TableHead className="w-[40%]">Notes</TableHead>
                 <TableHead className="w-[76px]">Actions</TableHead>
               </TableRow>
             </TableHeader>
@@ -180,8 +169,6 @@ Echo Dot,Best Buy,39.99,BSC,Sample item`}
                     />
                   </TableCell>
                   <TableCell className="font-medium truncate max-w-0">{item.name}</TableCell>
-                  <TableCell className="truncate max-w-0">{item.vendor_name}</TableCell>
-                  <TableCell className="text-right">{formatCurrency(item.purchase_cost)}</TableCell>
                   <TableCell>{item.default_destination_code || "-"}</TableCell>
                   <TableCell className="text-muted-foreground text-sm truncate max-w-0">
                     {item.notes || "-"}
@@ -194,7 +181,7 @@ Echo Dot,Best Buy,39.99,BSC,Sample item`}
                   </TableCell>
                 </TableRow>
               ))}
-              {items.length === 0 && <EmptyTableRow colSpan={7} message="No items yet" />}
+              {items.length === 0 && <EmptyTableRow colSpan={5} message="No items yet" />}
             </TableBody>
           </Table>
         </CardContent>

@@ -85,10 +85,6 @@ export function useCreateItem() {
   return useMutation({
     mutationFn: (data: {
       name: string
-      vendor_id: string
-      purchase_cost: string
-      start_date: string
-      end_date?: string
       default_destination_id?: string
       notes?: string
     }) => items.create(data),
@@ -109,6 +105,22 @@ export function useDeleteItem() {
   return useMutation({
     mutationFn: (id: string) => items.delete(id),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["items"] }),
+  })
+}
+
+export function useItem(id: string) {
+  return useQuery({
+    queryKey: ["item", id],
+    queryFn: () => items.get(id),
+    enabled: !!id,
+  })
+}
+
+export function useItemPurchases(id: string) {
+  return useQuery({
+    queryKey: ["item", id, "purchases"],
+    queryFn: () => items.purchases(id),
+    enabled: !!id,
   })
 }
 

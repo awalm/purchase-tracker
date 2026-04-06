@@ -25,13 +25,12 @@ export function ItemSearch({
 
   const selectedItem = items.find(item => item.id === value)
 
-  // Filter items based on search (name or vendor)
+  // Filter items based on search
   const filteredItems = React.useMemo(() => {
     if (!search) return items.slice(0, 20) // Show first 20 (most recent) when no search
     const searchLower = search.toLowerCase()
     return items.filter(item => 
-      item.name.toLowerCase().includes(searchLower) ||
-      item.vendor_name.toLowerCase().includes(searchLower)
+      item.name.toLowerCase().includes(searchLower)
     ).slice(0, 50) // Limit results to 50
   }, [items, search])
 
@@ -67,7 +66,7 @@ export function ItemSearch({
       >
         {selectedItem ? (
           <span className="truncate">
-            {selectedItem.name} <span className="text-muted-foreground">({selectedItem.vendor_name})</span>
+            {selectedItem.name}
           </span>
         ) : (
           <span className="text-muted-foreground">Select item...</span>
@@ -116,7 +115,6 @@ export function ItemSearch({
                     />
                     <div className="flex-1 truncate">
                       <span className="font-medium">{item.name}</span>
-                      <span className="ml-2 text-muted-foreground">({item.vendor_name})</span>
                     </div>
                   </div>
                 ))}

@@ -150,6 +150,12 @@ async fn download_document(
 
     let content_type = if filename.ends_with(".pdf") {
         "application/pdf"
+    } else if filename.ends_with(".png") {
+        "image/png"
+    } else if filename.ends_with(".jpg") || filename.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if filename.ends_with(".webp") {
+        "image/webp"
     } else {
         "application/octet-stream"
     };

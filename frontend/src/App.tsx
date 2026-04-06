@@ -6,6 +6,7 @@ import DashboardPage from "@/pages/DashboardPage"
 import VendorsPage from "@/pages/VendorsPage"
 import DestinationsPage from "@/pages/DestinationsPage"
 import ItemsPage from "@/pages/ItemsPage"
+import ItemDetailPage from "@/pages/ItemDetailPage"
 import InvoicesPage from "@/pages/InvoicesPage"
 import InvoiceDetailPage from "@/pages/InvoiceDetailPage"
 import ReceiptsPage from "@/pages/ReceiptsPage"
@@ -76,6 +77,14 @@ export default function App() {
         element={
           <ProtectedRoute>
             <ItemsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/items/:id"
+        element={
+          <ProtectedRoute>
+            <ItemDetailPage />
           </ProtectedRoute>
         }
       />

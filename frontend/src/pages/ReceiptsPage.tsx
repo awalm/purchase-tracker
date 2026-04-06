@@ -36,8 +36,50 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
-import { Plus, Trash2, Pencil, FileText, Upload } from "lucide-react"
+import { ExportCsvButton } from "@/components/ExportCsvButton"
+import { Plus, Trash2, Pencil, FileText, Upload, CheckCircle2, AlertCircle, Clock } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
+
+type Receipt = ReturnType<typeof useReceipts>["data"] extends (infer T)[] | undefined ? T : never
+
+function ReconciliationBadge({ receipt }: { receipt: Receipt }) {
+  const subtotal = parseFloat(receipt.subtotal)
+  const purchasesTotal = parseFloat(receipt.purchases_total || "0")
+  const difference = Math.abs(subtotal - purchasesTotal)
+  const count = receipt.purchase_count || 0
+  const invoicedCount = receipt.invoiced_count || 0
+  const allInvoiced = count > 0 && invoicedCount === count
+  const totalsMatched = difference < 0.01
+
+  if (count === 0) {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 bg-gray-100 px-2 py-1 rounded-full">
+        <Clock className="h-3 w-3" />
+        No items
+      </span>
+    )
+  }
+
+  if (totalsMatched && allInvoiced) {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-medium text-green-600 bg-green-50 px-2 py-1 rounded-full">
+        <CheckCircle2 className="h-3 w-3" />
+        Reconciled
+      </span>
+    )
+  }
+
+  const issues: string[] = []
+  if (!totalsMatched) issues.push(`${formatCurrency(difference)} off`)
+  if (!allInvoiced) issues.push(`${invoicedCount}/${count} invoiced`)
+
+  return (
+    <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-600 bg-amber-50 px-2 py-1 rounded-full">
+      <AlertCircle className="h-3 w-3" />
+      {issues.join(" · ")}
+    </span>
+  )
+}
 
 export default function ReceiptsPage() {
   const navigate = useNavigate()
@@ -118,7 +160,7 @@ export default function ReceiptsPage() {
   const handleUploadPdf = async (id: string) => {
     const input = document.createElement("input")
     input.type = "file"
-    input.accept = ".pdf"
+    input.accept = ".pdf,.png,.jpg,.jpeg,.webp"
     input.onchange = async () => {
       const file = input.files?.[0]
       if (file) {
@@ -139,6 +181,14 @@ export default function ReceiptsPage() {
     (sum, r) => sum + parseFloat(r.total_commission || "0"),
     0
   )
+  const unreconciledCount = filteredReceipts.filter(r => {
+    const count = r.purchase_count || 0
+    if (count === 0) return false
+    const diff = Math.abs(parseFloat(r.subtotal) - parseFloat(r.purchases_total || "0"))
+    const totalsMatched = diff < 0.01
+    const allInvoiced = (r.invoiced_count || 0) === count
+    return !totalsMatched || !allInvoiced
+  }).length
 
   if (isLoading) return <div className="text-muted-foreground">Loading...</div>
 
@@ -147,6 +197,24 @@ export default function ReceiptsPage() {
       <div className="flex justify-between items-center">
         <h1 className="text-2xl font-bold">Receipts</h1>
         <div className="flex gap-2">
+          <ExportCsvButton
+            filename="receipts"
+            columns={[
+              { header: "Receipt #", accessor: (r) => r.receipt_number },
+              { header: "Vendor", accessor: (r) => r.vendor_name },
+              { header: "Date", accessor: (r) => r.receipt_date },
+              { header: "Subtotal", accessor: (r) => r.subtotal },
+              { header: "Tax Rate", accessor: (r) => r.tax_rate },
+              { header: "Total", accessor: (r) => r.total },
+              { header: "Purchase Count", accessor: (r) => r.purchase_count },
+              { header: "Purchases Total", accessor: (r) => r.purchases_total },
+              { header: "Total Selling", accessor: (r) => r.total_selling },
+              { header: "Total Commission", accessor: (r) => r.total_commission },
+              { header: "Has Document", accessor: (r) => r.has_pdf ? "Yes" : "No" },
+              { header: "Notes", accessor: (r) => r.notes },
+            ]}
+            data={filteredReceipts}
+          />
           <Dialog
             open={isOpen}
             onOpenChange={(open) => {
@@ -265,7 +333,7 @@ export default function ReceiptsPage() {
       </div>
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-4 gap-4">
         <Card>
           <CardContent className="pt-6">
             <div className="text-2xl font-bold">{totalReceipts}</div>
@@ -284,6 +352,14 @@ export default function ReceiptsPage() {
               {formatCurrency(totalCommission.toFixed(2))}
             </div>
             <p className="text-sm text-muted-foreground">Total Profit</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="pt-6">
+            <div className={`text-2xl font-bold ${unreconciledCount > 0 ? "text-amber-600" : "text-green-600"}`}>
+              {unreconciledCount}
+            </div>
+            <p className="text-sm text-muted-foreground">Unreconciled</p>
           </CardContent>
         </Card>
       </div>
@@ -332,6 +408,7 @@ export default function ReceiptsPage() {
                 <TableHead className="text-right">Total</TableHead>
                 <TableHead className="text-right">Items</TableHead>
                 <TableHead className="text-right">Profit</TableHead>
+                <TableHead>Status</TableHead>
                 <TableHead>PDF</TableHead>
                 <TableHead className="w-24">Actions</TableHead>
               </TableRow>
@@ -373,6 +450,9 @@ export default function ReceiptsPage() {
                       {r.total_commission
                         ? formatCurrency(r.total_commission)
                         : "—"}
+                    </TableCell>
+                    <TableCell>
+                      <ReconciliationBadge receipt={r} />
                     </TableCell>
                     <TableCell>
                       {r.has_pdf ? (
@@ -418,7 +498,7 @@ export default function ReceiptsPage() {
                 )
               })}
               {filteredReceipts.length === 0 && (
-                <EmptyTableRow colSpan={10} message="No receipts yet" />
+                <EmptyTableRow colSpan={11} message="No receipts yet" />
               )}
             </TableBody>
           </Table>

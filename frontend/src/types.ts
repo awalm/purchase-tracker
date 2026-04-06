@@ -19,10 +19,6 @@ export interface Destination {
 export interface Item {
   id: string;
   name: string;
-  vendor_id: string;
-  purchase_cost: string;
-  start_date: string;
-  end_date: string | null;
   default_destination_id: string | null;
   notes: string | null;
   created_at: string;
@@ -116,9 +112,6 @@ export interface Purchase {
 export interface ActiveItem {
   id: string;
   name: string;
-  vendor_id: string;
-  vendor_name: string;
-  purchase_cost: string;
   default_destination_id: string | null;
   default_destination_code: string | null;
   notes: string | null;
@@ -128,8 +121,9 @@ export interface ActiveItem {
 export interface PurchaseEconomics {
   purchase_id: string;
   purchase_date: string;
+  item_id: string;
   item_name: string;
-  vendor_name: string;
+  vendor_name: string | null;
   destination_code: string | null;
   quantity: number;
   purchase_cost: string;
@@ -146,6 +140,7 @@ export interface PurchaseEconomics {
   receipt_id: string | null;
   receipt_number: string | null;
   invoice_number: string | null;
+  notes: string | null;
 }
 
 export interface VendorSummary {

@@ -72,6 +72,18 @@ struct CsvPurchaseRow {
     #[serde(alias = "invoice", alias = "Invoice", alias = "invoice_number", default)]
     invoice: Option<String>,
     
+    #[serde(alias = "receipt", alias = "Receipt", alias = "receipt_number", default)]
+    receipt: Option<String>,
+    
+    #[serde(alias = "selling_price", alias = "Selling Price", alias = "sell_price", alias = "price", default)]
+    selling_price: Option<String>,
+    
+    #[serde(alias = "Status", alias = "status", alias = "delivery_status", default)]
+    status: Option<String>,
+    
+    #[serde(alias = "delivery_date", alias = "Delivery Date", alias = "delivered", default)]
+    delivery_date: Option<String>,
+    
     #[serde(alias = "Notes", alias = "notes", alias = "Note", default)]
     notes: Option<String>,
 }
@@ -301,12 +313,6 @@ struct CsvItemRow {
     #[serde(alias = "Name", alias = "item_name", alias = "Item", alias = "item")]
     name: String,
     
-    #[serde(alias = "Vendor", alias = "vendor_name", alias = "vendor_id")]
-    vendor: String,
-    
-    #[serde(alias = "Cost", alias = "unit_cost", alias = "purchase_cost", alias = "Unit Cost", alias = "Purchase Cost", alias = "Item Cost", alias = "cost")]
-    purchase_cost: String,
-    
     #[serde(alias = "Destination", alias = "default_destination", alias = "dest_code", alias = "Default Destination", alias = "Default Dest", alias = "Dest", alias = "dest", alias = "destination", default)]
     destination: Option<String>,
     
@@ -328,9 +334,6 @@ async fn import_items(
     let mut duplicate_count = 0;
     let mut errors: Vec<ImportError> = Vec::new();
 
-    let vendors = queries::get_all_vendors(&state.pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let destinations = queries::get_all_destinations(&state.pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -338,17 +341,13 @@ async fn import_items(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let vendor_by_name: HashMap<String, &Vendor> = vendors
-        .iter()
-        .map(|v| (v.name.to_lowercase(), v))
-        .collect();
     let dest_by_code: HashMap<String, &Destination> = destinations
         .iter()
         .map(|d| (d.code.to_lowercase(), d))
         .collect();
     let existing_names: HashSet<String> = existing_items
         .iter()
-        .map(|i| format!("{}|{}", i.name.to_lowercase(), i.vendor_id))
+        .map(|i| i.name.to_lowercase())
         .collect();
 
     let mut batch_names: HashSet<String> = HashSet::new();
@@ -362,30 +361,17 @@ async fn import_items(
         match result {
             Ok(row) => {
                 // Skip empty rows
-                if row.name.trim().is_empty() || row.vendor.trim().is_empty() {
+                if row.name.trim().is_empty() {
                     continue;
                 }
 
-                // Find vendor
-                let vendor = match vendor_by_name.get(&row.vendor.to_lowercase()) {
-                    Some(v) => *v,
-                    None => {
-                        errors.push(ImportError {
-                            row: row_num,
-                            message: format!("Vendor not found: {}", row.vendor),
-                            original_data: original_line,
-                        });
-                        continue;
-                    }
-                };
-
-                // Check for duplicate item name + vendor
-                let item_key = format!("{}|{}", row.name.to_lowercase(), vendor.id);
+                // Check for duplicate item name
+                let item_key = row.name.to_lowercase();
                 if existing_names.contains(&item_key) {
                     duplicate_count += 1;
                     errors.push(ImportError {
                         row: row_num,
-                        message: format!("Item already exists: {} from {}", row.name, row.vendor),
+                        message: format!("Item already exists: {}", row.name),
                         original_data: original_line,
                     });
                     continue;
@@ -419,27 +405,11 @@ async fn import_items(
                     _ => None,
                 };
 
-                // Parse unit cost
-                let purchase_cost = match Decimal::from_str(&row.purchase_cost.replace(['$', ','], "")) {
-                    Ok(d) => d,
-                    Err(_) => {
-                        errors.push(ImportError {
-                            row: row_num,
-                            message: format!("Invalid purchase cost: {}", row.purchase_cost),
-                            original_data: original_line,
-                        });
-                        continue;
-                    }
-                };
-
+                // Create the item
                 let create_item = CreateItem {
                     name: row.name.clone(),
-                    vendor_id: vendor.id,
-                    purchase_cost,
                     default_destination_id: destination_id,
                     notes: row.notes.clone(),
-                    start_date: chrono::Utc::now().date_naive(),
-                    end_date: None,
                 };
 
                 match queries::create_item(&state.pool, create_item, user.user_id).await {
@@ -503,6 +473,9 @@ async fn import_purchases(
     let invoices = queries::get_all_invoices(&state.pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let receipts = queries::get_all_receipts(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Get existing purchases for duplicate detection
     let existing_purchases = queries::get_all_purchases(&state.pool, PurchaseQuery::default())
@@ -537,6 +510,10 @@ async fn import_purchases(
     let invoice_by_number: HashMap<String, &Invoice> = invoices
         .iter()
         .map(|i| (i.invoice_number.to_lowercase(), i))
+        .collect();
+    let receipt_by_number: HashMap<String, &Receipt> = receipts
+        .iter()
+        .map(|r| (r.receipt_number.to_lowercase(), r))
         .collect();
 
     // Store raw lines for error reporting
@@ -612,6 +589,88 @@ async fn import_purchases(
                     _ => None,
                 };
 
+                // Find receipt (optional)
+                let receipt_id = match &row.receipt {
+                    Some(rcpt_num) if !rcpt_num.is_empty() => {
+                        match receipt_by_number.get(&rcpt_num.to_lowercase()) {
+                            Some(r) => Some(r.id),
+                            None => {
+                                errors.push(ImportError {
+                                    row: row_num,
+                                    message: format!("Receipt not found: {}", rcpt_num),
+                                    original_data: original_line,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+
+                // Parse selling price (optional)
+                let selling_price = match &row.selling_price {
+                    Some(sp) if !sp.is_empty() => {
+                        match Decimal::from_str(&sp.replace(['$', ','], "")) {
+                            Ok(d) => Some(d),
+                            Err(_) => {
+                                errors.push(ImportError {
+                                    row: row_num,
+                                    message: format!("Invalid selling price: {}", sp),
+                                    original_data: original_line,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+
+                // Parse status (optional, default pending)
+                let status = match &row.status {
+                    Some(s) if !s.is_empty() => {
+                        match s.to_lowercase().as_str() {
+                            "pending" => Some(DeliveryStatus::Pending),
+                            "in_transit" | "in transit" => Some(DeliveryStatus::InTransit),
+                            "delivered" => Some(DeliveryStatus::Delivered),
+                            "damaged" => Some(DeliveryStatus::Damaged),
+                            "returned" => Some(DeliveryStatus::Returned),
+                            "lost" => Some(DeliveryStatus::Lost),
+                            _ => {
+                                errors.push(ImportError {
+                                    row: row_num,
+                                    message: format!("Invalid status: {} (use pending/in_transit/delivered/damaged/returned/lost)", s),
+                                    original_data: original_line,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    _ => Some(DeliveryStatus::Pending),
+                };
+
+                // Parse delivery date (optional)
+                let delivery_date = match &row.delivery_date {
+                    Some(date_str) if !date_str.is_empty() => {
+                        match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                            Ok(d) => Some(d),
+                            Err(_) => {
+                                match NaiveDate::parse_from_str(date_str, "%m/%d/%Y") {
+                                    Ok(d) => Some(d),
+                                    Err(_) => {
+                                        errors.push(ImportError {
+                                            row: row_num,
+                                            message: format!("Invalid delivery date: {} (use YYYY-MM-DD)", date_str),
+                                            original_data: original_line,
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+
                 // Parse unit cost
                 let purchase_cost = match Decimal::from_str(&row.purchase_cost.replace(['$', ','], "")) {
                     Ok(d) => d,
@@ -675,14 +734,14 @@ async fn import_purchases(
                 // Create the purchase
                 let create_purchase = CreatePurchase {
                     item_id: item.id,
-                    receipt_id: None,
+                    receipt_id,
                     invoice_id,
                     quantity: row.quantity,
                     purchase_cost,
-                    selling_price: None,
+                    selling_price,
                     destination_id,
-                    status: Some(DeliveryStatus::Pending),
-                    delivery_date: None,
+                    status,
+                    delivery_date,
                     notes: row.notes.clone(),
                 };
 
@@ -871,24 +930,20 @@ mod tests {
 
         #[test]
         fn parses_standard_format() {
-            let row: CsvItemRow = assert_parses("name,vendor,unit_cost\nEcho Dot,Amazon,39.99");
+            let row: CsvItemRow = assert_parses("name\nEcho Dot");
             assert_eq!(row.name, "Echo Dot");
-            assert_eq!(row.vendor, "Amazon");
-            assert_eq!(row.purchase_cost, "39.99");
         }
 
         #[test]
         fn parses_with_item_alias() {
-            let row: CsvItemRow = assert_parses("Item,Vendor,Item Cost\nPS5,Best Buy,519.99");
+            let row: CsvItemRow = assert_parses("Item\nPS5");
             assert_eq!(row.name, "PS5");
-            assert_eq!(row.vendor, "Best Buy");
-            assert_eq!(row.purchase_cost, "519.99");
         }
 
         #[test]
         fn parses_optional_destination() {
             let row: CsvItemRow = assert_parses(
-                "name,vendor,unit_cost,destination\nEcho Dot,Amazon,39.99,BSC"
+                "name,destination\nEcho Dot,BSC"
             );
             assert_eq!(row.destination, Some("BSC".to_string()));
         }
@@ -896,21 +951,21 @@ mod tests {
         #[test]
         fn parses_default_destination_alias() {
             let row: CsvItemRow = assert_parses(
-                "Item,Vendor,Item Cost,Default Destination\nEcho Dot,Amazon,39.99,CBG"
+                "Item,Default Destination\nEcho Dot,CBG"
             );
             assert_eq!(row.destination, Some("CBG".to_string()));
         }
 
         #[test]
         fn destination_defaults_to_none() {
-            let row: CsvItemRow = assert_parses("name,vendor,unit_cost\nEcho Dot,Amazon,39.99");
+            let row: CsvItemRow = assert_parses("name\nEcho Dot");
             assert_eq!(row.destination, None);
         }
 
         #[test]
         fn parses_optional_notes() {
             let row: CsvItemRow = assert_parses(
-                "name,vendor,unit_cost,notes\nEcho Dot,Amazon,39.99,Test note"
+                "name,notes\nEcho Dot,Test note"
             );
             assert_eq!(row.notes, Some("Test note".to_string()));
         }
@@ -919,10 +974,9 @@ mod tests {
         fn handles_extra_columns() {
             // CSV with extra columns that should be ignored
             let row: CsvItemRow = assert_parses(
-                "Item,Vendor,Extra Col,Item Cost,Another Extra\nEcho,Amazon,ignore,29.99,also ignore"
+                "Item,Extra Col,Another Extra\nEcho,ignore,also ignore"
             );
             assert_eq!(row.name, "Echo");
-            assert_eq!(row.purchase_cost, "29.99");
         }
     }
 
@@ -985,6 +1039,10 @@ mod tests {
                 purchase_cost: "$39.99".to_string(),
                 date: None,
                 invoice: None,
+                receipt: None,
+                selling_price: None,
+                status: None,
+                delivery_date: None,
                 notes: None,
             };
             let item_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
@@ -1013,7 +1071,7 @@ mod tests {
 
         #[test]
         fn handles_csv_with_only_header() {
-            let results: Vec<Result<CsvItemRow, _>> = parse_csv("name,vendor,unit_cost");
+            let results: Vec<Result<CsvItemRow, _>> = parse_csv("name");
             assert!(results.is_empty());
         }
 
@@ -1026,10 +1084,11 @@ mod tests {
         }
 
         #[test]
-        fn item_row_handles_currency_format() {
-            let row: CsvItemRow = assert_parses("name,vendor,unit_cost\nEcho,$39.99,Amazon");
-            // Note: This tests the flexible parsing - actual cost parsing happens in import logic
-            assert!(!row.purchase_cost.is_empty());
+        fn item_row_parses_with_notes_and_destination() {
+            let row: CsvItemRow = assert_parses("name,destination,notes\nEcho,BSC,Test note");
+            assert_eq!(row.name, "Echo");
+            assert_eq!(row.destination, Some("BSC".to_string()));
+            assert_eq!(row.notes, Some("Test note".to_string()));
         }
     }
 
