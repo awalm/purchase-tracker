@@ -3,6 +3,7 @@
 export interface Vendor {
   id: string;
   name: string;
+  short_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -69,6 +70,9 @@ export interface InvoiceWithDestination {
   updated_at: string;
   purchase_count: number | null;
   purchases_total: string | null;
+  total_cost: string | null;
+  total_commission: string | null;
+  receipted_count: number | null;
 }
 
 export interface ReceiptWithVendor {
@@ -88,6 +92,7 @@ export interface ReceiptWithVendor {
   purchases_total: string | null;
   total_selling: string | null;
   total_commission: string | null;
+  invoiced_count: number | null;
 }
 
 export type DeliveryStatus = 'pending' | 'in_transit' | 'delivered' | 'returned' | 'damaged' | 'lost';
@@ -99,7 +104,7 @@ export interface Purchase {
   receipt_id: string | null;
   quantity: number;
   purchase_cost: string;
-  selling_price: string | null;
+  invoice_unit_price: string | null;
   destination_id: string | null;
   status: DeliveryStatus;
   delivery_date: string | null;
@@ -128,7 +133,7 @@ export interface PurchaseEconomics {
   quantity: number;
   purchase_cost: string;
   total_cost: string | null;
-  selling_price: string | null;
+  invoice_unit_price: string | null;
   total_selling: string | null;
   unit_commission: string | null;
   total_commission: string | null;

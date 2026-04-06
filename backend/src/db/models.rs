@@ -28,6 +28,7 @@ pub enum DeliveryStatus {
 pub struct Vendor {
     pub id: Uuid,
     pub name: String,
+    pub short_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -93,7 +94,7 @@ pub struct Purchase {
     pub receipt_id: Option<Uuid>,
     pub quantity: i32,
     pub purchase_cost: Decimal,
-    pub selling_price: Option<Decimal>,
+    pub invoice_unit_price: Option<Decimal>, // Invoice-side unit price (invoice context)
     pub destination_id: Option<Uuid>,
     pub status: DeliveryStatus,
     pub delivery_date: Option<NaiveDate>,
@@ -149,7 +150,7 @@ pub struct PurchaseEconomics {
     pub quantity: i32,
     pub purchase_cost: Decimal,
     pub total_cost: Option<Decimal>,
-    pub selling_price: Option<Decimal>,
+    pub invoice_unit_price: Option<Decimal>,
     pub total_selling: Option<Decimal>,
     pub unit_commission: Option<Decimal>,
     pub total_commission: Option<Decimal>,
@@ -258,11 +259,13 @@ pub struct InvoiceWithDestination {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateVendor {
     pub name: String,
+    pub short_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateVendor {
     pub name: Option<String>,
+    pub short_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,18 +320,21 @@ pub struct UpdateInvoice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateReceipt {
     pub vendor_id: Uuid,
-    pub receipt_number: String,
+    pub receipt_number: Option<String>,
     pub receipt_date: NaiveDate,
     pub subtotal: Decimal,
-    pub tax_rate: Option<Decimal>,  // defaults to 13.00 if not provided
+    pub tax_amount: Option<Decimal>,
+    pub tax_rate: Option<Decimal>,  // backwards-compatible fallback if tax_amount is not provided
     pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateReceipt {
+    pub vendor_id: Option<Uuid>,
     pub receipt_number: Option<String>,
     pub receipt_date: Option<NaiveDate>,
     pub subtotal: Option<Decimal>,
+    pub tax_amount: Option<Decimal>,
     pub tax_rate: Option<Decimal>,
     pub notes: Option<String>,
 }
@@ -340,7 +346,7 @@ pub struct CreatePurchase {
     pub receipt_id: Option<Uuid>,
     pub quantity: i32,
     pub purchase_cost: Decimal,
-    pub selling_price: Option<Decimal>,
+    pub invoice_unit_price: Option<Decimal>, // Invoice-side unit price (invoice context)
     pub destination_id: Option<Uuid>,
     pub status: Option<DeliveryStatus>,
     pub delivery_date: Option<NaiveDate>,
@@ -358,9 +364,9 @@ pub struct UpdatePurchase {
     pub clear_receipt: bool,     // true → set receipt_id to NULL
     pub quantity: Option<i32>,
     pub purchase_cost: Option<Decimal>,
-    pub selling_price: Option<Decimal>,
+    pub invoice_unit_price: Option<Decimal>, // Invoice-side unit price (invoice context)
     #[serde(default)]
-    pub clear_selling_price: bool,  // true → set selling_price to NULL
+    pub clear_invoice_unit_price: bool,  // true → set invoice_unit_price to NULL
     pub destination_id: Option<Uuid>,
     pub status: Option<DeliveryStatus>,
     pub delivery_date: Option<NaiveDate>,
@@ -796,7 +802,7 @@ mod tests {
                     receipt_id: None,
                     quantity: 4,
                     purchase_cost,
-                    selling_price: Some(dec!(12.00)),
+                    invoice_unit_price: Some(dec!(12.00)),
                     destination_id: Some(dest_id),
                     status: DeliveryStatus::Pending,
                     delivery_date: None,
@@ -811,7 +817,7 @@ mod tests {
                     receipt_id: None,
                     quantity: -1,
                     purchase_cost,
-                    selling_price: Some(dec!(12.00)),
+                    invoice_unit_price: Some(dec!(12.00)),
                     destination_id: Some(dest_id),
                     status: DeliveryStatus::Pending,
                     delivery_date: None,
@@ -888,7 +894,7 @@ mod tests {
                 quantity: -1,
                 purchase_cost: dec!(8.00),
                 total_cost: Some(dec!(-8.00)),
-                selling_price: Some(dec!(12.00)),
+                invoice_unit_price: Some(dec!(12.00)),
                 total_selling: Some(dec!(-12.00)),
                 unit_commission: Some(dec!(4.00)),
                 total_commission: Some(dec!(-4.00)),
@@ -922,7 +928,7 @@ mod tests {
                 quantity: 4,
                 purchase_cost: dec!(8.00),
                 total_cost: Some(dec!(32.00)),
-                selling_price: Some(dec!(12.00)),
+                invoice_unit_price: Some(dec!(12.00)),
                 total_selling: Some(dec!(48.00)),
                 unit_commission: Some(dec!(4.00)),
                 total_commission: Some(dec!(16.00)),
@@ -947,7 +953,7 @@ mod tests {
                 quantity: -1,
                 purchase_cost: dec!(8.00),
                 total_cost: Some(dec!(-8.00)),
-                selling_price: Some(dec!(12.00)),
+                invoice_unit_price: Some(dec!(12.00)),
                 total_selling: Some(dec!(-12.00)),
                 unit_commission: Some(dec!(4.00)),
                 total_commission: Some(dec!(-4.00)),
@@ -1177,7 +1183,7 @@ mod tests {
 
     // ==================== Zero Purchase Cost Economics ====================
     // When purchase_cost = 0 (cost unknown), the view treats it as if
-    // cost = selling_price, so commission = 0 (break-even) instead of
+    // cost = invoice_unit_price, so commission = 0 (break-even) instead of
     // inflated profit. These tests validate the expected model values
     // that the view would produce.
 
@@ -1185,8 +1191,8 @@ mod tests {
         use super::*;
 
         /// Helper: builds a PurchaseEconomics with the logic the view applies
-        /// when purchase_cost = 0 (uses selling_price as effective cost).
-        fn make_zero_cost_economics(qty: i32, selling_price: Decimal) -> PurchaseEconomics {
+        /// when purchase_cost = 0 (uses invoice_unit_price as effective cost).
+        fn make_zero_cost_economics(qty: i32, invoice_unit_price: Decimal) -> PurchaseEconomics {
             PurchaseEconomics {
                 purchase_id: Uuid::new_v4(),
                 purchase_date: Utc::now(),
@@ -1196,15 +1202,15 @@ mod tests {
                 destination_code: Some("BSC".to_string()),
                 quantity: qty,
                 purchase_cost: dec!(0),
-                // View logic: total_cost = qty * selling_price when cost = 0
-                total_cost: Some(Decimal::from(qty) * selling_price),
-                selling_price: Some(selling_price),
-                total_selling: Some(Decimal::from(qty) * selling_price),
+                // View logic: total_cost = qty * invoice_unit_price when cost = 0
+                total_cost: Some(Decimal::from(qty) * invoice_unit_price),
+                invoice_unit_price: Some(invoice_unit_price),
+                total_selling: Some(Decimal::from(qty) * invoice_unit_price),
                 // View logic: commission = 0 when cost = 0
                 unit_commission: Some(dec!(0)),
                 total_commission: Some(dec!(0)),
-                // View logic: tax_paid = qty * selling_price * 0.13 when cost = 0
-                tax_paid: Some(Decimal::from(qty) * selling_price * dec!(0.13)),
+                // View logic: tax_paid = qty * invoice_unit_price * 0.13 when cost = 0
+                tax_paid: Some(Decimal::from(qty) * invoice_unit_price * dec!(0.13)),
                 tax_owed: Some(dec!(0)),
                 status: DeliveryStatus::Pending,
                 delivery_date: None,
@@ -1229,7 +1235,7 @@ mod tests {
                 quantity: qty,
                 purchase_cost: cost,
                 total_cost: Some(Decimal::from(qty) * cost),
-                selling_price: Some(sell),
+                invoice_unit_price: Some(sell),
                 total_selling: Some(Decimal::from(qty) * sell),
                 unit_commission: Some(commission),
                 total_commission: Some(Decimal::from(qty) * commission),
@@ -1256,24 +1262,24 @@ mod tests {
         }
 
         #[test]
-        fn zero_cost_total_cost_uses_selling_price() {
+        fn zero_cost_total_cost_uses_invoice_unit_price() {
             let econ = make_zero_cost_economics(4, dec!(30.00));
-            // total_cost should be qty * selling_price = 4 * 30 = 120
+            // total_cost should be qty * invoice_unit_price = 4 * 30 = 120
             assert_eq!(econ.total_cost, Some(dec!(120.00)),
-                "total_cost should use selling_price as effective cost");
+                "total_cost should use invoice_unit_price as effective cost");
             assert_eq!(econ.total_selling, Some(dec!(120.00)),
-                "total_selling = qty * selling_price");
+                "total_selling = qty * invoice_unit_price");
             // total_cost == total_selling (break-even)
             assert_eq!(econ.total_cost, econ.total_selling,
                 "When cost unknown, total_cost = total_selling (break-even)");
         }
 
         #[test]
-        fn zero_cost_tax_paid_uses_selling_price() {
+        fn zero_cost_tax_paid_uses_invoice_unit_price() {
             let econ = make_zero_cost_economics(2, dec!(50.00));
-            // tax_paid = qty * selling_price * 0.13 = 2 * 50 * 0.13 = 13
+            // tax_paid = qty * invoice_unit_price * 0.13 = 2 * 50 * 0.13 = 13
             assert_eq!(econ.tax_paid, Some(dec!(13.00)),
-                "tax_paid should use selling_price when cost is 0");
+                "tax_paid should use invoice_unit_price when cost is 0");
         }
 
         #[test]
@@ -1309,7 +1315,7 @@ mod tests {
         fn zero_cost_single_unit() {
             let econ = make_zero_cost_economics(1, dec!(99.99));
             assert_eq!(econ.total_cost, Some(dec!(99.99)),
-                "Single unit: total_cost = selling_price");
+                "Single unit: total_cost = invoice_unit_price");
             assert_eq!(econ.total_selling, Some(dec!(99.99)));
             assert_eq!(econ.total_commission, Some(dec!(0)));
         }

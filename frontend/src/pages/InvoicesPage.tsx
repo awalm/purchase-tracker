@@ -215,7 +215,7 @@ export default function InvoicesPage() {
               item_id: item.id,
               quantity: li.qty,
               purchase_cost: "0",
-              selling_price: li.selling_price,
+              invoice_unit_price: li.invoice_unit_price,
               destination_id: pdfDestinationId,
               invoice_id: invoiceId,
               status: "delivered",
@@ -497,7 +497,7 @@ export default function InvoicesPage() {
                                     </div>
                                   </TableCell>
                                   <TableCell className="text-xs text-right">{item.qty}</TableCell>
-                                  <TableCell className="text-xs text-right">{formatCurrency(item.selling_price)}</TableCell>
+                                  <TableCell className="text-xs text-right">{formatCurrency(item.invoice_unit_price)}</TableCell>
                                   <TableCell className="text-xs text-right">{formatCurrency(item.subtotal)}</TableCell>
                                 </TableRow>
                                 )
@@ -597,7 +597,7 @@ export default function InvoicesPage() {
               <form onSubmit={handleSubmit} className="space-y-4">
                 {!editingInvoice && (
                   <div className="space-y-2">
-                    <Label htmlFor="destination">Destination</Label>
+                    <Label htmlFor="destination">Destination *</Label>
                     <Select value={destinationId} onValueChange={setDestinationId} required>
                       <SelectTrigger>
                         <SelectValue placeholder="Select destination" />
@@ -619,7 +619,7 @@ export default function InvoicesPage() {
                 )}
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <Label htmlFor="invoiceNumber">Invoice #</Label>
+                    <Label htmlFor="invoiceNumber">Invoice # *</Label>
                     <Input
                       id="invoiceNumber"
                       value={invoiceNumber}
@@ -629,7 +629,7 @@ export default function InvoicesPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="orderNumber">Order # (optional)</Label>
+                    <Label htmlFor="orderNumber">Order #</Label>
                     <Input
                       id="orderNumber"
                       value={orderNumber}
@@ -640,7 +640,7 @@ export default function InvoicesPage() {
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <Label htmlFor="invoiceDate">Invoice Date</Label>
+                    <Label htmlFor="invoiceDate">Invoice Date *</Label>
                     <DateInput
                       id="invoiceDate"
                       value={invoiceDate}
@@ -649,7 +649,7 @@ export default function InvoicesPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="subtotal">Subtotal (pre-tax)</Label>
+                    <Label htmlFor="subtotal">Subtotal (pre-tax) *</Label>
                     <Input
                       id="subtotal"
                       type="number"
@@ -662,7 +662,7 @@ export default function InvoicesPage() {
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="notes">Notes (optional)</Label>
+                  <Label htmlFor="notes">Notes</Label>
                   <Input
                     id="notes"
                     value={notes}

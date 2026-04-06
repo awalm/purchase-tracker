@@ -97,7 +97,7 @@ export default function ReceiptsPage() {
   const [receiptNumber, setReceiptNumber] = useState("")
   const [receiptDate, setReceiptDate] = useState("")
   const [subtotal, setSubtotal] = useState("")
-  const [taxRate, setTaxRate] = useState("13.00")
+  const [taxAmount, setTaxAmount] = useState("")
   const [notes, setNotes] = useState("")
   const [vendorFilter, setVendorFilter] = useState<string>("")
 
@@ -111,7 +111,7 @@ export default function ReceiptsPage() {
     setReceiptNumber("")
     setReceiptDate("")
     setSubtotal("")
-    setTaxRate("13.00")
+    setTaxAmount("")
     setNotes("")
   }
 
@@ -120,19 +120,20 @@ export default function ReceiptsPage() {
     if (editingId) {
       await updateReceipt.mutateAsync({
         id: editingId,
+        vendor_id: vendorId,
         receipt_number: receiptNumber,
         receipt_date: receiptDate,
         subtotal,
-        tax_rate: taxRate,
+        tax_amount: taxAmount,
         notes: notes || undefined,
       })
     } else {
       await createReceipt.mutateAsync({
         vendor_id: vendorId,
-        receipt_number: receiptNumber,
+        ...(receiptNumber.trim() ? { receipt_number: receiptNumber.trim() } : {}),
         receipt_date: receiptDate,
         subtotal,
-        tax_rate: taxRate,
+        tax_amount: taxAmount,
         notes: notes || undefined,
       })
     }
@@ -146,7 +147,7 @@ export default function ReceiptsPage() {
     setReceiptNumber(r.receipt_number)
     setReceiptDate(r.receipt_date)
     setSubtotal(r.subtotal)
-    setTaxRate(r.tax_rate)
+    setTaxAmount((parseFloat(r.total) - parseFloat(r.subtotal)).toFixed(2))
     setNotes(r.notes || "")
     setIsOpen(true)
   }
@@ -177,10 +178,6 @@ export default function ReceiptsPage() {
     (sum, r) => sum + parseFloat(r.total || "0"),
     0
   )
-  const totalCommission = filteredReceipts.reduce(
-    (sum, r) => sum + parseFloat(r.total_commission || "0"),
-    0
-  )
   const unreconciledCount = filteredReceipts.filter(r => {
     const count = r.purchase_count || 0
     if (count === 0) return false
@@ -208,8 +205,6 @@ export default function ReceiptsPage() {
               { header: "Total", accessor: (r) => r.total },
               { header: "Purchase Count", accessor: (r) => r.purchase_count },
               { header: "Purchases Total", accessor: (r) => r.purchases_total },
-              { header: "Total Selling", accessor: (r) => r.total_selling },
-              { header: "Total Commission", accessor: (r) => r.total_commission },
               { header: "Has Document", accessor: (r) => r.has_pdf ? "Yes" : "No" },
               { header: "Notes", accessor: (r) => r.notes },
             ]}
@@ -236,12 +231,11 @@ export default function ReceiptsPage() {
               </DialogHeader>
               <form onSubmit={handleSubmit} className="space-y-4">
                 <div className="space-y-2">
-                  <Label htmlFor="vendor">Vendor</Label>
+                  <Label htmlFor="vendor">Vendor *</Label>
                   <Select
                     value={vendorId}
                     onValueChange={setVendorId}
                     required
-                    disabled={!!editingId}
                   >
                     <SelectTrigger>
                       <SelectValue placeholder="Select vendor" />
@@ -261,12 +255,11 @@ export default function ReceiptsPage() {
                     id="receiptNumber"
                     value={receiptNumber}
                     onChange={(e) => setReceiptNumber(e.target.value)}
-                    placeholder="REC-001"
-                    required
+                    placeholder="Auto-generated if empty"
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="receiptDate">Receipt Date</Label>
+                  <Label htmlFor="receiptDate">Receipt Date *</Label>
                   <Input
                     id="receiptDate"
                     type="date"
@@ -277,7 +270,7 @@ export default function ReceiptsPage() {
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <Label htmlFor="subtotal">Subtotal</Label>
+                    <Label htmlFor="subtotal">Subtotal *</Label>
                     <Input
                       id="subtotal"
                       type="number"
@@ -289,14 +282,15 @@ export default function ReceiptsPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="taxRate">Tax Rate %</Label>
+                    <Label htmlFor="taxAmount">Tax Amount *</Label>
                     <Input
-                      id="taxRate"
+                      id="taxAmount"
                       type="number"
                       step="0.01"
-                      value={taxRate}
-                      onChange={(e) => setTaxRate(e.target.value)}
-                      placeholder="13.00"
+                      value={taxAmount}
+                      onChange={(e) => setTaxAmount(e.target.value)}
+                      placeholder="0.00"
+                      required
                     />
                   </div>
                 </div>
@@ -333,7 +327,7 @@ export default function ReceiptsPage() {
       </div>
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-3 gap-4">
         <Card>
           <CardContent className="pt-6">
             <div className="text-2xl font-bold">{totalReceipts}</div>
@@ -344,14 +338,6 @@ export default function ReceiptsPage() {
           <CardContent className="pt-6">
             <div className="text-2xl font-bold">{formatCurrency(totalSpent.toFixed(2))}</div>
             <p className="text-sm text-muted-foreground">Total Spent (incl. tax)</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div className={`text-2xl font-bold ${totalCommission >= 0 ? "text-green-600" : "text-red-600"}`}>
-              {formatCurrency(totalCommission.toFixed(2))}
-            </div>
-            <p className="text-sm text-muted-foreground">Total Profit</p>
           </CardContent>
         </Card>
         <Card>
@@ -407,7 +393,6 @@ export default function ReceiptsPage() {
                 <TableHead className="text-right">Tax</TableHead>
                 <TableHead className="text-right">Total</TableHead>
                 <TableHead className="text-right">Items</TableHead>
-                <TableHead className="text-right">Profit</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>PDF</TableHead>
                 <TableHead className="w-24">Actions</TableHead>
@@ -439,17 +424,6 @@ export default function ReceiptsPage() {
                     </TableCell>
                     <TableCell className="text-right">
                       {r.purchase_count || 0}
-                    </TableCell>
-                    <TableCell
-                      className={`text-right ${
-                        parseFloat(r.total_commission || "0") >= 0
-                          ? "text-green-600"
-                          : "text-red-600"
-                      }`}
-                    >
-                      {r.total_commission
-                        ? formatCurrency(r.total_commission)
-                        : "—"}
                     </TableCell>
                     <TableCell>
                       <ReconciliationBadge receipt={r} />
@@ -498,7 +472,7 @@ export default function ReceiptsPage() {
                 )
               })}
               {filteredReceipts.length === 0 && (
-                <EmptyTableRow colSpan={11} message="No receipts yet" />
+                <EmptyTableRow colSpan={10} message="No receipts yet" />
               )}
             </TableBody>
           </Table>

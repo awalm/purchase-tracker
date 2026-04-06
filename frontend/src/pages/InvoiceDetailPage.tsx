@@ -46,6 +46,8 @@ import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, Fi
 import { formatCurrency, formatDate } from "@/lib/utils"
 import { invoices as invoicesApi, receipts as receiptsApi } from "@/api"
 
+type InvoicePurchase = ReturnType<typeof useInvoicePurchases>["data"] extends (infer T)[] | undefined ? T : never
+
 
 export default function InvoiceDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -92,7 +94,7 @@ export default function InvoiceDetailPage() {
   const [itemId, setItemId] = useState("")
   const [quantity, setQuantity] = useState("1")
   const [purchaseCost, setPurchaseCost] = useState("")
-  const [sellingPrice, setSellingPrice] = useState("")
+  const [invoiceUnitPrice, setInvoiceUnitPrice] = useState("")
   const [destinationId, setDestinationId] = useState("")
   const [receiptId, setReceiptId] = useState("")
   const [notes, setNotes] = useState("")
@@ -106,16 +108,22 @@ export default function InvoiceDetailPage() {
   const [newRcptNumber, setNewRcptNumber] = useState("")
   const [newRcptDate, setNewRcptDate] = useState("")
   const [newRcptSubtotal, setNewRcptSubtotal] = useState("")
-  const [newRcptTaxRate, setNewRcptTaxRate] = useState("13.00")
+  const [newRcptTaxAmount, setNewRcptTaxAmount] = useState("")
   const [newRcptFile, setNewRcptFile] = useState<File | null>(null)
+  const [linkQuantity, setLinkQuantity] = useState("1")
+  const [linkingPurchase, setLinkingPurchase] = useState<InvoicePurchase | null>(null)
   const [linkNotes, setLinkNotes] = useState("")
+  const [confirmSplit, setConfirmSplit] = useState(false)
 
-  const openLinkDialog = (purchaseId: string, currentReceiptId?: string | null, currentNotes?: string | null) => {
-    setLinkingPurchaseId(purchaseId)
-    setLinkReceiptId(currentReceiptId || "")
-    setLinkNotes(currentNotes || "")
+  const openLinkDialog = (purchase: InvoicePurchase) => {
+    setLinkingPurchaseId(purchase.purchase_id)
+    setLinkingPurchase(purchase)
+    setLinkReceiptId(purchase.receipt_id || "")
+    setLinkNotes(purchase.notes || "")
+    setLinkQuantity(String(purchase.quantity))
     setShowNewReceipt(false)
     setNewRcptFile(null)
+    setConfirmSplit(false)
     setLinkDialogOpen(true)
   }
 
@@ -124,8 +132,86 @@ export default function InvoiceDetailPage() {
     setNewRcptNumber("")
     setNewRcptDate("")
     setNewRcptSubtotal("")
-    setNewRcptTaxRate("13.00")
+    setNewRcptTaxAmount("")
     setNewRcptFile(null)
+    setLinkQuantity("1")
+    setConfirmSplit(false)
+  }
+
+  const resolveDestinationIdForPurchase = (purchase: InvoicePurchase): string | undefined => {
+    const byCode = destinations.find((d) => d.code === purchase.destination_code)
+    return byCode?.id || invoice?.destination_id || undefined
+  }
+
+  const ensureReceiptItemCapacity = async (receiptIdToAssign: string, selectedQty: number) => {
+    if (!linkingPurchase) return
+
+    const isSameReceipt = linkingPurchase.receipt_id === receiptIdToAssign
+    if (isSameReceipt) return
+
+    const receiptLines = await receiptsApi.purchases(receiptIdToAssign)
+    const availableQtyForItem = receiptLines
+      .filter((line) => line.item_id === linkingPurchase.item_id && !line.invoice_id)
+      .reduce((sum, line) => sum + line.quantity, 0)
+
+    if (selectedQty > availableQtyForItem) {
+      throw new Error(`Only ${availableQtyForItem} unallocated unit(s) of this item remain on the selected receipt.`)
+    }
+  }
+
+  const applyReceiptAllocation = async (receiptIdToAssign?: string) => {
+    if (!linkingPurchaseId || !linkingPurchase) return
+
+    const parsedQty = parseInt(linkQuantity, 10)
+    const selectedQty = Number.isNaN(parsedQty) ? 1 : parsedQty
+
+    if (selectedQty <= 0 || selectedQty > linkingPurchase.quantity) {
+      alert(`Quantity must be between 1 and ${linkingPurchase.quantity}`)
+      return
+    }
+
+    if (!receiptIdToAssign && selectedQty < linkingPurchase.quantity) {
+      alert("Choose a receipt when splitting quantity.")
+      return
+    }
+
+    if (receiptIdToAssign) {
+      try {
+        await ensureReceiptItemCapacity(receiptIdToAssign, selectedQty)
+      } catch (err) {
+        alert(err instanceof Error ? err.message : "Selected receipt does not have enough available quantity for this item.")
+        return
+      }
+    }
+
+    if (selectedQty === linkingPurchase.quantity) {
+      await updatePurchase.mutateAsync({
+        id: linkingPurchaseId,
+        receipt_id: receiptIdToAssign || undefined,
+        clear_receipt: !receiptIdToAssign,
+        notes: linkNotes || undefined,
+      })
+      return
+    }
+
+    const remainingQty = linkingPurchase.quantity - selectedQty
+
+    await updatePurchase.mutateAsync({
+      id: linkingPurchaseId,
+      quantity: remainingQty,
+    })
+
+    await createPurchase.mutateAsync({
+      item_id: linkingPurchase.item_id,
+      quantity: selectedQty,
+      purchase_cost: linkingPurchase.purchase_cost,
+      invoice_unit_price: linkingPurchase.invoice_unit_price || undefined,
+      destination_id: resolveDestinationIdForPurchase(linkingPurchase),
+      receipt_id: receiptIdToAssign,
+      invoice_id: id,
+      status: linkingPurchase.status,
+      notes: linkNotes || linkingPurchase.notes || undefined,
+    })
   }
 
   const handleCreateAndLink = async (e: React.FormEvent) => {
@@ -133,17 +219,13 @@ export default function InvoiceDetailPage() {
     if (!linkingPurchaseId) return
     const newReceipt = await createReceipt.mutateAsync({
       vendor_id: newRcptVendorId,
-      receipt_number: newRcptNumber,
+      ...(newRcptNumber.trim() ? { receipt_number: newRcptNumber.trim() } : {}),
       receipt_date: newRcptDate,
       subtotal: newRcptSubtotal,
-      tax_rate: newRcptTaxRate,
+      tax_amount: newRcptTaxAmount,
     })
     await receiptsApi.uploadPdf(newReceipt.id, newRcptFile!)
-    await updatePurchase.mutateAsync({
-      id: linkingPurchaseId,
-      receipt_id: newReceipt.id,
-      notes: linkNotes || undefined,
-    })
+    await applyReceiptAllocation(newReceipt.id)
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
     queryClient.invalidateQueries({ queryKey: ["receipts"] })
     setLinkDialogOpen(false)
@@ -152,15 +234,25 @@ export default function InvoiceDetailPage() {
 
   const handleLinkReceipt = async () => {
     if (!linkingPurchaseId) return
-    await updatePurchase.mutateAsync({
-      id: linkingPurchaseId,
-      receipt_id: linkReceiptId || undefined,
-      clear_receipt: !linkReceiptId,
-      notes: linkNotes || undefined,
-    })
+    await applyReceiptAllocation(linkReceiptId || undefined)
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
     queryClient.invalidateQueries({ queryKey: ["receipts"] })
+    setConfirmSplit(false)
     setLinkDialogOpen(false)
+  }
+
+  const handleSaveLinkFlow = async () => {
+    if (!linkingPurchase) return
+
+    const parsedQty = parseInt(linkQuantity, 10)
+    const selectedQty = Number.isNaN(parsedQty) ? 1 : parsedQty
+
+    if (selectedQty < linkingPurchase.quantity && !confirmSplit) {
+      setConfirmSplit(true)
+      return
+    }
+
+    await handleLinkReceipt()
   }
 
   // Show all items (no vendor filtering needed for outgoing invoices)
@@ -174,7 +266,7 @@ export default function InvoiceDetailPage() {
         item_id: itemId,
         quantity: parseInt(quantity),
         purchase_cost: purchaseCost,
-        selling_price: sellingPrice || undefined,
+        invoice_unit_price: invoiceUnitPrice || undefined,
         destination_id: destinationId || undefined,
         receipt_id: receiptId || undefined,
         clear_receipt: !receiptId,
@@ -186,7 +278,7 @@ export default function InvoiceDetailPage() {
         item_id: itemId,
         quantity: parseInt(quantity),
         purchase_cost: purchaseCost,
-        selling_price: sellingPrice || undefined,
+        invoice_unit_price: invoiceUnitPrice || undefined,
         destination_id: destinationId || undefined,
         receipt_id: receiptId || undefined,
         invoice_id: id,
@@ -205,7 +297,7 @@ export default function InvoiceDetailPage() {
     setItemId("")
     setQuantity("1")
     setPurchaseCost("")
-    setSellingPrice("")
+    setInvoiceUnitPrice("")
     setDestinationId("")
     setReceiptId("")
     setNotes("")
@@ -231,7 +323,7 @@ export default function InvoiceDetailPage() {
     setItemId(matchedItem?.id || "")
     setQuantity(String(p.quantity))
     setPurchaseCost(p.purchase_cost)
-    setSellingPrice(p.selling_price || "")
+    setInvoiceUnitPrice(p.invoice_unit_price || "")
     // Find destination by code
     const matchedDest = destinations.find((d) => d.code === p.destination_code)
     setDestinationId(matchedDest?.id || "")
@@ -264,7 +356,7 @@ export default function InvoiceDetailPage() {
   const totalQuantity = purchases.reduce((sum, p) => sum + p.quantity, 0)
   const totalCost = purchases.reduce((sum, p) => sum + parseFloat(p.total_cost || "0"), 0)
   const totalCommission = purchases.reduce((sum, p) => sum + parseFloat(p.total_commission || "0"), 0)
-  const hasAnyPrice = purchases.some(p => p.selling_price !== null)
+  const hasAnyPrice = purchases.some(p => p.invoice_unit_price !== null)
   const receiptedCount = invoice.receipted_count || purchases.filter(p => p.receipt_id).length
   const totalPurchases = purchases.length
   const fullyReconciled = isReconciled && totalPurchases > 0 && receiptedCount === totalPurchases
@@ -339,7 +431,7 @@ export default function InvoiceDetailPage() {
               { header: "Destination", accessor: (p) => p.destination_code },
               { header: "Quantity", accessor: (p) => p.quantity },
               { header: "Purchase Cost", accessor: (p) => p.purchase_cost },
-              { header: "Selling Price", accessor: (p) => p.selling_price },
+              { header: "Invoice Unit Price", accessor: (p) => p.invoice_unit_price },
               { header: "Line Total", accessor: (p) => p.total_selling },
               { header: "Commission", accessor: (p) => p.total_commission },
               { header: "Receipt", accessor: (p) => p.receipt_number },
@@ -465,7 +557,7 @@ export default function InvoiceDetailPage() {
                     <strong>Invoice:</strong> {invoice.invoice_number} ({invoice.destination_code} - {invoice.destination_name})
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="item">Item</Label>
+                    <Label htmlFor="item">Item *</Label>
                     <Select value={itemId} onValueChange={handleItemChange} required>
                       <SelectTrigger className="truncate">
                         <SelectValue placeholder="Select item" />
@@ -481,7 +573,7 @@ export default function InvoiceDetailPage() {
                   </div>
                   <div className="grid grid-cols-3 gap-4">
                     <div className="space-y-2">
-                      <Label htmlFor="quantity">Quantity</Label>
+                      <Label htmlFor="quantity">Quantity *</Label>
                       <Input
                         id="quantity"
                         type="number"
@@ -491,7 +583,7 @@ export default function InvoiceDetailPage() {
                       />
                     </div>
                     <div className="space-y-2">
-                      <Label htmlFor="purchaseCost">Purchase Cost</Label>
+                      <Label htmlFor="purchaseCost">Purchase Cost *</Label>
                       <Input
                         id="purchaseCost"
                         type="number"
@@ -503,14 +595,14 @@ export default function InvoiceDetailPage() {
                       />
                     </div>
                     <div className="space-y-2">
-                      <Label htmlFor="sellingPrice">Selling Price</Label>
+                      <Label htmlFor="invoiceUnitPrice">Invoice Unit Price</Label>
                       <Input
-                        id="sellingPrice"
+                        id="invoiceUnitPrice"
                         type="number"
                         step="0.01"
-                        value={sellingPrice}
-                        onChange={(e) => setSellingPrice(e.target.value)}
-                        placeholder="Selling price"
+                        value={invoiceUnitPrice}
+                        onChange={(e) => setInvoiceUnitPrice(e.target.value)}
+                        placeholder="Invoice unit price"
                       />
                     </div>
                   </div>
@@ -530,7 +622,7 @@ export default function InvoiceDetailPage() {
                     </Select>
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="notes">Notes (optional)</Label>
+                    <Label htmlFor="notes">Notes</Label>
                     <Input
                       id="notes"
                       value={notes}
@@ -539,7 +631,7 @@ export default function InvoiceDetailPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="receipt">Receipt (optional)</Label>
+                    <Label htmlFor="receipt">Receipt</Label>
                     <Select
                       value={receiptId || "__none__"}
                       onValueChange={(v) => setReceiptId(v === "__none__" ? "" : v)}
@@ -560,17 +652,17 @@ export default function InvoiceDetailPage() {
                     </Select>
                   </div>
                   {/* Live reconciliation hint */}
-                  {sellingPrice && quantity && (
+                  {invoiceUnitPrice && quantity && (
                     <div className="text-sm bg-muted p-3 rounded-md space-y-1">
-                      <p>This line: <strong>{formatCurrency(parseFloat(sellingPrice) * parseInt(quantity || "0"))}</strong></p>
+                      <p>This line: <strong>{formatCurrency(parseFloat(invoiceUnitPrice) * parseInt(quantity || "0"))}</strong></p>
                       <p>
                         Remaining after:{" "}
                         <strong className={
-                          (difference - parseFloat(sellingPrice) * parseInt(quantity || "0")) < 0.01
+                          (difference - parseFloat(invoiceUnitPrice) * parseInt(quantity || "0")) < 0.01
                             ? "text-green-600"
                             : "text-amber-600"
                         }>
-                          {formatCurrency(difference - parseFloat(sellingPrice) * parseInt(quantity || "0"))}
+                          {formatCurrency(difference - parseFloat(invoiceUnitPrice) * parseInt(quantity || "0"))}
                         </strong>
                       </p>
                     </div>
@@ -600,7 +692,7 @@ export default function InvoiceDetailPage() {
                   <TableHead>Receipts</TableHead>
                   <TableHead className="text-right">Qty</TableHead>
                   <TableHead className="text-right">Purchase Cost</TableHead>
-                  <TableHead className="text-right">Selling Price</TableHead>
+                  <TableHead className="text-right">Invoice Unit Price</TableHead>
                   <TableHead className="text-right">Line Total</TableHead>
                   <TableHead className="text-right">Commission</TableHead>
                   <TableHead>Status</TableHead>
@@ -618,15 +710,24 @@ export default function InvoiceDetailPage() {
                     <TableCell className="font-mono">{p.destination_code || "-"}</TableCell>
                     <TableCell>
                       {p.receipt_id ? (
-                        <Link
-                          to={`/receipts/${p.receipt_id}`}
-                          className="text-xs font-mono text-emerald-600 hover:underline"
-                        >
-                          {p.receipt_number || "linked"}
-                        </Link>
+                        <div className="space-y-1">
+                          <Link
+                            to={`/receipts/${p.receipt_id}`}
+                            className="text-xs font-mono text-emerald-600 hover:underline block"
+                          >
+                            {p.receipt_number || "linked"}
+                          </Link>
+                          <button
+                            onClick={() => openLinkDialog(p)}
+                            className="text-[11px] text-muted-foreground hover:underline"
+                            title="Change receipt link or split quantity"
+                          >
+                            split / change
+                          </button>
+                        </div>
                       ) : (
                         <button
-                          onClick={() => openLinkDialog(p.purchase_id, p.receipt_id, p.notes)}
+                          onClick={() => openLinkDialog(p)}
                           className="text-red-500 text-xs flex items-center gap-1 hover:underline cursor-pointer"
                           title="Click to link a receipt"
                         >
@@ -637,7 +738,7 @@ export default function InvoiceDetailPage() {
                     </TableCell>
                     <TableCell className="text-right">{p.quantity}</TableCell>
                     <TableCell className="text-right text-muted-foreground">{formatCurrency(p.purchase_cost)}</TableCell>
-                    <TableCell className="text-right">{p.selling_price ? formatCurrency(p.selling_price) : "-"}</TableCell>
+                    <TableCell className="text-right">{p.invoice_unit_price ? formatCurrency(p.invoice_unit_price) : "-"}</TableCell>
                     <TableCell className="text-right">{p.total_selling ? formatCurrency(p.total_selling) : formatCurrency(p.total_cost)}</TableCell>
                     <TableCell className={`text-right ${p.total_commission ? (parseFloat(p.total_commission) >= 0 ? "text-green-600" : "text-red-600") : "text-muted-foreground"}`}>
                       {p.total_commission ? formatCurrency(p.total_commission) : "—"}
@@ -687,18 +788,23 @@ export default function InvoiceDetailPage() {
       {/* Focused Receipt Link Dialog */}
       <Dialog open={linkDialogOpen} onOpenChange={(open) => {
         setLinkDialogOpen(open)
-        if (!open) { setShowNewReceipt(false); resetNewReceiptForm() }
+        if (!open) {
+          setShowNewReceipt(false)
+          setLinkingPurchase(null)
+          setLinkingPurchaseId(null)
+          resetNewReceiptForm()
+        }
       }}>
-        <DialogContent className="max-w-sm">
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-md sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>{showNewReceipt ? "New Receipt" : "Link Receipt"}</DialogTitle>
           </DialogHeader>
           {showNewReceipt ? (
-            <form onSubmit={handleCreateAndLink} className="space-y-4">
+            <form onSubmit={handleCreateAndLink} className="space-y-4 min-w-0">
               <div className="space-y-2">
-                <Label>Vendor</Label>
+                <Label>Vendor *</Label>
                 <Select value={newRcptVendorId} onValueChange={setNewRcptVendorId} required>
-                  <SelectTrigger>
+                  <SelectTrigger className="w-full min-w-0">
                     <SelectValue placeholder="Select vendor" />
                   </SelectTrigger>
                   <SelectContent>
@@ -710,35 +816,35 @@ export default function InvoiceDetailPage() {
               </div>
               <div className="space-y-2">
                 <Label>Receipt Number</Label>
-                <Input value={newRcptNumber} onChange={(e) => setNewRcptNumber(e.target.value)} placeholder="REC-001" required />
+                <Input className="w-full min-w-0" value={newRcptNumber} onChange={(e) => setNewRcptNumber(e.target.value)} placeholder="Auto-generated if empty" />
               </div>
               <div className="space-y-2">
-                <Label>Date</Label>
-                <Input type="date" value={newRcptDate} onChange={(e) => setNewRcptDate(e.target.value)} required />
+                <Label>Date *</Label>
+                <Input className="w-full min-w-0" type="date" value={newRcptDate} onChange={(e) => setNewRcptDate(e.target.value)} required />
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label>Subtotal</Label>
-                  <Input type="number" step="0.01" value={newRcptSubtotal} onChange={(e) => setNewRcptSubtotal(e.target.value)} placeholder="0.00" required />
+                  <Label>Subtotal *</Label>
+                  <Input className="w-full min-w-0" type="number" step="0.01" value={newRcptSubtotal} onChange={(e) => setNewRcptSubtotal(e.target.value)} placeholder="0.00" required />
                 </div>
                 <div className="space-y-2">
-                  <Label>Tax Rate %</Label>
-                  <Input type="number" step="0.01" value={newRcptTaxRate} onChange={(e) => setNewRcptTaxRate(e.target.value)} />
+                  <Label>Tax Amount *</Label>
+                  <Input className="w-full min-w-0" type="number" step="0.01" value={newRcptTaxAmount} onChange={(e) => setNewRcptTaxAmount(e.target.value)} placeholder="0.00" required />
                 </div>
               </div>
               <div className="space-y-2">
-                <Label>Receipt Document</Label>
+                <Label>Receipt Document *</Label>
                 <Input
+                  className="w-full min-w-0 cursor-pointer"
                   type="file"
                   accept=".pdf,.png,.jpg,.jpeg,.webp"
                   onChange={(e) => setNewRcptFile(e.target.files?.[0] || null)}
-                  className="cursor-pointer"
                   required
                 />
               </div>
               <div className="space-y-2">
                 <Label>Notes</Label>
-                <Input value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
+                <Input className="w-full min-w-0" value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
               </div>
               <div className="flex justify-between">
                 <Button type="button" variant="link" className="px-0" onClick={() => setShowNewReceipt(false)}>
@@ -753,14 +859,25 @@ export default function InvoiceDetailPage() {
               </div>
             </form>
           ) : (
-            <div className="space-y-4">
+            <div className="space-y-4 min-w-0">
+              <div className="rounded-md bg-muted p-3 text-sm min-w-0">
+                <div>
+                  <strong className="block break-words">{linkingPurchase?.item_name || "Item"}</strong>
+                </div>
+                <div className="text-muted-foreground">
+                  Available quantity to allocate: {linkingPurchase?.quantity ?? 0}
+                </div>
+              </div>
               <div className="space-y-2">
                 <Label>Receipt</Label>
                 <Select
                   value={linkReceiptId || "__none__"}
-                  onValueChange={(v) => setLinkReceiptId(v === "__none__" ? "" : v)}
+                  onValueChange={(v) => {
+                    setLinkReceiptId(v === "__none__" ? "" : v)
+                    setConfirmSplit(false)
+                  }}
                 >
-                  <SelectTrigger>
+                  <SelectTrigger className="w-full min-w-0">
                     <SelectValue placeholder="Select receipt" />
                   </SelectTrigger>
                   <SelectContent>
@@ -776,8 +893,34 @@ export default function InvoiceDetailPage() {
                 </Select>
               </div>
               <div className="space-y-2">
+                <Label>Quantity *</Label>
+                <Input
+                  className="w-full min-w-0"
+                  type="number"
+                  min={1}
+                  max={linkingPurchase?.quantity || 1}
+                  value={linkQuantity}
+                  onChange={(e) => {
+                    setLinkQuantity(e.target.value)
+                    setConfirmSplit(false)
+                  }}
+                />
+                <p className="text-xs text-muted-foreground">
+                  If less than total quantity, this line will be split so you can link to multiple receipts.
+                </p>
+              </div>
+              {confirmSplit && linkingPurchase && parseInt(linkQuantity || "0", 10) < linkingPurchase.quantity && (
+                <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+                  <p className="font-medium">Split confirmation</p>
+                  <p>
+                    This will split the current line into <strong>{linkQuantity}</strong> linked now and{" "}
+                    <strong>{linkingPurchase.quantity - parseInt(linkQuantity || "0", 10)}</strong> remaining.
+                  </p>
+                </div>
+              )}
+              <div className="space-y-2">
                 <Label>Notes</Label>
-                <Input value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
+                <Input className="w-full min-w-0" value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
               </div>
               <div className="flex justify-between">
                 <Button
@@ -789,9 +932,18 @@ export default function InvoiceDetailPage() {
                   New Receipt
                 </Button>
                 <div className="flex gap-2">
+                  {confirmSplit && (
+                    <Button variant="outline" onClick={() => setConfirmSplit(false)}>
+                      Back
+                    </Button>
+                  )}
                   <Button variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
-                  <Button onClick={handleLinkReceipt} disabled={updatePurchase.isPending}>
-                    {updatePurchase.isPending ? "Saving..." : "Save"}
+                  <Button onClick={handleSaveLinkFlow} disabled={updatePurchase.isPending || createPurchase.isPending}>
+                    {updatePurchase.isPending || createPurchase.isPending
+                      ? "Saving..."
+                      : confirmSplit
+                        ? "Confirm Split & Save"
+                        : "Save"}
                   </Button>
                 </div>
               </div>

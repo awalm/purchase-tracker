@@ -73,7 +73,6 @@ export default function ReceiptDetailPage() {
   const [itemId, setItemId] = useState("")
   const [quantity, setQuantity] = useState("1")
   const [purchaseCost, setPurchaseCost] = useState("")
-  const [sellingPrice, setSellingPrice] = useState("")
   const [destinationId, setDestinationId] = useState("")
   const [invoiceId, setInvoiceId] = useState("")
   const [purchaseNotes, setPurchaseNotes] = useState("")
@@ -83,7 +82,6 @@ export default function ReceiptDetailPage() {
     setItemId("")
     setQuantity("1")
     setPurchaseCost("")
-    setSellingPrice("")
     setDestinationId("")
     setInvoiceId("")
     setPurchaseNotes("")
@@ -97,7 +95,6 @@ export default function ReceiptDetailPage() {
         item_id: itemId,
         quantity: parseInt(quantity),
         purchase_cost: purchaseCost,
-        selling_price: sellingPrice || undefined,
         destination_id: destinationId || undefined,
         invoice_id: invoiceId || undefined,
         clear_invoice: !invoiceId,
@@ -109,7 +106,6 @@ export default function ReceiptDetailPage() {
         item_id: itemId,
         quantity: parseInt(quantity),
         purchase_cost: purchaseCost,
-        selling_price: sellingPrice || undefined,
         destination_id: destinationId || undefined,
         invoice_id: invoiceId || undefined,
         receipt_id: id,
@@ -127,7 +123,6 @@ export default function ReceiptDetailPage() {
     setItemId(matchedItem?.id || "")
     setQuantity(String(p.quantity))
     setPurchaseCost(p.purchase_cost)
-    setSellingPrice(p.selling_price || "")
     const matchedDest = destinations.find((d) => d.code === p.destination_code)
     setDestinationId(matchedDest?.id || "")
     setInvoiceId(p.invoice_id || "")
@@ -179,14 +174,6 @@ export default function ReceiptDetailPage() {
   // Compute summary stats
   const totalCost = purchases.reduce(
     (sum, p) => sum + parseFloat(p.total_cost || "0"),
-    0
-  )
-  const totalSelling = purchases.reduce(
-    (sum, p) => sum + parseFloat(p.total_selling || "0"),
-    0
-  )
-  const totalCommission = purchases.reduce(
-    (sum, p) => sum + parseFloat(p.total_commission || "0"),
     0
   )
   const unlinkedCount = purchases.filter((p) => !p.invoice_id).length
@@ -256,7 +243,7 @@ export default function ReceiptDetailPage() {
       </div>
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-5 gap-4">
+      <div className="grid grid-cols-4 gap-4">
         <Card>
           <CardContent className="pt-6">
             <div className="text-2xl font-bold">
@@ -285,22 +272,8 @@ export default function ReceiptDetailPage() {
         </Card>
         <Card>
           <CardContent className="pt-6">
-            <div className="text-2xl font-bold">
-              {formatCurrency(totalSelling.toFixed(2))}
-            </div>
-            <p className="text-sm text-muted-foreground">Selling Total</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <div
-              className={`text-2xl font-bold ${
-                totalCommission >= 0 ? "text-green-600" : "text-red-600"
-              }`}
-            >
-              {formatCurrency(totalCommission.toFixed(2))}
-            </div>
-            <p className="text-sm text-muted-foreground">Profit</p>
+            <div className="text-2xl font-bold">{purchases.length}</div>
+            <p className="text-sm text-muted-foreground">Line Items</p>
           </CardContent>
         </Card>
       </div>
@@ -330,7 +303,7 @@ export default function ReceiptDetailPage() {
               </DialogHeader>
               <form onSubmit={handleSubmit} className="space-y-4">
                 <div className="space-y-2">
-                  <Label htmlFor="item">Item</Label>
+                  <Label htmlFor="item">Item *</Label>
                   <Select
                     value={itemId}
                     onValueChange={handleItemChange}
@@ -350,7 +323,7 @@ export default function ReceiptDetailPage() {
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <Label htmlFor="quantity">Quantity</Label>
+                    <Label htmlFor="quantity">Quantity *</Label>
                     <Input
                       id="quantity"
                       type="number"
@@ -360,7 +333,7 @@ export default function ReceiptDetailPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="purchaseCost">Purchase Cost</Label>
+                    <Label htmlFor="purchaseCost">Purchase Cost *</Label>
                     <Input
                       id="purchaseCost"
                       type="number"
@@ -370,16 +343,6 @@ export default function ReceiptDetailPage() {
                       required
                     />
                   </div>
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="sellingPrice">Selling Price (optional)</Label>
-                  <Input
-                    id="sellingPrice"
-                    type="number"
-                    step="0.01"
-                    value={sellingPrice}
-                    onChange={(e) => setSellingPrice(e.target.value)}
-                  />
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="destination">Destination</Label>
@@ -397,7 +360,7 @@ export default function ReceiptDetailPage() {
                   </Select>
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="invoice">Invoice (optional)</Label>
+                  <Label htmlFor="invoice">Invoice</Label>
                   <Select
                     value={invoiceId || "__none__"}
                     onValueChange={(v) =>
@@ -459,8 +422,6 @@ export default function ReceiptDetailPage() {
                 <TableHead>Invoice</TableHead>
                 <TableHead className="text-right">Qty</TableHead>
                 <TableHead className="text-right">Cost</TableHead>
-                <TableHead className="text-right">Selling</TableHead>
-                <TableHead className="text-right">Profit</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead className="w-20">Actions</TableHead>
               </TableRow>
@@ -494,22 +455,6 @@ export default function ReceiptDetailPage() {
                   <TableCell className="text-right text-muted-foreground">
                     {formatCurrency(p.total_cost)}
                   </TableCell>
-                  <TableCell className="text-right">
-                    {p.total_selling ? formatCurrency(p.total_selling) : "—"}
-                  </TableCell>
-                  <TableCell
-                    className={`text-right ${
-                      p.total_commission
-                        ? parseFloat(p.total_commission) >= 0
-                          ? "text-green-600"
-                          : "text-red-600"
-                        : ""
-                    }`}
-                  >
-                    {p.total_commission
-                      ? formatCurrency(p.total_commission)
-                      : "—"}
-                  </TableCell>
                   <TableCell>
                     <StatusSelect
                       value={p.status}
@@ -540,7 +485,7 @@ export default function ReceiptDetailPage() {
                 </TableRow>
               ))}
               {purchases.length === 0 && (
-                <EmptyTableRow colSpan={9} message="No line items yet" />
+                <EmptyTableRow colSpan={7} message="No line items yet" />
               )}
             </TableBody>
           </Table>

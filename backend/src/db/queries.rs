@@ -13,7 +13,7 @@ use crate::services::audit::AuditService;
 pub async fn get_all_vendors(pool: &PgPool) -> Result<Vec<Vendor>, sqlx::Error> {
     sqlx::query_as!(
         Vendor,
-        r#"SELECT id, name, created_at, updated_at FROM vendors ORDER BY name"#
+        r#"SELECT id, name, short_id, created_at, updated_at FROM vendors ORDER BY name"#
     )
     .fetch_all(pool)
     .await
@@ -22,7 +22,7 @@ pub async fn get_all_vendors(pool: &PgPool) -> Result<Vec<Vendor>, sqlx::Error> 
 pub async fn get_vendor_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Vendor>, sqlx::Error> {
     sqlx::query_as!(
         Vendor,
-        r#"SELECT id, name, created_at, updated_at FROM vendors WHERE id = $1"#,
+        r#"SELECT id, name, short_id, created_at, updated_at FROM vendors WHERE id = $1"#,
         id
     )
     .fetch_optional(pool)
@@ -34,10 +34,17 @@ pub async fn create_vendor(
     data: CreateVendor,
     user_id: Uuid,
 ) -> Result<Vendor, sqlx::Error> {
+    let short_id = data
+        .short_id
+        .as_deref()
+        .and_then(normalize_vendor_short_id)
+        .or_else(|| derive_vendor_short_id(&data.name));
+
     let vendor = sqlx::query_as!(
         Vendor,
-        r#"INSERT INTO vendors (name) VALUES ($1) RETURNING id, name, created_at, updated_at"#,
-        data.name
+        r#"INSERT INTO vendors (name, short_id) VALUES ($1, $2) RETURNING id, name, short_id, created_at, updated_at"#,
+        data.name,
+        short_id
     )
     .fetch_one(pool)
     .await?;
@@ -55,12 +62,21 @@ pub async fn update_vendor(
     let old = get_vendor_by_id(pool, id).await?;
 
     if let Some(ref old_vendor) = old {
+        let next_name = data.name.clone().unwrap_or_else(|| old_vendor.name.clone());
+        let next_short_id = data
+            .short_id
+            .as_deref()
+            .and_then(normalize_vendor_short_id)
+            .or_else(|| old_vendor.short_id.clone())
+            .or_else(|| derive_vendor_short_id(&next_name));
+
         let vendor = sqlx::query_as!(
             Vendor,
-            r#"UPDATE vendors SET name = COALESCE($2, name) WHERE id = $1 
-               RETURNING id, name, created_at, updated_at"#,
+            r#"UPDATE vendors SET name = COALESCE($2, name), short_id = $3 WHERE id = $1 
+               RETURNING id, name, short_id, created_at, updated_at"#,
             id,
-            data.name
+            data.name,
+            next_short_id
         )
         .fetch_optional(pool)
         .await?;
@@ -640,9 +656,9 @@ pub async fn get_invoice_with_destination(
             inv.created_at,
             inv.updated_at,
             COUNT(p.id) AS purchase_count,
-            COALESCE(SUM(p.quantity * COALESCE(p.selling_price, p.purchase_cost)), 0) AS purchases_total,
+            COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, p.purchase_cost)), 0) AS purchases_total,
             COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS total_cost,
-            COALESCE(SUM(p.quantity * (COALESCE(p.selling_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
+            COALESCE(SUM(p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
             COUNT(p.id) FILTER (WHERE p.receipt_id IS NOT NULL) AS receipted_count
         FROM invoices inv
         JOIN destinations d ON d.id = inv.destination_id
@@ -677,9 +693,9 @@ pub async fn get_invoices_with_destination(
             inv.created_at,
             inv.updated_at,
             COUNT(p.id) AS purchase_count,
-            COALESCE(SUM(p.quantity * COALESCE(p.selling_price, p.purchase_cost)), 0) AS purchases_total,
+            COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, p.purchase_cost)), 0) AS purchases_total,
             COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS total_cost,
-            COALESCE(SUM(p.quantity * (COALESCE(p.selling_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
+            COALESCE(SUM(p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
             COUNT(p.id) FILTER (WHERE p.receipt_id IS NOT NULL) AS receipted_count
         FROM invoices inv
         JOIN destinations d ON d.id = inv.destination_id
@@ -708,7 +724,7 @@ pub async fn get_purchases_by_invoice(
             pe.quantity as "quantity!",
             pe.purchase_cost as "purchase_cost!",
             pe.total_cost,
-            pe.selling_price,
+            pe.invoice_unit_price,
             pe.total_selling,
             pe.unit_commission,
             pe.total_commission,
@@ -740,7 +756,7 @@ pub async fn get_all_purchases(
 ) -> Result<Vec<Purchase>, sqlx::Error> {
     sqlx::query_as!(
         Purchase,
-        r#"SELECT p.id, p.item_id, p.invoice_id, p.receipt_id, p.quantity, p.purchase_cost, p.selling_price,
+        r#"SELECT p.id, p.item_id, p.invoice_id, p.receipt_id, p.quantity, p.purchase_cost, p.invoice_unit_price,
                   p.destination_id, p.status as "status: DeliveryStatus", 
                   p.delivery_date, p.notes, p.created_at, p.updated_at
            FROM purchases p
@@ -768,7 +784,7 @@ pub async fn get_all_purchases(
 pub async fn get_purchase_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Purchase>, sqlx::Error> {
     sqlx::query_as!(
         Purchase,
-        r#"SELECT id, item_id, invoice_id, receipt_id, quantity, purchase_cost, selling_price,
+        r#"SELECT id, item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price,
                   destination_id, status as "status: DeliveryStatus", 
                   delivery_date, notes, created_at, updated_at
            FROM purchases WHERE id = $1"#,
@@ -784,12 +800,17 @@ pub async fn create_purchase(
     user_id: Uuid,
 ) -> Result<Purchase, sqlx::Error> {
     let status = data.status.unwrap_or(DeliveryStatus::Pending);
+    let invoice_unit_price = if data.invoice_id.is_some() {
+        data.invoice_unit_price
+    } else {
+        None
+    };
     
     let purchase = sqlx::query_as!(
         Purchase,
-        r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, selling_price, destination_id, status, delivery_date, notes) 
+          r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price, destination_id, status, delivery_date, notes) 
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) 
-           RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, selling_price,
+              RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price,
                      destination_id, status as "status: DeliveryStatus", 
                      delivery_date, notes, created_at, updated_at"#,
         data.item_id,
@@ -797,7 +818,7 @@ pub async fn create_purchase(
         data.receipt_id,
         data.quantity,
         data.purchase_cost,
-        data.selling_price,
+        invoice_unit_price,
         data.destination_id,
         status as DeliveryStatus,
         data.delivery_date,
@@ -823,7 +844,11 @@ pub async fn update_purchase(
         // Resolve nullable fields: explicit clear wins, then new value, then keep existing
         let invoice_id = if data.clear_invoice { None } else { data.invoice_id.or(old_purchase.invoice_id) };
         let receipt_id = if data.clear_receipt { None } else { data.receipt_id.or(old_purchase.receipt_id) };
-        let selling_price = if data.clear_selling_price { None } else { data.selling_price.or(old_purchase.selling_price) };
+        let invoice_unit_price = if invoice_id.is_some() {
+            if data.clear_invoice_unit_price { None } else { data.invoice_unit_price.or(old_purchase.invoice_unit_price) }
+        } else {
+            None
+        };
         let item_id = data.item_id.unwrap_or(old_purchase.item_id);
         let quantity = data.quantity.unwrap_or(old_purchase.quantity);
         let purchase_cost = data.purchase_cost.unwrap_or(old_purchase.purchase_cost);
@@ -840,13 +865,13 @@ pub async fn update_purchase(
                 receipt_id = $4,
                 quantity = $5,
                 purchase_cost = $6,
-                selling_price = $7,
+                invoice_unit_price = $7,
                 destination_id = $8,
                 status = $9,
                 delivery_date = $10,
                 notes = $11
                WHERE id = $1 
-               RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, selling_price,
+               RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price,
                          destination_id, status as "status: DeliveryStatus", 
                          delivery_date, notes, created_at, updated_at"#,
             id,
@@ -855,7 +880,7 @@ pub async fn update_purchase(
             receipt_id,
             quantity,
             purchase_cost,
-            selling_price,
+            invoice_unit_price,
             destination_id,
             status as DeliveryStatus,
             delivery_date,
@@ -886,7 +911,7 @@ pub async fn update_purchase_status(
             Purchase,
             r#"UPDATE purchases SET status = $2
                WHERE id = $1 
-               RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, selling_price,
+               RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price,
                          destination_id, status as "status: DeliveryStatus", 
                          delivery_date, notes, created_at, updated_at"#,
             id,
@@ -937,7 +962,7 @@ pub async fn get_purchase_economics(
             pe.quantity as "quantity!",
             pe.purchase_cost as "purchase_cost!",
             pe.total_cost,
-            pe.selling_price,
+            pe.invoice_unit_price,
             pe.total_selling,
             pe.unit_commission,
             pe.total_commission,
@@ -1075,8 +1100,31 @@ pub async fn create_receipt(
     data: CreateReceipt,
     user_id: Uuid,
 ) -> Result<Receipt, sqlx::Error> {
-    let tax_rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00
-    let total = data.subtotal * (Decimal::ONE + tax_rate / Decimal::new(100, 0));
+    let (tax_rate, total) = if let Some(tax_amount) = data.tax_amount {
+        let rate = if data.subtotal == Decimal::ZERO {
+            Decimal::ZERO
+        } else {
+            (tax_amount * Decimal::new(100, 0)) / data.subtotal
+        };
+        (rate, data.subtotal + tax_amount)
+    } else {
+        let rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00 fallback
+        let computed_total = data.subtotal * (Decimal::ONE + rate / Decimal::new(100, 0));
+        (rate, computed_total)
+    };
+    let provided_number = data
+        .receipt_number
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
+    let receipt_number = if let Some(number) = provided_number {
+        number
+    } else {
+        generate_unique_receipt_number(pool, data.vendor_id).await?
+    };
+
     let receipt = sqlx::query_as!(
         Receipt,
         r#"INSERT INTO receipts (vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, notes) 
@@ -1084,7 +1132,7 @@ pub async fn create_receipt(
            RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, 
                      notes, created_at, updated_at"#,
         data.vendor_id,
-        data.receipt_number,
+        receipt_number,
         data.receipt_date,
         data.subtotal,
         tax_rate,
@@ -1098,6 +1146,64 @@ pub async fn create_receipt(
     Ok(receipt)
 }
 
+async fn generate_unique_receipt_number(pool: &PgPool, vendor_id: Uuid) -> Result<String, sqlx::Error> {
+    let vendor = get_vendor_by_id(pool, vendor_id).await?;
+    let vendor_prefix = vendor
+        .as_ref()
+        .and_then(|v| v.short_id.clone().or_else(|| derive_vendor_short_id(&v.name)))
+        .unwrap_or_else(|| "VND".to_string());
+
+    loop {
+        let candidate = format!("{}-{}", vendor_prefix, Uuid::new_v4().simple());
+        let exists = sqlx::query_scalar!(
+            r#"SELECT EXISTS(SELECT 1 FROM receipts WHERE receipt_number = $1)"#,
+            candidate
+        )
+        .fetch_one(pool)
+        .await?
+        .unwrap_or(false);
+
+        if !exists {
+            return Ok(candidate);
+        }
+    }
+}
+
+fn normalize_vendor_short_id(value: &str) -> Option<String> {
+    let normalized: String = value
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect::<String>()
+        .to_uppercase();
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn derive_vendor_short_id(name: &str) -> Option<String> {
+    let mut built = String::new();
+    for part in name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|p| !p.is_empty())
+    {
+        let chunk: String = part.chars().take(3).collect();
+        built.push_str(&chunk.to_uppercase());
+        if built.len() >= 12 {
+            break;
+        }
+    }
+
+    if built.is_empty() {
+        Some("VND".to_string())
+    } else {
+        Some(built.chars().take(12).collect())
+    }
+}
+
 pub async fn update_receipt(
     pool: &PgPool,
     id: Uuid,
@@ -1107,24 +1213,45 @@ pub async fn update_receipt(
     let old = get_receipt_by_id(pool, id).await?;
 
     if let Some(ref old_receipt) = old {
+        let vendor_id = data.vendor_id.unwrap_or(old_receipt.vendor_id);
+        let receipt_number = data.receipt_number.clone().unwrap_or_else(|| old_receipt.receipt_number.clone());
+        let receipt_date = data.receipt_date.unwrap_or(old_receipt.receipt_date);
+        let subtotal = data.subtotal.unwrap_or(old_receipt.subtotal);
+        let notes = data.notes.clone().or(old_receipt.notes.clone());
+
+        let (tax_rate, total) = if let Some(tax_amount) = data.tax_amount {
+            let rate = if subtotal == Decimal::ZERO {
+                Decimal::ZERO
+            } else {
+                (tax_amount * Decimal::new(100, 0)) / subtotal
+            };
+            (rate, subtotal + tax_amount)
+        } else {
+            let rate = data.tax_rate.unwrap_or(old_receipt.tax_rate);
+            (rate, subtotal * (Decimal::ONE + rate / Decimal::new(100, 0)))
+        };
+
         let receipt = sqlx::query_as!(
             Receipt,
             r#"UPDATE receipts SET 
-                receipt_number = COALESCE($2, receipt_number),
-                receipt_date = COALESCE($3, receipt_date),
-                subtotal = COALESCE($4, subtotal),
-                tax_rate = COALESCE($5, tax_rate),
-                total = COALESCE($4, subtotal) * (1 + COALESCE($5, tax_rate) / 100),
-                notes = COALESCE($6, notes)
+                vendor_id = $2,
+                receipt_number = $3,
+                receipt_date = $4,
+                subtotal = $5,
+                tax_rate = $6,
+                total = $7,
+                notes = $8
                WHERE id = $1 
                RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
                          notes, created_at, updated_at"#,
             id,
-            data.receipt_number,
-            data.receipt_date,
-            data.subtotal,
-            data.tax_rate,
-            data.notes
+            vendor_id,
+            receipt_number,
+            receipt_date,
+            subtotal,
+            tax_rate,
+            total,
+            notes
         )
         .fetch_optional(pool)
         .await?;
@@ -1216,8 +1343,8 @@ pub async fn get_receipt_with_vendor(
             r.updated_at,
             COUNT(p.id) AS purchase_count,
             COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS purchases_total,
-            COALESCE(SUM(p.quantity * COALESCE(p.selling_price, 0)), 0) AS total_selling,
-            COALESCE(SUM(p.quantity * (COALESCE(p.selling_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
+            COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, 0)), 0) AS total_selling,
+            COALESCE(SUM(p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
             COUNT(p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count
         FROM receipts r
         JOIN vendors v ON v.id = r.vendor_id
@@ -1251,8 +1378,8 @@ pub async fn get_receipts_with_vendor(
             r.updated_at,
             COUNT(p.id) AS purchase_count,
             COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS purchases_total,
-            COALESCE(SUM(p.quantity * COALESCE(p.selling_price, 0)), 0) AS total_selling,
-            COALESCE(SUM(p.quantity * (COALESCE(p.selling_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
+            COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, 0)), 0) AS total_selling,
+            COALESCE(SUM(p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
             COUNT(p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count
         FROM receipts r
         JOIN vendors v ON v.id = r.vendor_id
@@ -1281,7 +1408,7 @@ pub async fn get_purchases_by_receipt(
             pe.quantity as "quantity!",
             pe.purchase_cost as "purchase_cost!",
             pe.total_cost,
-            pe.selling_price,
+            pe.invoice_unit_price,
             pe.total_selling,
             pe.unit_commission,
             pe.total_commission,
@@ -1319,7 +1446,7 @@ pub async fn get_purchases_by_item(
             pe.quantity as "quantity!",
             pe.purchase_cost as "purchase_cost!",
             pe.total_cost,
-            pe.selling_price,
+            pe.invoice_unit_price,
             pe.total_selling,
             pe.unit_commission,
             pe.total_commission,

@@ -97,7 +97,7 @@ export function ItemFormDialog({
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="item-name">Name</Label>
+            <Label htmlFor="item-name">Name *</Label>
             <Input
               id="item-name"
               value={name}
@@ -107,7 +107,7 @@ export function ItemFormDialog({
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="item-destination">Default Destination (optional)</Label>
+            <Label htmlFor="item-destination">Default Destination</Label>
             <Select value={defaultDestinationId || "__none__"} onValueChange={(v) => setDefaultDestinationId(v === "__none__" ? "" : v)}>
               <SelectTrigger>
                 <SelectValue placeholder="Select destination" />
@@ -123,7 +123,7 @@ export function ItemFormDialog({
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="item-notes">Notes (optional)</Label>
+            <Label htmlFor="item-notes">Notes</Label>
             <Input
               id="item-notes"
               value={notes}

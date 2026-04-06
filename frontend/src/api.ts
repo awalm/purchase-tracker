@@ -53,17 +53,17 @@ export const auth = {
 
 // Vendors
 export const vendors = {
-  list: () => request<{ id: string; name: string }[]>('/vendors'),
-  get: (id: string) => request<{ id: string; name: string }>(`/vendors/${id}`),
-  create: (name: string) =>
-    request<{ id: string; name: string }>('/vendors', {
+  list: () => request<{ id: string; name: string; short_id: string | null }[]>('/vendors'),
+  get: (id: string) => request<{ id: string; name: string; short_id: string | null }>(`/vendors/${id}`),
+  create: (data: { name: string; short_id?: string }) =>
+    request<{ id: string; name: string; short_id: string | null }>('/vendors', {
       method: 'POST',
-      body: JSON.stringify({ name }),
+      body: JSON.stringify(data),
     }),
-  update: (id: string, name: string) =>
-    request<{ id: string; name: string }>(`/vendors/${id}`, {
+  update: (id: string, data: { name?: string; short_id?: string }) =>
+    request<{ id: string; name: string; short_id: string | null }>(`/vendors/${id}`, {
       method: 'PUT',
-      body: JSON.stringify({ name }),
+      body: JSON.stringify(data),
     }),
   delete: (id: string) =>
     request<void>(`/vendors/${id}`, { method: 'DELETE' }),
@@ -134,7 +134,7 @@ export const items = {
       quantity: number;
       purchase_cost: string;
       total_cost: string | null;
-      selling_price: string | null;
+      invoice_unit_price: string | null;
       total_selling: string | null;
       unit_commission: string | null;
       total_commission: string | null;
@@ -207,7 +207,7 @@ export const invoices = {
       quantity: number;
       purchase_cost: string;
       total_cost: string | null;
-      selling_price: string | null;
+      invoice_unit_price: string | null;
       total_selling: string | null;
       unit_commission: string | null;
       total_commission: string | null;
@@ -313,7 +313,7 @@ export const receipts = {
       quantity: number;
       purchase_cost: string;
       total_cost: string | null;
-      selling_price: string | null;
+      invoice_unit_price: string | null;
       total_selling: string | null;
       unit_commission: string | null;
       total_commission: string | null;
@@ -329,10 +329,10 @@ export const receipts = {
     }[]>(`/receipts/${id}/purchases`),
   create: (data: {
     vendor_id: string;
-    receipt_number: string;
+    receipt_number?: string;
     receipt_date: string;
     subtotal: string;
-    tax_rate?: string;
+    tax_amount?: string;
     notes?: string;
   }) =>
     request<{ id: string }>('/receipts', {
@@ -382,7 +382,7 @@ export const purchases = {
       quantity: number;
       purchase_cost: string;
       total_cost: string | null;
-      selling_price: string | null;
+      invoice_unit_price: string | null;
       total_selling: string | null;
       unit_commission: string | null;
       total_commission: string | null;
@@ -401,7 +401,7 @@ export const purchases = {
     item_id: string;
     quantity: number;
     purchase_cost: string;
-    selling_price?: string;
+    invoice_unit_price?: string;
     destination_id?: string;
     invoice_id?: string;
     receipt_id?: string;
@@ -556,7 +556,7 @@ export const importApi = {
 export interface ParsedInvoiceLineItem {
   description: string;
   qty: number;
-  selling_price: string;
+  invoice_unit_price: string;
   subtotal: string;
 }
 

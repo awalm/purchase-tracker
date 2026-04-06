@@ -54,9 +54,6 @@ struct CsvPurchaseRow {
     #[serde(alias = "item", alias = "item_id", alias = "Item", alias = "Item Name", alias = "item_name")]
     item: String,
     
-    #[serde(alias = "vendor", alias = "Vendor", alias = "vendor_name", alias = "vendor_id", default)]
-    _vendor: Option<String>,
-    
     #[serde(alias = "destination", alias = "dest", alias = "Destination", alias = "dest_code", alias = "Dest", alias = "Default Destination", alias = "Default Dest")]
     destination: Option<String>,
     
@@ -75,8 +72,8 @@ struct CsvPurchaseRow {
     #[serde(alias = "receipt", alias = "Receipt", alias = "receipt_number", default)]
     receipt: Option<String>,
     
-    #[serde(alias = "selling_price", alias = "Selling Price", alias = "sell_price", alias = "price", default)]
-    selling_price: Option<String>,
+    #[serde(alias = "invoice_unit_price", alias = "Invoice Unit Price", alias = "unit_price", alias = "price", default)]
+    invoice_unit_price: Option<String>,
     
     #[serde(alias = "Status", alias = "status", alias = "delivery_status", default)]
     status: Option<String>,
@@ -163,7 +160,7 @@ async fn import_vendors(
                     continue;
                 }
 
-                let create_data = CreateVendor { name: row.name.clone() };
+                let create_data = CreateVendor { name: row.name.clone(), short_id: None };
                 match queries::create_vendor(&state.pool, create_data, user.user_id).await {
                     Ok(_) => {
                         success_count += 1;
@@ -607,15 +604,15 @@ async fn import_purchases(
                     _ => None,
                 };
 
-                // Parse selling price (optional)
-                let selling_price = match &row.selling_price {
+                // Parse invoice unit price (optional)
+                let invoice_unit_price = match &row.invoice_unit_price {
                     Some(sp) if !sp.is_empty() => {
                         match Decimal::from_str(&sp.replace(['$', ','], "")) {
                             Ok(d) => Some(d),
                             Err(_) => {
                                 errors.push(ImportError {
                                     row: row_num,
-                                    message: format!("Invalid selling price: {}", sp),
+                                    message: format!("Invalid invoice unit price: {}", sp),
                                     original_data: original_line,
                                 });
                                 continue;
@@ -738,7 +735,7 @@ async fn import_purchases(
                     invoice_id,
                     quantity: row.quantity,
                     purchase_cost,
-                    selling_price,
+                    invoice_unit_price,
                     destination_id,
                     status,
                     delivery_date,
@@ -1033,14 +1030,13 @@ mod tests {
         fn duplicate_key_format() {
             let row = CsvPurchaseRow {
                 item: "Echo Dot".to_string(),
-                _vendor: None,
                 destination: Some("BSC".to_string()),
                 quantity: 5,
                 purchase_cost: "$39.99".to_string(),
                 date: None,
                 invoice: None,
                 receipt: None,
-                selling_price: None,
+                invoice_unit_price: None,
                 status: None,
                 delivery_date: None,
                 notes: None,
@@ -1137,7 +1133,7 @@ mod tests {
 pub struct ParsedInvoiceLineItem {
     pub description: String,
     pub qty: i32,
-    pub selling_price: String,
+    pub invoice_unit_price: String,
     pub subtotal: String,
 }
 
@@ -1234,7 +1230,7 @@ async fn parse_invoice_pdf(
                     Some(ParsedInvoiceLineItem {
                         description: item.get("description")?.as_str()?.to_string(),
                         qty: item.get("qty")?.as_i64()? as i32,
-                        selling_price: item.get("unit_price")?.as_str()?.to_string(),
+                        invoice_unit_price: item.get("unit_price")?.as_str()?.to_string(),
                         subtotal: item.get("subtotal")?.as_str()?.to_string(),
                     })
                 })

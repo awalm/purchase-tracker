@@ -14,7 +14,7 @@ export function useVendors() {
 export function useCreateVendor() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (name: string) => vendors.create(name),
+    mutationFn: (data: { name: string; short_id?: string }) => vendors.create(data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["vendors"] }),
   })
 }
@@ -22,7 +22,7 @@ export function useCreateVendor() {
 export function useUpdateVendor() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, name }: { id: string; name: string }) => vendors.update(id, name),
+    mutationFn: ({ id, ...data }: { id: string; name?: string; short_id?: string }) => vendors.update(id, data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["vendors"] }),
   })
 }
@@ -214,10 +214,10 @@ export function useCreateReceipt() {
   return useMutation({
     mutationFn: (data: {
       vendor_id: string
-      receipt_number: string
+      receipt_number?: string
       receipt_date: string
       subtotal: string
-      tax_rate?: string
+      tax_amount?: string
       notes?: string
     }) => receipts.create(data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["receipts"] }),
@@ -258,7 +258,7 @@ export function useCreatePurchase() {
       item_id: string
       quantity: number
       purchase_cost: string
-      selling_price?: string
+      invoice_unit_price?: string
       destination_id?: string
       invoice_id?: string
       receipt_id?: string

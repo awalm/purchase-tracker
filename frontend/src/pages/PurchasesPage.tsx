@@ -102,7 +102,6 @@ export default function PurchasesPage() {
   const [itemId, setItemId] = useState("")
   const [quantity, setQuantity] = useState("1")
   const [purchaseCost, setPurchaseCost] = useState("")
-  const [sellingPrice, setSellingPrice] = useState("")
   const [destinationId, setDestinationId] = useState("")
   const [invoiceId, setInvoiceId] = useState("")
   const [receiptId, setReceiptId] = useState("")
@@ -116,7 +115,6 @@ export default function PurchasesPage() {
         item_id: itemId,
         quantity: parseInt(quantity),
         purchase_cost: purchaseCost,
-        selling_price: sellingPrice || undefined,
         destination_id: destinationId || undefined,
         invoice_id: invoiceId || undefined,
         clear_invoice: !invoiceId,
@@ -129,7 +127,6 @@ export default function PurchasesPage() {
         item_id: itemId,
         quantity: parseInt(quantity),
         purchase_cost: purchaseCost,
-        selling_price: sellingPrice || undefined,
         destination_id: destinationId || undefined,
         invoice_id: invoiceId || undefined,
         receipt_id: receiptId || undefined,
@@ -147,7 +144,6 @@ export default function PurchasesPage() {
     setItemId("")
     setQuantity("1")
     setPurchaseCost("")
-    setSellingPrice("")
     setDestinationId("")
     setInvoiceId("")
     setReceiptId("")
@@ -160,7 +156,6 @@ export default function PurchasesPage() {
     setItemId(matchedItem?.id || "")
     setQuantity(String(p.quantity))
     setPurchaseCost(p.purchase_cost)
-    setSellingPrice(p.selling_price || "")
     const matchedDest = destinations.find((d) => d.code === p.destination_code)
     setDestinationId(matchedDest?.id || "")
     setInvoiceId(p.invoice_id || "")
@@ -207,7 +202,7 @@ export default function PurchasesPage() {
               { header: "Quantity", accessor: (p) => p.quantity },
               { header: "Purchase Cost", accessor: (p) => p.purchase_cost },
               { header: "Total Cost", accessor: (p) => p.total_cost },
-              { header: "Selling Price", accessor: (p) => p.selling_price },
+              { header: "Invoice Unit Price", accessor: (p) => p.invoice_unit_price },
               { header: "Total Price", accessor: (p) => p.total_selling },
               { header: "Commission", accessor: (p) => p.total_commission },
               { header: "Receipt", accessor: (p) => p.receipt_number },
@@ -228,12 +223,12 @@ export default function PurchasesPage() {
               { name: "date", required: false, description: "Purchase date (YYYY-MM-DD)" },
               { name: "invoice", required: false, description: "Invoice number (must exist)" },
               { name: "receipt", required: false, description: "Receipt number (must exist)" },
-              { name: "selling_price", required: false, description: "Selling price per unit" },
+              { name: "invoice_unit_price", required: false, description: "Invoice unit price" },
               { name: "status", required: false, description: "pending/in_transit/delivered/damaged/returned/lost" },
               { name: "delivery_date", required: false, description: "Delivery date (YYYY-MM-DD)" },
               { name: "notes", required: false, description: "Optional notes" },
             ]}
-            exampleCsv="item,quantity,purchase_cost,destination,date,invoice,receipt,selling_price,status\nWidget A,10,9.99,CBG,2024-01-15,INV-001,REC-001,12.99,delivered"
+            exampleCsv="item,quantity,purchase_cost,destination,date,invoice,receipt,invoice_unit_price,status\nWidget A,10,9.99,CBG,2024-01-15,INV-001,REC-001,12.99,delivered"
             onPreview={importApi.purchasesPreview}
             onImport={async (csv) => {
               setIsImporting(true)
@@ -263,7 +258,7 @@ export default function PurchasesPage() {
             </DialogHeader>
             <form onSubmit={handleSubmit} className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="item">Item</Label>
+                <Label htmlFor="item">Item *</Label>
                 <Select value={itemId} onValueChange={handleItemChange} required>
                   <SelectTrigger>
                     <SelectValue placeholder="Select item" />
@@ -279,7 +274,7 @@ export default function PurchasesPage() {
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label htmlFor="quantity">Quantity</Label>
+                  <Label htmlFor="quantity">Quantity *</Label>
                   <Input
                     id="quantity"
                     type="number"
@@ -289,7 +284,7 @@ export default function PurchasesPage() {
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="purchaseCost">Purchase Cost</Label>
+                  <Label htmlFor="purchaseCost">Purchase Cost *</Label>
                   <Input
                     id="purchaseCost"
                     type="number"
@@ -300,17 +295,6 @@ export default function PurchasesPage() {
                     required
                   />
                 </div>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="sellingPrice">Selling Price (optional)</Label>
-                <Input
-                  id="sellingPrice"
-                  type="number"
-                  step="0.01"
-                  value={sellingPrice}
-                  onChange={(e) => setSellingPrice(e.target.value)}
-                  placeholder="0.00"
-                />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="destination">Destination</Label>
@@ -328,7 +312,7 @@ export default function PurchasesPage() {
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="invoice">Invoice (optional)</Label>
+                <Label htmlFor="invoice">Invoice</Label>
                 <Select value={invoiceId || "__none__"} onValueChange={(v) => setInvoiceId(v === "__none__" ? "" : v)}>
                   <SelectTrigger>
                     <SelectValue placeholder="Select invoice" />
@@ -346,7 +330,7 @@ export default function PurchasesPage() {
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="receipt">Receipt (optional)</Label>
+                <Label htmlFor="receipt">Receipt</Label>
                 <Select value={receiptId || "__none__"} onValueChange={(v) => setReceiptId(v === "__none__" ? "" : v)}>
                   <SelectTrigger>
                     <SelectValue placeholder="Select receipt" />
@@ -364,7 +348,7 @@ export default function PurchasesPage() {
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="notes">Notes (optional)</Label>
+                <Label htmlFor="notes">Notes</Label>
                 <Input
                   id="notes"
                   value={notes}

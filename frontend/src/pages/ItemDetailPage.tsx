@@ -71,7 +71,7 @@ export default function ItemDetailPage() {
   const [newRcptNumber, setNewRcptNumber] = useState("")
   const [newRcptDate, setNewRcptDate] = useState("")
   const [newRcptSubtotal, setNewRcptSubtotal] = useState("")
-  const [newRcptTaxRate, setNewRcptTaxRate] = useState("13.00")
+  const [newRcptTaxAmount, setNewRcptTaxAmount] = useState("")
   const [newRcptFile, setNewRcptFile] = useState<File | null>(null)
 
   // New invoice inline form
@@ -82,7 +82,7 @@ export default function ItemDetailPage() {
   const [newInvTaxRate, setNewInvTaxRate] = useState("13.00")
 
   const resetNewForms = () => {
-    setNewRcptVendorId(""); setNewRcptNumber(""); setNewRcptDate(""); setNewRcptSubtotal(""); setNewRcptTaxRate("13.00"); setNewRcptFile(null)
+    setNewRcptVendorId(""); setNewRcptNumber(""); setNewRcptDate(""); setNewRcptSubtotal(""); setNewRcptTaxAmount(""); setNewRcptFile(null)
     setNewInvDestId(""); setNewInvNumber(""); setNewInvDate(""); setNewInvSubtotal(""); setNewInvTaxRate("13.00")
     setLinkNotes("")
   }
@@ -122,10 +122,10 @@ export default function ItemDetailPage() {
     if (linkType === "receipt") {
       const r = await createReceipt.mutateAsync({
         vendor_id: newRcptVendorId,
-        receipt_number: newRcptNumber,
+        ...(newRcptNumber.trim() ? { receipt_number: newRcptNumber.trim() } : {}),
         receipt_date: newRcptDate,
         subtotal: newRcptSubtotal,
-        tax_rate: newRcptTaxRate,
+        tax_amount: newRcptTaxAmount,
       })
       newId = r.id
       await receiptsApi.uploadPdf(r.id, newRcptFile!)
@@ -183,7 +183,7 @@ export default function ItemDetailPage() {
             { header: "Qty", accessor: (p) => p.quantity },
             { header: "Purchase Cost", accessor: (p) => p.purchase_cost },
             { header: "Total Cost", accessor: (p) => p.total_cost || "" },
-            { header: "Selling Price", accessor: (p) => p.selling_price || "" },
+            { header: "Invoice Unit Price", accessor: (p) => p.invoice_unit_price || "" },
             { header: "Total Selling", accessor: (p) => p.total_selling || "" },
             { header: "Commission", accessor: (p) => p.total_commission || "" },
             { header: "Status", accessor: (p) => p.status },
@@ -317,7 +317,7 @@ export default function ItemDetailPage() {
                     <TableCell className="text-right">{p.quantity}</TableCell>
                     <TableCell className="text-right text-muted-foreground">{formatCurrency(p.purchase_cost)}</TableCell>
                     <TableCell className="text-right">{formatCurrency(p.total_cost)}</TableCell>
-                    <TableCell className="text-right">{p.selling_price ? formatCurrency(p.selling_price) : "-"}</TableCell>
+                    <TableCell className="text-right">{p.invoice_unit_price ? formatCurrency(p.invoice_unit_price) : "-"}</TableCell>
                     <TableCell className={`text-right ${p.total_commission ? (parseFloat(p.total_commission) >= 0 ? "text-green-600" : "text-red-600") : "text-muted-foreground"}`}>
                       {p.total_commission ? formatCurrency(p.total_commission) : "—"}
                     </TableCell>
@@ -364,7 +364,7 @@ export default function ItemDetailPage() {
             linkType === "receipt" ? (
               <form onSubmit={handleCreateAndLink} className="space-y-4">
                 <div className="space-y-2">
-                  <Label>Vendor</Label>
+                  <Label>Vendor *</Label>
                   <Select value={newRcptVendorId} onValueChange={setNewRcptVendorId} required>
                     <SelectTrigger><SelectValue placeholder="Select vendor" /></SelectTrigger>
                     <SelectContent>
@@ -374,24 +374,24 @@ export default function ItemDetailPage() {
                 </div>
                 <div className="space-y-2">
                   <Label>Receipt Number</Label>
-                  <Input value={newRcptNumber} onChange={(e) => setNewRcptNumber(e.target.value)} placeholder="REC-001" required />
+                  <Input value={newRcptNumber} onChange={(e) => setNewRcptNumber(e.target.value)} placeholder="Auto-generated if empty" />
                 </div>
                 <div className="space-y-2">
-                  <Label>Date</Label>
+                  <Label>Date *</Label>
                   <Input type="date" value={newRcptDate} onChange={(e) => setNewRcptDate(e.target.value)} required />
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <Label>Subtotal</Label>
+                    <Label>Subtotal *</Label>
                     <Input type="number" step="0.01" value={newRcptSubtotal} onChange={(e) => setNewRcptSubtotal(e.target.value)} placeholder="0.00" required />
                   </div>
                   <div className="space-y-2">
-                    <Label>Tax %</Label>
-                    <Input type="number" step="0.01" value={newRcptTaxRate} onChange={(e) => setNewRcptTaxRate(e.target.value)} />
+                    <Label>Tax Amount *</Label>
+                    <Input type="number" step="0.01" value={newRcptTaxAmount} onChange={(e) => setNewRcptTaxAmount(e.target.value)} placeholder="0.00" required />
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <Label>Receipt Document</Label>
+                  <Label>Receipt Document *</Label>
                   <Input
                     type="file"
                     accept=".pdf,.png,.jpg,.jpeg,.webp"
@@ -415,7 +415,7 @@ export default function ItemDetailPage() {
             ) : (
               <form onSubmit={handleCreateAndLink} className="space-y-4">
                 <div className="space-y-2">
-                  <Label>Destination</Label>
+                  <Label>Destination *</Label>
                   <Select value={newInvDestId} onValueChange={setNewInvDestId} required>
                     <SelectTrigger><SelectValue placeholder="Select destination" /></SelectTrigger>
                     <SelectContent>
@@ -424,16 +424,16 @@ export default function ItemDetailPage() {
                   </Select>
                 </div>
                 <div className="space-y-2">
-                  <Label>Invoice Number</Label>
+                  <Label>Invoice Number *</Label>
                   <Input value={newInvNumber} onChange={(e) => setNewInvNumber(e.target.value)} placeholder="INV-001" required />
                 </div>
                 <div className="space-y-2">
-                  <Label>Date</Label>
+                  <Label>Date *</Label>
                   <Input type="date" value={newInvDate} onChange={(e) => setNewInvDate(e.target.value)} required />
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <Label>Subtotal</Label>
+                    <Label>Subtotal *</Label>
                     <Input type="number" step="0.01" value={newInvSubtotal} onChange={(e) => setNewInvSubtotal(e.target.value)} placeholder="0.00" required />
                   </div>
                   <div className="space-y-2">

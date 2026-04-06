@@ -59,22 +59,37 @@ export default function VendorsPage() {
   const [isOpen, setIsOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [name, setName] = useState("")
+  const [shortId, setShortId] = useState("")
+
+  const suggestShortId = (vendorName: string) => {
+    const chunks = vendorName
+      .split(/[^A-Za-z0-9]+/)
+      .filter(Boolean)
+      .map((part) => part.slice(0, 3).toUpperCase())
+      .join("")
+    return (chunks || "VND").slice(0, 20)
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (editingId) {
-      await updateVendor.mutateAsync({ id: editingId, name })
+      await updateVendor.mutateAsync({ id: editingId, name, short_id: shortId || undefined })
     } else {
-      await createVendor.mutateAsync(name)
+      await createVendor.mutateAsync({
+        name,
+        short_id: shortId || suggestShortId(name),
+      })
     }
     setIsOpen(false)
     setEditingId(null)
     setName("")
+    setShortId("")
   }
 
-  const handleEdit = (vendor: { id: string; name: string }) => {
+  const handleEdit = (vendor: { id: string; name: string; short_id?: string | null }) => {
     setEditingId(vendor.id)
     setName(vendor.name)
+    setShortId(vendor.short_id || "")
     setIsOpen(true)
   }
 
@@ -95,6 +110,7 @@ export default function VendorsPage() {
             filename="vendors"
             columns={[
               { header: "Name", accessor: (v: { name: string }) => v.name },
+              { header: "Short ID", accessor: (v: { short_id?: string | null }) => v.short_id || "" },
             ]}
             data={vendors}
           />
@@ -102,8 +118,9 @@ export default function VendorsPage() {
             entityName="Vendors"
             columns={[
               { name: "name", required: true, description: "Vendor name" },
+              { name: "short_id", required: false, description: "Optional short id prefix for receipt numbers" },
             ]}
-            exampleCsv="name\nBest Buy\nAmazon\nCostco"
+            exampleCsv="name,short_id\nBest Buy,BBY\nAmazon,AMZ\nCostco,CST"
             onPreview={importApi.vendorsPreview}
             onImport={async (csv) => {
               setIsImporting(true)
@@ -122,6 +139,7 @@ export default function VendorsPage() {
             if (!open) {
               setEditingId(null)
               setName("")
+              setShortId("")
             }
           }}>
             <DialogTrigger asChild>
@@ -136,7 +154,7 @@ export default function VendorsPage() {
             </DialogHeader>
             <form onSubmit={handleSubmit} className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="name">Name</Label>
+                <Label htmlFor="name">Name *</Label>
                 <Input
                   id="name"
                   value={name}
@@ -144,6 +162,18 @@ export default function VendorsPage() {
                   placeholder="e.g., Best Buy"
                   required
                 />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="shortId">Short ID</Label>
+                <Input
+                  id="shortId"
+                  value={shortId}
+                  onChange={(e) => setShortId(e.target.value.toUpperCase())}
+                  placeholder={suggestShortId(name || "Vendor")}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Used for auto receipt numbers: SHORTID-uuid
+                </p>
               </div>
               <div className="flex justify-end gap-2">
                 <Button type="button" variant="outline" onClick={() => setIsOpen(false)}>
@@ -168,6 +198,7 @@ export default function VendorsPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Name</TableHead>
+                <TableHead>Short ID</TableHead>
                 <TableHead className="w-24">Actions</TableHead>
               </TableRow>
             </TableHeader>
@@ -175,6 +206,7 @@ export default function VendorsPage() {
               {vendors.map((vendor) => (
                 <TableRow key={vendor.id}>
                   <TableCell>{vendor.name}</TableCell>
+                  <TableCell className="font-mono">{vendor.short_id || "—"}</TableCell>
                   <TableCell>
                     <RowActions
                       onEdit={() => handleEdit(vendor)}
@@ -183,7 +215,7 @@ export default function VendorsPage() {
                   </TableCell>
                 </TableRow>
               ))}
-              {vendors.length === 0 && <EmptyTableRow colSpan={2} message="No vendors yet" />}
+              {vendors.length === 0 && <EmptyTableRow colSpan={3} message="No vendors yet" />}
             </TableBody>
           </Table>
         </CardContent>

@@ -2,12 +2,6 @@
 -- Migration 001: Initial Schema (with Receipts — Phase 1 rearchitecture)
 
 -- ============================================
--- EXTENSIONS
--- ============================================
-
-CREATE EXTENSION IF NOT EXISTS btree_gist;
-
--- ============================================
 -- TABLES
 -- ============================================
 
@@ -15,6 +9,7 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE TABLE vendors (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(100) NOT NULL UNIQUE,
+    short_id VARCHAR(20),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -29,23 +24,14 @@ CREATE TABLE destinations (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Items (Product catalog — keyed by name + vendor + date range)
+-- Items (Product catalog — pure entries: name + default destination + notes)
 CREATE TABLE items (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(255) NOT NULL,
-    vendor_id UUID NOT NULL REFERENCES vendors(id),
-    purchase_cost DECIMAL(10, 4) NOT NULL,
-    start_date DATE NOT NULL,
-    end_date DATE,  -- NULL means currently active
+    name VARCHAR(255) NOT NULL UNIQUE,
     default_destination_id UUID REFERENCES destinations(id),
     notes TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    EXCLUDE USING gist (
-        name WITH =,
-        vendor_id WITH =,
-        daterange(start_date, COALESCE(end_date, '9999-12-31'::date), '[]') WITH &&
-    )
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Delivery Status Enum
@@ -62,7 +48,7 @@ CREATE TYPE delivery_status AS ENUM (
 CREATE TABLE receipts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     vendor_id UUID NOT NULL REFERENCES vendors(id),
-    receipt_number VARCHAR(100) NOT NULL,
+    receipt_number VARCHAR(100) NOT NULL UNIQUE,
     receipt_date DATE NOT NULL,
     subtotal DECIMAL(12, 4) NOT NULL,
     tax_rate DECIMAL(5, 2) NOT NULL DEFAULT 13.00,
@@ -99,7 +85,7 @@ CREATE TABLE purchases (
     invoice_id UUID REFERENCES invoices(id),
     quantity INTEGER NOT NULL CHECK (quantity != 0),
     purchase_cost DECIMAL(10, 4) NOT NULL,
-    selling_price DECIMAL(10, 4),
+    invoice_unit_price DECIMAL(10, 4),
     destination_id UUID REFERENCES destinations(id),
     status delivery_status NOT NULL DEFAULT 'pending',
     delivery_date DATE,
@@ -151,24 +137,22 @@ CREATE TABLE audit_log_2026_12 PARTITION OF audit_log FOR VALUES FROM ('2026-12-
 -- VIEWS
 -- ============================================
 
--- Active items (currently valid pricing)
+-- Active items (simple: items + default destination)
 CREATE VIEW v_active_items AS
 SELECT 
     i.id,
     i.name,
-    i.vendor_id,
-    v.name AS vendor_name,
-    i.purchase_cost,
     i.default_destination_id,
     d.code AS default_destination_code,
-    i.notes
+    i.notes,
+    i.created_at
 FROM items i
-JOIN vendors v ON v.id = i.vendor_id
-LEFT JOIN destinations d ON d.id = i.default_destination_id
-WHERE i.start_date <= CURRENT_DATE
-  AND (i.end_date IS NULL OR i.end_date >= CURRENT_DATE);
+LEFT JOIN destinations d ON d.id = i.default_destination_id;
 
 -- Purchase economics (cost + commission + tax + receipt/invoice linkage)
+-- Vendor comes from receipt (LEFT JOIN), not items.
+-- When purchase_cost = 0, treat as unknown: use invoice_unit_price as effective cost
+-- so commission shows as 0 (break-even) rather than inflated profit.
 CREATE VIEW v_purchase_economics AS
 SELECT 
     p.id AS purchase_id,
@@ -179,14 +163,25 @@ SELECT
     d.code AS destination_code,
     p.quantity,
     p.purchase_cost,
-    p.quantity * p.purchase_cost AS total_cost,
-    p.selling_price,
-    p.quantity * p.selling_price AS total_selling,
-    p.selling_price - p.purchase_cost AS unit_commission,
-    p.quantity * (p.selling_price - p.purchase_cost) AS total_commission,
-    p.quantity * p.purchase_cost * 0.13 AS tax_paid,
-    CASE WHEN p.selling_price IS NOT NULL
-      THEN p.quantity * (p.selling_price - p.purchase_cost) * 0.13
+        CASE WHEN p.purchase_cost = 0 AND p.invoice_unit_price IS NOT NULL
+            THEN p.quantity * p.invoice_unit_price
+      ELSE p.quantity * p.purchase_cost
+    END AS total_cost,
+        p.invoice_unit_price,
+        p.quantity * p.invoice_unit_price AS total_selling,
+    CASE WHEN p.purchase_cost = 0 THEN 0
+            ELSE p.invoice_unit_price - p.purchase_cost
+    END AS unit_commission,
+    CASE WHEN p.purchase_cost = 0 THEN 0
+            ELSE p.quantity * (p.invoice_unit_price - p.purchase_cost)
+    END AS total_commission,
+        CASE WHEN p.purchase_cost = 0 AND p.invoice_unit_price IS NOT NULL
+            THEN p.quantity * p.invoice_unit_price * 0.13
+      ELSE p.quantity * p.purchase_cost * 0.13
+    END AS tax_paid,
+    CASE WHEN p.purchase_cost = 0 THEN 0
+            WHEN p.invoice_unit_price IS NOT NULL
+                THEN p.quantity * (p.invoice_unit_price - p.purchase_cost) * 0.13
       ELSE 0
     END AS tax_owed,
     p.status,
@@ -194,12 +189,13 @@ SELECT
     p.invoice_id,
     p.receipt_id,
     r.receipt_number,
-    inv.invoice_number
+    inv.invoice_number,
+    p.notes
 FROM purchases p
 JOIN items i ON i.id = p.item_id
-JOIN vendors v ON v.id = i.vendor_id
-LEFT JOIN destinations d ON d.id = p.destination_id
 LEFT JOIN receipts r ON r.id = p.receipt_id
+LEFT JOIN vendors v ON v.id = r.vendor_id
+LEFT JOIN destinations d ON d.id = p.destination_id
 LEFT JOIN invoices inv ON inv.id = p.invoice_id;
 
 -- Invoice reconciliation
@@ -211,18 +207,18 @@ SELECT
     d.name AS destination_name,
     inv.invoice_date,
     inv.subtotal AS invoice_total,
-    COALESCE(SUM(p.quantity * COALESCE(p.selling_price, p.purchase_cost)), 0) AS purchases_total,
-    inv.subtotal - COALESCE(SUM(p.quantity * COALESCE(p.selling_price, p.purchase_cost)), 0) AS difference,
-    ABS(inv.subtotal - COALESCE(SUM(p.quantity * COALESCE(p.selling_price, p.purchase_cost)), 0)) < 0.01 AS is_matched,
+    COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, p.purchase_cost)), 0) AS purchases_total,
+    inv.subtotal - COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, p.purchase_cost)), 0) AS difference,
+    ABS(inv.subtotal - COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, p.purchase_cost)), 0)) < 0.01 AS is_matched,
     COUNT(p.id) AS purchase_count,
     COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS total_cost,
-    COALESCE(SUM(p.quantity * (COALESCE(p.selling_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission
+    COALESCE(SUM(p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission
 FROM invoices inv
 JOIN destinations d ON d.id = inv.destination_id
 LEFT JOIN purchases p ON p.invoice_id = inv.id
 GROUP BY inv.id, inv.invoice_number, d.code, d.name, inv.invoice_date, inv.subtotal;
 
--- Destination summary
+-- Destination summary (with zero-cost guard logic)
 CREATE VIEW v_destination_summary AS
 SELECT 
     d.id AS destination_id,
@@ -231,14 +227,34 @@ SELECT
     (SELECT COUNT(*) FROM invoices WHERE destination_id = d.id) AS total_invoices,
     (SELECT COUNT(*) FROM purchases WHERE destination_id = d.id) AS total_purchases,
     (SELECT COALESCE(SUM(quantity), 0) FROM purchases WHERE destination_id = d.id) AS total_quantity,
-    (SELECT COALESCE(SUM(quantity * purchase_cost), 0) FROM purchases WHERE destination_id = d.id) AS total_cost,
-    (SELECT COALESCE(SUM(quantity * COALESCE(selling_price, purchase_cost)), 0) FROM purchases WHERE destination_id = d.id) AS total_revenue,
-    (SELECT COALESCE(SUM(quantity * (COALESCE(selling_price, purchase_cost) - purchase_cost)), 0) FROM purchases WHERE destination_id = d.id) AS total_commission,
-    (SELECT COALESCE(SUM(quantity * purchase_cost * 0.13), 0) FROM purchases WHERE destination_id = d.id) AS total_tax_paid,
-    (SELECT COALESCE(SUM(CASE WHEN selling_price IS NOT NULL THEN quantity * (selling_price - purchase_cost) * 0.13 ELSE 0 END), 0) FROM purchases WHERE destination_id = d.id) AS total_tax_owed
+    (SELECT COALESCE(SUM(
+                CASE WHEN purchase_cost = 0 AND invoice_unit_price IS NOT NULL
+                    THEN quantity * invoice_unit_price
+          ELSE quantity * purchase_cost
+        END
+    ), 0) FROM purchases WHERE destination_id = d.id) AS total_cost,
+        (SELECT COALESCE(SUM(quantity * COALESCE(invoice_unit_price, purchase_cost)), 0) FROM purchases WHERE destination_id = d.id) AS total_revenue,
+    (SELECT COALESCE(SUM(
+        CASE WHEN purchase_cost = 0 THEN 0
+                    ELSE quantity * (COALESCE(invoice_unit_price, purchase_cost) - purchase_cost)
+        END
+    ), 0) FROM purchases WHERE destination_id = d.id) AS total_commission,
+    (SELECT COALESCE(SUM(
+                CASE WHEN purchase_cost = 0 AND invoice_unit_price IS NOT NULL
+                    THEN quantity * invoice_unit_price * 0.13
+          ELSE quantity * purchase_cost * 0.13
+        END
+    ), 0) FROM purchases WHERE destination_id = d.id) AS total_tax_paid,
+    (SELECT COALESCE(SUM(
+        CASE WHEN purchase_cost = 0 THEN 0
+                    WHEN invoice_unit_price IS NOT NULL
+                        THEN quantity * (invoice_unit_price - purchase_cost) * 0.13
+          ELSE 0
+        END
+    ), 0) FROM purchases WHERE destination_id = d.id) AS total_tax_owed
 FROM destinations d;
 
--- Vendor summary (with receipt count)
+-- Vendor summary (receipts-based — a vendor's purchases come through their receipts)
 CREATE VIEW v_vendor_summary AS
 SELECT 
     v.id AS vendor_id,
@@ -248,17 +264,34 @@ SELECT
     COALESCE(SUM(p.quantity), 0) AS total_quantity,
     COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS total_spent
 FROM vendors v
-LEFT JOIN items i ON i.vendor_id = v.id
-LEFT JOIN purchases p ON p.item_id = i.id
 LEFT JOIN receipts r ON r.vendor_id = v.id
+LEFT JOIN purchases p ON p.receipt_id = r.id
 GROUP BY v.id, v.name;
+
+-- Receipt reconciliation
+CREATE VIEW v_receipt_reconciliation AS
+SELECT
+    r.id AS receipt_id,
+    r.receipt_number,
+    v.name AS vendor_name,
+    r.receipt_date,
+    r.subtotal AS receipt_subtotal,
+    COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS purchases_total,
+    r.subtotal - COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS difference,
+    ABS(r.subtotal - COALESCE(SUM(p.quantity * p.purchase_cost), 0)) < 0.01 AS is_matched,
+    COUNT(p.id) AS purchase_count,
+    COUNT(p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count,
+    COUNT(p.id) = COUNT(p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AND COUNT(p.id) > 0 AS all_invoiced,
+    COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, 0)), 0) AS total_selling,
+    COALESCE(SUM(p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission
+FROM receipts r
+JOIN vendors v ON v.id = r.vendor_id
+LEFT JOIN purchases p ON p.receipt_id = r.id
+GROUP BY r.id, r.receipt_number, v.name, r.receipt_date, r.subtotal;
 
 -- ============================================
 -- Indexes
 -- ============================================
-
-CREATE INDEX idx_items_vendor ON items(vendor_id);
-CREATE INDEX idx_items_end_date ON items(end_date);
 
 CREATE INDEX idx_purchases_item ON purchases(item_id);
 CREATE INDEX idx_purchases_receipt ON purchases(receipt_id);
@@ -307,18 +340,6 @@ CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
 -- ============================================
 -- Helper Functions
 -- ============================================
-
-CREATE OR REPLACE FUNCTION is_item_valid(
-    p_item_id UUID,
-    p_date DATE DEFAULT CURRENT_DATE
-) RETURNS BOOLEAN AS $$
-    SELECT EXISTS (
-        SELECT 1 FROM items
-        WHERE id = p_item_id
-          AND start_date <= p_date
-          AND (end_date IS NULL OR end_date >= p_date)
-    );
-$$ LANGUAGE SQL;
 
 CREATE OR REPLACE FUNCTION create_audit_partition(p_year INT, p_month INT)
 RETURNS VOID AS $$

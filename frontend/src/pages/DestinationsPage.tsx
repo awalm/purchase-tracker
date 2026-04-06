@@ -159,7 +159,7 @@ export default function DestinationsPage() {
             </DialogHeader>
             <form onSubmit={handleSubmit} className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="code">Code</Label>
+                <Label htmlFor="code">Code *</Label>
                 <Input
                   id="code"
                   value={code}
@@ -169,7 +169,7 @@ export default function DestinationsPage() {
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="name">Name</Label>
+                <Label htmlFor="name">Name *</Label>
                 <Input
                   id="name"
                   value={name}
