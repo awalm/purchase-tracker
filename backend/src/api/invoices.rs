@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Multipart, Path, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::Response,
     routing::get,
     Json, Router,
@@ -19,9 +19,17 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_invoices).post(create_invoice))
         .route("/reconciliation", get(list_reconciliations))
-        .route("/{id}", get(get_invoice_detail).put(update_invoice).delete(delete_invoice))
+        .route(
+            "/{id}",
+            get(get_invoice_detail)
+                .put(update_invoice)
+                .delete(delete_invoice),
+        )
         .route("/{id}/purchases", get(get_invoice_purchases))
-        .route("/{id}/document", get(download_document).post(upload_document))
+        .route(
+            "/{id}/document",
+            get(download_document).post(upload_document),
+        )
 }
 
 async fn list_invoices(
@@ -101,7 +109,7 @@ async fn delete_invoice(
     let deleted = queries::delete_invoice(&state.pool, id, user.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
+
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -128,10 +136,7 @@ async fn upload_document(
     {
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
-            let filename = field
-                .file_name()
-                .unwrap_or("invoice.pdf")
-                .to_string();
+            let filename = field.file_name().unwrap_or("invoice.pdf").to_string();
             let data = field
                 .bytes()
                 .await
@@ -156,7 +161,10 @@ async fn download_document(
     let (pdf_data, filename) = queries::get_invoice_pdf(&state.pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "No document attached to this invoice".to_string()))?;
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "No document attached to this invoice".to_string(),
+        ))?;
 
     let response = Response::builder()
         .status(StatusCode::OK)

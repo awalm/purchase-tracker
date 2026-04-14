@@ -17,7 +17,12 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_destinations).post(create_destination))
         .route("/active", get(list_active_destinations))
-        .route("/{id}", get(get_destination).put(update_destination).delete(delete_destination))
+        .route(
+            "/{id}",
+            get(get_destination)
+                .put(update_destination)
+                .delete(delete_destination),
+        )
 }
 
 async fn list_destinations(
@@ -81,7 +86,7 @@ async fn delete_destination(
     let deleted = queries::delete_destination(&state.pool, id, user.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
+
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {

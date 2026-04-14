@@ -87,6 +87,33 @@ pub struct Receipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ReceiptLineItem {
+    pub id: Uuid,
+    pub receipt_id: Uuid,
+    pub item_id: Uuid,
+    pub quantity: i32,
+    pub unit_cost: Decimal,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ReceiptLineItemWithItem {
+    pub id: Uuid,
+    pub receipt_id: Uuid,
+    pub item_id: Uuid,
+    pub item_name: String,
+    pub quantity: i32,
+    pub unit_cost: Decimal,
+    pub notes: Option<String>,
+    pub allocated_qty: i32,
+    pub remaining_qty: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Purchase {
     pub id: Uuid,
     pub item_id: Uuid,
@@ -99,6 +126,35 @@ pub struct Purchase {
     pub status: DeliveryStatus,
     pub delivery_date: Option<NaiveDate>,
     pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct PurchaseAllocation {
+    pub id: Uuid,
+    pub purchase_id: Uuid,
+    pub receipt_id: Uuid,
+    pub receipt_line_item_id: Option<Uuid>,
+    pub allocated_qty: i32,
+    pub unit_cost: Decimal,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct PurchaseAllocationWithReceipt {
+    pub id: Uuid,
+    pub purchase_id: Uuid,
+    pub receipt_id: Uuid,
+    pub receipt_line_item_id: Option<Uuid>,
+    pub item_id: Option<Uuid>,
+    pub item_name: Option<String>,
+    pub allocated_qty: i32,
+    pub unit_cost: Decimal,
+    pub receipt_number: String,
+    pub vendor_name: String,
+    pub receipt_date: NaiveDate,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -303,7 +359,7 @@ pub struct CreateInvoice {
     pub order_number: Option<String>,
     pub invoice_date: NaiveDate,
     pub subtotal: Decimal,
-    pub tax_rate: Option<Decimal>,  // defaults to 13.00 if not provided
+    pub tax_rate: Option<Decimal>, // defaults to 13.00 if not provided
     pub notes: Option<String>,
 }
 
@@ -318,13 +374,56 @@ pub struct UpdateInvoice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateInvoiceFromPdfLineItem {
+    pub line_index: usize,
+    pub description: String,
+    pub qty: i32,
+    pub invoice_unit_price: String,
+    pub subtotal: String,
+    pub item_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateInvoiceFromPdfRequest {
+    pub destination_id: Uuid,
+    pub invoice_number: String,
+    pub invoice_date: String,
+    pub subtotal: String,
+    pub tax_rate: Option<String>,
+    pub notes: Option<String>,
+    pub line_items: Vec<CreateInvoiceFromPdfLineItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvoiceImportValidationError {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvoiceImportLineFailure {
+    pub line_index: usize,
+    pub code: String,
+    pub message: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateInvoiceFromPdfResponse {
+    pub invoice_id: Uuid,
+    pub purchase_count: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateReceipt {
     pub vendor_id: Uuid,
     pub receipt_number: Option<String>,
     pub receipt_date: NaiveDate,
     pub subtotal: Decimal,
     pub tax_amount: Option<Decimal>,
-    pub tax_rate: Option<Decimal>,  // backwards-compatible fallback if tax_amount is not provided
+    pub tax_rate: Option<Decimal>, // backwards-compatible fallback if tax_amount is not provided
     pub notes: Option<String>,
 }
 
@@ -336,6 +435,22 @@ pub struct UpdateReceipt {
     pub subtotal: Option<Decimal>,
     pub tax_amount: Option<Decimal>,
     pub tax_rate: Option<Decimal>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateReceiptLineItem {
+    pub item_id: Uuid,
+    pub quantity: i32,
+    pub unit_cost: Decimal,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateReceiptLineItem {
+    pub item_id: Option<Uuid>,
+    pub quantity: Option<i32>,
+    pub unit_cost: Option<Decimal>,
     pub notes: Option<String>,
 }
 
@@ -358,15 +473,15 @@ pub struct UpdatePurchase {
     pub item_id: Option<Uuid>,
     pub invoice_id: Option<Uuid>,
     #[serde(default)]
-    pub clear_invoice: bool,     // true → set invoice_id to NULL
+    pub clear_invoice: bool, // true → set invoice_id to NULL
     pub receipt_id: Option<Uuid>,
     #[serde(default)]
-    pub clear_receipt: bool,     // true → set receipt_id to NULL
+    pub clear_receipt: bool, // true → set receipt_id to NULL
     pub quantity: Option<i32>,
     pub purchase_cost: Option<Decimal>,
     pub invoice_unit_price: Option<Decimal>, // Invoice-side unit price (invoice context)
     #[serde(default)]
-    pub clear_invoice_unit_price: bool,  // true → set invoice_unit_price to NULL
+    pub clear_invoice_unit_price: bool, // true → set invoice_unit_price to NULL
     pub destination_id: Option<Uuid>,
     pub status: Option<DeliveryStatus>,
     pub delivery_date: Option<NaiveDate>,
@@ -376,6 +491,18 @@ pub struct UpdatePurchase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusUpdate {
     pub status: DeliveryStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatePurchaseAllocation {
+    pub receipt_line_item_id: Uuid,
+    pub allocated_qty: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePurchaseAllocation {
+    pub receipt_line_item_id: Option<Uuid>,
+    pub allocated_qty: Option<i32>,
 }
 
 // ============================================
@@ -417,19 +544,46 @@ mod tests {
 
         #[test]
         fn serializes_to_snake_case() {
-            assert_eq!(serde_json::to_string(&DeliveryStatus::Pending).unwrap(), "\"pending\"");
-            assert_eq!(serde_json::to_string(&DeliveryStatus::InTransit).unwrap(), "\"in_transit\"");
-            assert_eq!(serde_json::to_string(&DeliveryStatus::Delivered).unwrap(), "\"delivered\"");
-            assert_eq!(serde_json::to_string(&DeliveryStatus::Damaged).unwrap(), "\"damaged\"");
-            assert_eq!(serde_json::to_string(&DeliveryStatus::Returned).unwrap(), "\"returned\"");
-            assert_eq!(serde_json::to_string(&DeliveryStatus::Lost).unwrap(), "\"lost\"");
+            assert_eq!(
+                serde_json::to_string(&DeliveryStatus::Pending).unwrap(),
+                "\"pending\""
+            );
+            assert_eq!(
+                serde_json::to_string(&DeliveryStatus::InTransit).unwrap(),
+                "\"in_transit\""
+            );
+            assert_eq!(
+                serde_json::to_string(&DeliveryStatus::Delivered).unwrap(),
+                "\"delivered\""
+            );
+            assert_eq!(
+                serde_json::to_string(&DeliveryStatus::Damaged).unwrap(),
+                "\"damaged\""
+            );
+            assert_eq!(
+                serde_json::to_string(&DeliveryStatus::Returned).unwrap(),
+                "\"returned\""
+            );
+            assert_eq!(
+                serde_json::to_string(&DeliveryStatus::Lost).unwrap(),
+                "\"lost\""
+            );
         }
 
         #[test]
         fn deserializes_from_snake_case() {
-            assert_eq!(serde_json::from_str::<DeliveryStatus>("\"pending\"").unwrap(), DeliveryStatus::Pending);
-            assert_eq!(serde_json::from_str::<DeliveryStatus>("\"in_transit\"").unwrap(), DeliveryStatus::InTransit);
-            assert_eq!(serde_json::from_str::<DeliveryStatus>("\"delivered\"").unwrap(), DeliveryStatus::Delivered);
+            assert_eq!(
+                serde_json::from_str::<DeliveryStatus>("\"pending\"").unwrap(),
+                DeliveryStatus::Pending
+            );
+            assert_eq!(
+                serde_json::from_str::<DeliveryStatus>("\"in_transit\"").unwrap(),
+                DeliveryStatus::InTransit
+            );
+            assert_eq!(
+                serde_json::from_str::<DeliveryStatus>("\"delivered\"").unwrap(),
+                DeliveryStatus::Delivered
+            );
         }
 
         #[test]
@@ -466,7 +620,10 @@ mod tests {
                 "subtotal": "1500.00"
             }"#;
             let invoice: CreateInvoice = serde_json::from_str(json).unwrap();
-            assert_eq!(invoice.destination_id, Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap());
+            assert_eq!(
+                invoice.destination_id,
+                Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
+            );
             assert_eq!(invoice.invoice_number, "INV-001");
         }
 
@@ -828,7 +985,10 @@ mod tests {
             ];
 
             let net_quantity: i32 = purchases.iter().map(|p| p.quantity).sum();
-            let net_cost: Decimal = purchases.iter().map(|p| Decimal::from(p.quantity) * p.purchase_cost).sum();
+            let net_cost: Decimal = purchases
+                .iter()
+                .map(|p| Decimal::from(p.quantity) * p.purchase_cost)
+                .sum();
 
             assert_eq!(net_quantity, 3, "4 purchased - 1 refunded = 3 net");
             assert_eq!(net_cost, dec!(30.00), "4×$10 + (-1)×$10 = $30");
@@ -875,9 +1035,16 @@ mod tests {
             // Cross-invoice net totals
             let net_invoice_total = rec_inv1.invoice_total + rec_inv2.invoice_total;
             let net_purchases_total = rec_inv1.purchases_total + rec_inv2.purchases_total;
-            assert_eq!(net_invoice_total, dec!(30.00), "$40 sale + (-$10) refund = $30 net");
+            assert_eq!(
+                net_invoice_total,
+                dec!(30.00),
+                "$40 sale + (-$10) refund = $30 net"
+            );
             assert_eq!(net_purchases_total, dec!(30.00));
-            assert_eq!(net_invoice_total, net_purchases_total, "Net totals reconcile");
+            assert_eq!(
+                net_invoice_total, net_purchases_total,
+                "Net totals reconcile"
+            );
         }
 
         #[test]
@@ -986,19 +1153,35 @@ mod tests {
                 destination_name: "Bulk Supply Co".to_string(),
                 total_invoices: Some(2),
                 total_purchases: Some(2),
-                total_quantity: Some(3), // 4 + (-1) = 3
-                total_cost: Some(dec!(24.00)), // 4×8 + (-1)×8 = 24
-                total_revenue: Some(dec!(36.00)), // 4×12 + (-1)×12 = 36
+                total_quantity: Some(3),             // 4 + (-1) = 3
+                total_cost: Some(dec!(24.00)),       // 4×8 + (-1)×8 = 24
+                total_revenue: Some(dec!(36.00)),    // 4×12 + (-1)×12 = 36
                 total_commission: Some(dec!(12.00)), // 36 - 24 = 12
                 total_tax_paid: Some(dec!(3.12)),
                 total_tax_owed: Some(dec!(1.56)),
             };
 
-            assert_eq!(summary.total_invoices, Some(2), "Two invoices: sale + refund");
+            assert_eq!(
+                summary.total_invoices,
+                Some(2),
+                "Two invoices: sale + refund"
+            );
             assert_eq!(summary.total_quantity, Some(3), "Net quantity after refund");
-            assert_eq!(summary.total_cost, Some(dec!(24.00)), "Net cost after refund");
-            assert_eq!(summary.total_revenue, Some(dec!(36.00)), "Net revenue after refund");
-            assert_eq!(summary.total_commission, Some(dec!(12.00)), "Net profit after refund");
+            assert_eq!(
+                summary.total_cost,
+                Some(dec!(24.00)),
+                "Net cost after refund"
+            );
+            assert_eq!(
+                summary.total_revenue,
+                Some(dec!(36.00)),
+                "Net revenue after refund"
+            );
+            assert_eq!(
+                summary.total_commission,
+                Some(dec!(12.00)),
+                "Net profit after refund"
+            );
         }
     }
 
@@ -1098,8 +1281,14 @@ mod tests {
                 updated_at: Utc::now(),
             };
             let json = serde_json::to_string(&item).unwrap();
-            assert!(!json.contains("vendor_id"), "Item must not have vendor_id field");
-            assert!(!json.contains("vendor_name"), "Item must not have vendor_name field");
+            assert!(
+                !json.contains("vendor_id"),
+                "Item must not have vendor_id field"
+            );
+            assert!(
+                !json.contains("vendor_name"),
+                "Item must not have vendor_name field"
+            );
         }
 
         #[test]
@@ -1113,8 +1302,14 @@ mod tests {
                 created_at: Utc::now(),
             };
             let json = serde_json::to_string(&item).unwrap();
-            assert!(!json.contains("vendor_id"), "ActiveItem must not have vendor_id");
-            assert!(!json.contains("vendor_name"), "ActiveItem must not have vendor_name");
+            assert!(
+                !json.contains("vendor_id"),
+                "ActiveItem must not have vendor_id"
+            );
+            assert!(
+                !json.contains("vendor_name"),
+                "ActiveItem must not have vendor_name"
+            );
         }
 
         #[test]
@@ -1127,7 +1322,10 @@ mod tests {
             let item: CreateItem = serde_json::from_value(json).unwrap();
             assert_eq!(item.name, "Test Item");
             let serialized = serde_json::to_string(&item).unwrap();
-            assert!(!serialized.contains("vendor"), "CreateItem must not have any vendor field");
+            assert!(
+                !serialized.contains("vendor"),
+                "CreateItem must not have any vendor field"
+            );
         }
 
         #[test]
@@ -1255,38 +1453,58 @@ mod tests {
         fn zero_cost_shows_zero_commission() {
             let econ = make_zero_cost_economics(3, dec!(25.00));
             assert_eq!(econ.purchase_cost, dec!(0));
-            assert_eq!(econ.unit_commission, Some(dec!(0)),
-                "Commission must be 0 when purchase cost unknown");
-            assert_eq!(econ.total_commission, Some(dec!(0)),
-                "Total commission must be 0 when purchase cost unknown");
+            assert_eq!(
+                econ.unit_commission,
+                Some(dec!(0)),
+                "Commission must be 0 when purchase cost unknown"
+            );
+            assert_eq!(
+                econ.total_commission,
+                Some(dec!(0)),
+                "Total commission must be 0 when purchase cost unknown"
+            );
         }
 
         #[test]
         fn zero_cost_total_cost_uses_invoice_unit_price() {
             let econ = make_zero_cost_economics(4, dec!(30.00));
             // total_cost should be qty * invoice_unit_price = 4 * 30 = 120
-            assert_eq!(econ.total_cost, Some(dec!(120.00)),
-                "total_cost should use invoice_unit_price as effective cost");
-            assert_eq!(econ.total_selling, Some(dec!(120.00)),
-                "total_selling = qty * invoice_unit_price");
+            assert_eq!(
+                econ.total_cost,
+                Some(dec!(120.00)),
+                "total_cost should use invoice_unit_price as effective cost"
+            );
+            assert_eq!(
+                econ.total_selling,
+                Some(dec!(120.00)),
+                "total_selling = qty * invoice_unit_price"
+            );
             // total_cost == total_selling (break-even)
-            assert_eq!(econ.total_cost, econ.total_selling,
-                "When cost unknown, total_cost = total_selling (break-even)");
+            assert_eq!(
+                econ.total_cost, econ.total_selling,
+                "When cost unknown, total_cost = total_selling (break-even)"
+            );
         }
 
         #[test]
         fn zero_cost_tax_paid_uses_invoice_unit_price() {
             let econ = make_zero_cost_economics(2, dec!(50.00));
             // tax_paid = qty * invoice_unit_price * 0.13 = 2 * 50 * 0.13 = 13
-            assert_eq!(econ.tax_paid, Some(dec!(13.00)),
-                "tax_paid should use invoice_unit_price when cost is 0");
+            assert_eq!(
+                econ.tax_paid,
+                Some(dec!(13.00)),
+                "tax_paid should use invoice_unit_price when cost is 0"
+            );
         }
 
         #[test]
         fn zero_cost_tax_owed_is_zero() {
             let econ = make_zero_cost_economics(2, dec!(50.00));
-            assert_eq!(econ.tax_owed, Some(dec!(0)),
-                "tax_owed should be 0 when cost unknown (no proven profit)");
+            assert_eq!(
+                econ.tax_owed,
+                Some(dec!(0)),
+                "tax_owed should be 0 when cost unknown (no proven profit)"
+            );
         }
 
         #[test]
@@ -1314,8 +1532,11 @@ mod tests {
         #[test]
         fn zero_cost_single_unit() {
             let econ = make_zero_cost_economics(1, dec!(99.99));
-            assert_eq!(econ.total_cost, Some(dec!(99.99)),
-                "Single unit: total_cost = invoice_unit_price");
+            assert_eq!(
+                econ.total_cost,
+                Some(dec!(99.99)),
+                "Single unit: total_cost = invoice_unit_price"
+            );
             assert_eq!(econ.total_selling, Some(dec!(99.99)));
             assert_eq!(econ.total_commission, Some(dec!(0)));
         }
@@ -1326,8 +1547,10 @@ mod tests {
             econ.vendor_name = None;
             let json = serde_json::to_string(&econ).unwrap();
             let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-            assert!(parsed["vendor_name"].is_null(),
-                "vendor_name should serialize as null when no receipt linked");
+            assert!(
+                parsed["vendor_name"].is_null(),
+                "vendor_name should serialize as null when no receipt linked"
+            );
         }
     }
 }

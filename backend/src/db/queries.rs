@@ -6,6 +6,63 @@ use uuid::Uuid;
 use super::models::*;
 use crate::services::audit::AuditService;
 
+#[derive(Debug, Clone)]
+pub struct AtomicInvoicePdfLine {
+    pub line_index: usize,
+    pub item_id: Uuid,
+    pub qty: i32,
+    pub invoice_unit_price: Decimal,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AtomicInvoicePdfCreateInput {
+    pub destination_id: Uuid,
+    pub invoice_number: String,
+    pub invoice_date: NaiveDate,
+    pub subtotal: Decimal,
+    pub tax_rate: Option<Decimal>,
+    pub notes: Option<String>,
+    pub pdf_data: Vec<u8>,
+    pub pdf_filename: String,
+    pub lines: Vec<AtomicInvoicePdfLine>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AtomicInvoicePdfCreateResult {
+    pub invoice: Invoice,
+    pub purchase_count: usize,
+}
+
+#[derive(Debug)]
+pub enum AtomicInvoicePdfCreateError {
+    Sql(sqlx::Error),
+    PurchaseInsert {
+        line_index: usize,
+        description: String,
+        source: sqlx::Error,
+    },
+}
+
+impl From<sqlx::Error> for AtomicInvoicePdfCreateError {
+    fn from(value: sqlx::Error) -> Self {
+        Self::Sql(value)
+    }
+}
+
+#[derive(Debug)]
+pub enum PurchaseAllocationError {
+    Sql(sqlx::Error),
+    NotFound(String),
+    Validation(String),
+}
+
+impl From<sqlx::Error> for PurchaseAllocationError {
+    fn from(value: sqlx::Error) -> Self {
+        Self::Sql(value)
+    }
+}
+
 // ============================================
 // Vendors
 // ============================================
@@ -49,7 +106,16 @@ pub async fn create_vendor(
     .fetch_one(pool)
     .await?;
 
-    AuditService::log(pool, "vendors", vendor.id, "create", None::<&Vendor>, Some(&vendor), user_id).await?;
+    AuditService::log(
+        pool,
+        "vendors",
+        vendor.id,
+        "create",
+        None::<&Vendor>,
+        Some(&vendor),
+        user_id,
+    )
+    .await?;
     Ok(vendor)
 }
 
@@ -82,8 +148,16 @@ pub async fn update_vendor(
         .await?;
 
         if let Some(ref v) = vendor {
-            AuditService::log(pool, "vendors", id, "update", Some(old_vendor), Some(v), user_id)
-                .await?;
+            AuditService::log(
+                pool,
+                "vendors",
+                id,
+                "update",
+                Some(old_vendor),
+                Some(v),
+                user_id,
+            )
+            .await?;
         }
         return Ok(vendor);
     }
@@ -107,8 +181,16 @@ pub async fn delete_vendor(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<boo
 
     if result.rows_affected() > 0 {
         if let Some(ref v) = old {
-            AuditService::log(pool, "vendors", id, "delete", Some(v), None::<&Vendor>, user_id)
-                .await?;
+            AuditService::log(
+                pool,
+                "vendors",
+                id,
+                "delete",
+                Some(v),
+                None::<&Vendor>,
+                user_id,
+            )
+            .await?;
         }
         return Ok(true);
     }
@@ -225,8 +307,16 @@ pub async fn update_destination(
         .await?;
 
         if let Some(ref d) = destination {
-            AuditService::log(pool, "destinations", id, "update", Some(old_dest), Some(d), user_id)
-                .await?;
+            AuditService::log(
+                pool,
+                "destinations",
+                id,
+                "update",
+                Some(old_dest),
+                Some(d),
+                user_id,
+            )
+            .await?;
         }
         return Ok(destination);
     }
@@ -241,13 +331,19 @@ pub async fn delete_destination(
     let old = get_destination_by_id(pool, id).await?;
 
     // Unlink items that use this as default destination
-    sqlx::query!(r#"UPDATE items SET default_destination_id = NULL WHERE default_destination_id = $1"#, id)
-        .execute(pool)
-        .await?;
+    sqlx::query!(
+        r#"UPDATE items SET default_destination_id = NULL WHERE default_destination_id = $1"#,
+        id
+    )
+    .execute(pool)
+    .await?;
     // Unlink purchases from this destination
-    sqlx::query!(r#"UPDATE purchases SET destination_id = NULL WHERE destination_id = $1"#, id)
-        .execute(pool)
-        .await?;
+    sqlx::query!(
+        r#"UPDATE purchases SET destination_id = NULL WHERE destination_id = $1"#,
+        id
+    )
+    .execute(pool)
+    .await?;
     // Unlink purchases from invoices for this destination, then delete the invoices
     sqlx::query!(r#"UPDATE purchases SET invoice_id = NULL WHERE invoice_id IN (SELECT id FROM invoices WHERE destination_id = $1)"#, id)
         .execute(pool)
@@ -278,7 +374,9 @@ pub async fn delete_destination(
     Ok(false)
 }
 
-pub async fn get_destination_summary(pool: &PgPool) -> Result<Vec<DestinationSummary>, sqlx::Error> {
+pub async fn get_destination_summary(
+    pool: &PgPool,
+) -> Result<Vec<DestinationSummary>, sqlx::Error> {
     sqlx::query_as!(
         DestinationSummary,
         r#"SELECT 
@@ -364,7 +462,16 @@ pub async fn create_item(
     .fetch_one(pool)
     .await?;
 
-    AuditService::log(pool, "items", item.id, "create", None::<&Item>, Some(&item), user_id).await?;
+    AuditService::log(
+        pool,
+        "items",
+        item.id,
+        "create",
+        None::<&Item>,
+        Some(&item),
+        user_id,
+    )
+    .await?;
     Ok(item)
 }
 
@@ -395,8 +502,16 @@ pub async fn update_item(
         .await?;
 
         if let Some(ref i) = item {
-            AuditService::log(pool, "items", id, "update", Some(old_item), Some(i), user_id)
-                .await?;
+            AuditService::log(
+                pool,
+                "items",
+                id,
+                "update",
+                Some(old_item),
+                Some(i),
+                user_id,
+            )
+            .await?;
         }
         return Ok(item);
     }
@@ -439,10 +554,7 @@ pub async fn get_all_invoices(pool: &PgPool) -> Result<Vec<Invoice>, sqlx::Error
     .await
 }
 
-pub async fn get_invoice_by_id(
-    pool: &PgPool,
-    id: Uuid,
-) -> Result<Option<Invoice>, sqlx::Error> {
+pub async fn get_invoice_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Invoice>, sqlx::Error> {
     sqlx::query_as!(
         Invoice,
         r#"SELECT id, destination_id, invoice_number, order_number, invoice_date, 
@@ -490,6 +602,94 @@ pub async fn create_invoice(
     )
     .await?;
     Ok(invoice)
+}
+
+pub async fn create_invoice_from_pdf_atomic(
+    pool: &PgPool,
+    data: AtomicInvoicePdfCreateInput,
+    user_id: Uuid,
+) -> Result<AtomicInvoicePdfCreateResult, AtomicInvoicePdfCreateError> {
+    let mut tx = pool.begin().await?;
+
+    let tax_rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00
+    let total = data.subtotal * (Decimal::ONE + tax_rate / Decimal::new(100, 0));
+
+    let invoice = sqlx::query_as!(
+        Invoice,
+        r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, subtotal, tax_rate, total, notes, original_pdf, original_filename)
+           VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9)
+           RETURNING id, destination_id, invoice_number, order_number, invoice_date,
+                     subtotal, tax_rate, total, notes, created_at, updated_at"#,
+        data.destination_id,
+        data.invoice_number,
+        data.invoice_date,
+        data.subtotal,
+        tax_rate,
+        total,
+        data.notes,
+        data.pdf_data,
+        data.pdf_filename,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    AuditService::log_with_executor(
+        &mut *tx,
+        "invoices",
+        invoice.id,
+        "create",
+        None::<&Invoice>,
+        Some(&invoice),
+        user_id,
+    )
+    .await?;
+
+    let mut purchase_count = 0usize;
+    for line in data.lines {
+        let purchase = sqlx::query_as!(
+            Purchase,
+                r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price, destination_id, status, delivery_date, notes, created_at, updated_at)
+                    VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, NULL, NULL, $8::date::timestamptz, $8::date::timestamptz)
+               RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price,
+                         destination_id, status as "status: DeliveryStatus",
+                         delivery_date, notes, created_at, updated_at"#,
+            line.item_id,
+            invoice.id,
+            line.qty,
+            Decimal::ZERO,
+            Some(line.invoice_unit_price),
+            Some(data.destination_id),
+            DeliveryStatus::Delivered as DeliveryStatus,
+            data.invoice_date,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|source| AtomicInvoicePdfCreateError::PurchaseInsert {
+            line_index: line.line_index,
+            description: line.description.clone(),
+            source,
+        })?;
+
+        AuditService::log_with_executor(
+            &mut *tx,
+            "purchases",
+            purchase.id,
+            "create",
+            None::<&Purchase>,
+            Some(&purchase),
+            user_id,
+        )
+        .await?;
+
+        purchase_count += 1;
+    }
+
+    tx.commit().await?;
+
+    Ok(AtomicInvoicePdfCreateResult {
+        invoice,
+        purchase_count,
+    })
 }
 
 pub async fn update_invoice(
@@ -546,9 +746,12 @@ pub async fn delete_invoice(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bo
     let old = get_invoice_by_id(pool, id).await?;
 
     // Unlink purchases that reference this invoice (SET NULL, not delete)
-    sqlx::query!(r#"UPDATE purchases SET invoice_id = NULL WHERE invoice_id = $1"#, id)
-        .execute(pool)
-        .await?;
+    sqlx::query!(
+        r#"UPDATE purchases SET invoice_id = NULL WHERE invoice_id = $1"#,
+        id
+    )
+    .execute(pool)
+    .await?;
 
     let result = sqlx::query!(r#"DELETE FROM invoices WHERE id = $1"#, id)
         .execute(pool)
@@ -600,13 +803,13 @@ pub async fn get_invoice_pdf(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.and_then(|r| {
-        match (r.original_pdf, r.original_filename) {
+    Ok(
+        row.and_then(|r| match (r.original_pdf, r.original_filename) {
             (Some(pdf), Some(name)) => Some((pdf, name)),
             (Some(pdf), None) => Some((pdf, "invoice.pdf".to_string())),
             _ => None,
-        }
-    }))
+        }),
+    )
 }
 
 pub async fn get_invoice_reconciliation(
@@ -794,6 +997,475 @@ pub async fn get_purchase_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Purcha
     .await
 }
 
+pub async fn get_purchase_allocations(
+    pool: &PgPool,
+    purchase_id: Uuid,
+) -> Result<Vec<PurchaseAllocationWithReceipt>, sqlx::Error> {
+    sqlx::query_as!(
+        PurchaseAllocationWithReceipt,
+        r#"SELECT
+            pa.id,
+            pa.purchase_id,
+            pa.receipt_id,
+            pa.receipt_line_item_id,
+            rli.item_id,
+            i.name as item_name,
+            pa.allocated_qty,
+            pa.unit_cost,
+            r.receipt_number,
+            v.name as vendor_name,
+            r.receipt_date,
+            pa.created_at,
+            pa.updated_at
+        FROM purchase_allocations pa
+        JOIN receipts r ON r.id = pa.receipt_id
+        JOIN vendors v ON v.id = r.vendor_id
+        LEFT JOIN receipt_line_items rli ON rli.id = pa.receipt_line_item_id
+        LEFT JOIN items i ON i.id = rli.item_id
+        WHERE pa.purchase_id = $1
+        ORDER BY r.receipt_date DESC, pa.created_at DESC"#,
+        purchase_id
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn create_purchase_allocation(
+    pool: &PgPool,
+    purchase_id: Uuid,
+    data: CreatePurchaseAllocation,
+) -> Result<PurchaseAllocationWithReceipt, PurchaseAllocationError> {
+    if data.allocated_qty <= 0 {
+        return Err(PurchaseAllocationError::Validation(
+            "allocated_qty must be greater than zero".to_string(),
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+
+    let purchase = sqlx::query!(
+        r#"SELECT id, item_id, quantity FROM purchases WHERE id = $1"#,
+        purchase_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| PurchaseAllocationError::NotFound("Purchase not found".to_string()))?;
+
+    let receipt_line = sqlx::query!(
+        r#"SELECT id, receipt_id, item_id, quantity, unit_cost
+           FROM receipt_line_items
+           WHERE id = $1"#,
+        data.receipt_line_item_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| PurchaseAllocationError::NotFound("Receipt line item not found".to_string()))?;
+
+    if receipt_line.item_id != purchase.item_id {
+        return Err(PurchaseAllocationError::Validation(
+            "Receipt line item item must match invoice line item".to_string(),
+        ));
+    }
+
+    let allocated_for_purchase_sum = sqlx::query_scalar!(
+        r#"SELECT COALESCE(SUM(allocated_qty), 0)::INT FROM purchase_allocations WHERE purchase_id = $1"#,
+        purchase_id
+    )
+    .fetch_one(&mut *tx)
+    .await?
+    .unwrap_or(0);
+
+    if allocated_for_purchase_sum + data.allocated_qty > purchase.quantity {
+        return Err(PurchaseAllocationError::Validation(format!(
+            "Allocated quantity exceeds purchase quantity (allocated: {}, requested: {}, purchase qty: {})",
+            allocated_for_purchase_sum, data.allocated_qty, purchase.quantity
+        )));
+    }
+
+    let allocated_for_line_sum = sqlx::query_scalar!(
+        r#"SELECT COALESCE(SUM(allocated_qty), 0)::INT FROM purchase_allocations WHERE receipt_line_item_id = $1"#,
+        data.receipt_line_item_id
+    )
+    .fetch_one(&mut *tx)
+    .await?
+    .unwrap_or(0);
+
+    if allocated_for_line_sum + data.allocated_qty > receipt_line.quantity {
+        return Err(PurchaseAllocationError::Validation(format!(
+            "Allocated quantity exceeds receipt line quantity (allocated: {}, requested: {}, receipt line qty: {})",
+            allocated_for_line_sum, data.allocated_qty, receipt_line.quantity
+        )));
+    }
+
+    let created = sqlx::query_as!(
+        PurchaseAllocation,
+        r#"INSERT INTO purchase_allocations (purchase_id, receipt_id, receipt_line_item_id, allocated_qty, unit_cost)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING id, purchase_id, receipt_id, receipt_line_item_id, allocated_qty, unit_cost, created_at, updated_at"#,
+        purchase_id,
+        receipt_line.receipt_id,
+        Some(receipt_line.id),
+        data.allocated_qty,
+        receipt_line.unit_cost
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        if let sqlx::Error::Database(db_err) = &e {
+            if db_err.constraint() == Some("purchase_allocations_purchase_id_receipt_id_key") {
+                return PurchaseAllocationError::Validation(
+                    "Allocation for this receipt already exists on this line item. Edit the existing allocation instead."
+                        .to_string(),
+                );
+            }
+        }
+        PurchaseAllocationError::Sql(e)
+    })?;
+
+    tx.commit().await?;
+
+    let rows = get_purchase_allocations(pool, purchase_id).await?;
+    rows.into_iter().find(|r| r.id == created.id).ok_or_else(|| {
+        PurchaseAllocationError::NotFound("Allocation created but not found".to_string())
+    })
+}
+
+pub async fn update_purchase_allocation(
+    pool: &PgPool,
+    purchase_id: Uuid,
+    allocation_id: Uuid,
+    data: UpdatePurchaseAllocation,
+) -> Result<PurchaseAllocationWithReceipt, PurchaseAllocationError> {
+    let mut tx = pool.begin().await?;
+
+    let purchase = sqlx::query!(
+        r#"SELECT id, item_id, quantity FROM purchases WHERE id = $1"#,
+        purchase_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| PurchaseAllocationError::NotFound("Purchase not found".to_string()))?;
+
+    let current = sqlx::query_as!(
+        PurchaseAllocation,
+        r#"SELECT id, purchase_id, receipt_id, receipt_line_item_id, allocated_qty, unit_cost, created_at, updated_at
+           FROM purchase_allocations
+           WHERE id = $1 AND purchase_id = $2"#,
+        allocation_id,
+        purchase_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| PurchaseAllocationError::NotFound("Allocation not found".to_string()))?;
+
+    let next_receipt_line_item_id = data
+        .receipt_line_item_id
+        .or(current.receipt_line_item_id)
+        .ok_or_else(|| {
+            PurchaseAllocationError::Validation(
+                "Allocation must be linked to a receipt line item".to_string(),
+            )
+        })?;
+    let next_allocated_qty = data.allocated_qty.unwrap_or(current.allocated_qty);
+
+    if next_allocated_qty <= 0 {
+        return Err(PurchaseAllocationError::Validation(
+            "allocated_qty must be greater than zero".to_string(),
+        ));
+    }
+
+    let receipt_line = sqlx::query!(
+        r#"SELECT id, receipt_id, item_id, quantity, unit_cost
+           FROM receipt_line_items
+           WHERE id = $1"#,
+        next_receipt_line_item_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| PurchaseAllocationError::NotFound("Receipt line item not found".to_string()))?;
+
+    if receipt_line.item_id != purchase.item_id {
+        return Err(PurchaseAllocationError::Validation(
+            "Receipt line item item must match invoice line item".to_string(),
+        ));
+    }
+
+    let other_allocated_purchase_sum = sqlx::query_scalar!(
+        r#"SELECT COALESCE(SUM(allocated_qty), 0)::INT
+           FROM purchase_allocations
+           WHERE purchase_id = $1 AND id <> $2"#,
+        purchase_id,
+        allocation_id
+    )
+    .fetch_one(&mut *tx)
+    .await?
+    .unwrap_or(0);
+
+    if other_allocated_purchase_sum + next_allocated_qty > purchase.quantity {
+        return Err(PurchaseAllocationError::Validation(format!(
+            "Allocated quantity exceeds purchase quantity (allocated by others: {}, requested: {}, purchase qty: {})",
+            other_allocated_purchase_sum, next_allocated_qty, purchase.quantity
+        )));
+    }
+
+    let other_allocated_line_sum = sqlx::query_scalar!(
+        r#"SELECT COALESCE(SUM(allocated_qty), 0)::INT
+           FROM purchase_allocations
+           WHERE receipt_line_item_id = $1 AND id <> $2"#,
+        next_receipt_line_item_id,
+        allocation_id
+    )
+    .fetch_one(&mut *tx)
+    .await?
+    .unwrap_or(0);
+
+    if other_allocated_line_sum + next_allocated_qty > receipt_line.quantity {
+        return Err(PurchaseAllocationError::Validation(format!(
+            "Allocated quantity exceeds receipt line quantity (allocated by others: {}, requested: {}, receipt line qty: {})",
+            other_allocated_line_sum, next_allocated_qty, receipt_line.quantity
+        )));
+    }
+
+    let updated = sqlx::query_as!(
+        PurchaseAllocation,
+        r#"UPDATE purchase_allocations
+           SET receipt_id = $3,
+               receipt_line_item_id = $4,
+               allocated_qty = $5,
+               unit_cost = $6
+           WHERE id = $1 AND purchase_id = $2
+           RETURNING id, purchase_id, receipt_id, receipt_line_item_id, allocated_qty, unit_cost, created_at, updated_at"#,
+        allocation_id,
+        purchase_id,
+        receipt_line.receipt_id,
+        Some(receipt_line.id),
+        next_allocated_qty,
+        receipt_line.unit_cost
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        if let sqlx::Error::Database(db_err) = &e {
+            if db_err.constraint() == Some("purchase_allocations_purchase_id_receipt_id_key") {
+                return PurchaseAllocationError::Validation(
+                    "Allocation for this receipt already exists on this line item."
+                        .to_string(),
+                );
+            }
+        }
+        PurchaseAllocationError::Sql(e)
+    })?;
+
+    tx.commit().await?;
+
+    let rows = get_purchase_allocations(pool, purchase_id).await?;
+    rows.into_iter().find(|r| r.id == updated.id).ok_or_else(|| {
+        PurchaseAllocationError::NotFound("Allocation updated but not found".to_string())
+    })
+}
+
+pub async fn get_receipt_line_items(
+    pool: &PgPool,
+    receipt_id: Uuid,
+) -> Result<Vec<ReceiptLineItemWithItem>, sqlx::Error> {
+    sqlx::query_as!(
+        ReceiptLineItemWithItem,
+        r#"SELECT
+            rli.id,
+            rli.receipt_id,
+            rli.item_id,
+            i.name AS item_name,
+            rli.quantity,
+            rli.unit_cost,
+            rli.notes,
+            COALESCE(SUM(pa.allocated_qty), 0)::INT AS "allocated_qty!: i32",
+            (rli.quantity - COALESCE(SUM(pa.allocated_qty), 0))::INT AS "remaining_qty!: i32",
+            rli.created_at,
+            rli.updated_at
+        FROM receipt_line_items rli
+        JOIN items i ON i.id = rli.item_id
+        LEFT JOIN purchase_allocations pa ON pa.receipt_line_item_id = rli.id
+        WHERE rli.receipt_id = $1
+        GROUP BY rli.id, rli.receipt_id, rli.item_id, i.name, rli.quantity, rli.unit_cost, rli.notes, rli.created_at, rli.updated_at
+        ORDER BY i.name"#,
+        receipt_id
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn create_receipt_line_item(
+    pool: &PgPool,
+    receipt_id: Uuid,
+    data: CreateReceiptLineItem,
+) -> Result<ReceiptLineItemWithItem, PurchaseAllocationError> {
+    if data.quantity <= 0 {
+        return Err(PurchaseAllocationError::Validation(
+            "quantity must be greater than zero".to_string(),
+        ));
+    }
+
+    let created = sqlx::query_as!(
+        ReceiptLineItem,
+        r#"INSERT INTO receipt_line_items (receipt_id, item_id, quantity, unit_cost, notes)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING id, receipt_id, item_id, quantity, unit_cost, notes, created_at, updated_at"#,
+        receipt_id,
+        data.item_id,
+        data.quantity,
+        data.unit_cost,
+        data.notes,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        if let sqlx::Error::Database(db_err) = &e {
+            if db_err.constraint() == Some("receipt_line_items_receipt_id_item_id_key") {
+                return PurchaseAllocationError::Validation(
+                    "Receipt already has a line for this item. Edit the existing line instead."
+                        .to_string(),
+                );
+            }
+        }
+        PurchaseAllocationError::Sql(e)
+    })?;
+
+    let rows = get_receipt_line_items(pool, receipt_id).await?;
+    rows.into_iter().find(|r| r.id == created.id).ok_or_else(|| {
+        PurchaseAllocationError::NotFound("Receipt line item created but not found".to_string())
+    })
+}
+
+pub async fn update_receipt_line_item(
+    pool: &PgPool,
+    receipt_id: Uuid,
+    line_item_id: Uuid,
+    data: UpdateReceiptLineItem,
+) -> Result<ReceiptLineItemWithItem, PurchaseAllocationError> {
+    let current = sqlx::query_as!(
+        ReceiptLineItem,
+        r#"SELECT id, receipt_id, item_id, quantity, unit_cost, notes, created_at, updated_at
+           FROM receipt_line_items
+           WHERE id = $1 AND receipt_id = $2"#,
+        line_item_id,
+        receipt_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| PurchaseAllocationError::NotFound("Receipt line item not found".to_string()))?;
+
+    let next_item_id = data.item_id.unwrap_or(current.item_id);
+    let next_qty = data.quantity.unwrap_or(current.quantity);
+    let next_unit_cost = data.unit_cost.unwrap_or(current.unit_cost);
+    let next_notes = data.notes.or(current.notes);
+
+    if next_qty <= 0 {
+        return Err(PurchaseAllocationError::Validation(
+            "quantity must be greater than zero".to_string(),
+        ));
+    }
+
+    let allocated = sqlx::query_scalar!(
+        r#"SELECT COALESCE(SUM(allocated_qty), 0)::INT
+           FROM purchase_allocations
+           WHERE receipt_line_item_id = $1"#,
+        line_item_id
+    )
+    .fetch_one(pool)
+    .await?
+    .unwrap_or(0);
+
+    if next_qty < allocated {
+        return Err(PurchaseAllocationError::Validation(format!(
+            "quantity cannot be less than currently allocated qty ({})",
+            allocated
+        )));
+    }
+
+    let updated = sqlx::query_as!(
+        ReceiptLineItem,
+        r#"UPDATE receipt_line_items
+           SET item_id = $3,
+               quantity = $4,
+               unit_cost = $5,
+               notes = $6
+           WHERE id = $1 AND receipt_id = $2
+           RETURNING id, receipt_id, item_id, quantity, unit_cost, notes, created_at, updated_at"#,
+        line_item_id,
+        receipt_id,
+        next_item_id,
+        next_qty,
+        next_unit_cost,
+        next_notes,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        if let sqlx::Error::Database(db_err) = &e {
+            if db_err.constraint() == Some("receipt_line_items_receipt_id_item_id_key") {
+                return PurchaseAllocationError::Validation(
+                    "Receipt already has a line for this item. Edit the existing line instead."
+                        .to_string(),
+                );
+            }
+        }
+        PurchaseAllocationError::Sql(e)
+    })?;
+
+    let rows = get_receipt_line_items(pool, receipt_id).await?;
+    rows.into_iter().find(|r| r.id == updated.id).ok_or_else(|| {
+        PurchaseAllocationError::NotFound("Receipt line item updated but not found".to_string())
+    })
+}
+
+pub async fn delete_receipt_line_item(
+    pool: &PgPool,
+    receipt_id: Uuid,
+    line_item_id: Uuid,
+) -> Result<bool, PurchaseAllocationError> {
+    let allocated = sqlx::query_scalar!(
+        r#"SELECT COALESCE(SUM(allocated_qty), 0)::INT
+           FROM purchase_allocations
+           WHERE receipt_line_item_id = $1"#,
+        line_item_id
+    )
+    .fetch_one(pool)
+    .await?
+    .unwrap_or(0);
+
+    if allocated > 0 {
+        return Err(PurchaseAllocationError::Validation(
+            "Cannot delete line item with existing allocations".to_string(),
+        ));
+    }
+
+    let result = sqlx::query!(
+        r#"DELETE FROM receipt_line_items WHERE id = $1 AND receipt_id = $2"#,
+        line_item_id,
+        receipt_id
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn delete_purchase_allocation(
+    pool: &PgPool,
+    purchase_id: Uuid,
+    allocation_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query!(
+        r#"DELETE FROM purchase_allocations WHERE id = $1 AND purchase_id = $2"#,
+        allocation_id,
+        purchase_id
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn create_purchase(
     pool: &PgPool,
     data: CreatePurchase,
@@ -805,11 +1477,17 @@ pub async fn create_purchase(
     } else {
         None
     };
-    
+
     let purchase = sqlx::query_as!(
         Purchase,
-          r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price, destination_id, status, delivery_date, notes) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) 
+                    r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price, destination_id, status, delivery_date, notes, created_at, updated_at) 
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                                     COALESCE((SELECT invoice_date::timestamptz FROM invoices WHERE id = $2),
+                                                        (SELECT receipt_date::timestamptz FROM receipts WHERE id = $3),
+                                                        TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                                     COALESCE((SELECT invoice_date::timestamptz FROM invoices WHERE id = $2),
+                                                        (SELECT receipt_date::timestamptz FROM receipts WHERE id = $3),
+                                                        TIMESTAMPTZ '1970-01-01 00:00:00+00')) 
               RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price,
                      destination_id, status as "status: DeliveryStatus", 
                      delivery_date, notes, created_at, updated_at"#,
@@ -827,8 +1505,16 @@ pub async fn create_purchase(
     .fetch_one(pool)
     .await?;
 
-    AuditService::log(pool, "purchases", purchase.id, "create", None::<&Purchase>, Some(&purchase), user_id)
-        .await?;
+    AuditService::log(
+        pool,
+        "purchases",
+        purchase.id,
+        "create",
+        None::<&Purchase>,
+        Some(&purchase),
+        user_id,
+    )
+    .await?;
     Ok(purchase)
 }
 
@@ -842,10 +1528,22 @@ pub async fn update_purchase(
 
     if let Some(ref old_purchase) = old {
         // Resolve nullable fields: explicit clear wins, then new value, then keep existing
-        let invoice_id = if data.clear_invoice { None } else { data.invoice_id.or(old_purchase.invoice_id) };
-        let receipt_id = if data.clear_receipt { None } else { data.receipt_id.or(old_purchase.receipt_id) };
+        let invoice_id = if data.clear_invoice {
+            None
+        } else {
+            data.invoice_id.or(old_purchase.invoice_id)
+        };
+        let receipt_id = if data.clear_receipt {
+            None
+        } else {
+            data.receipt_id.or(old_purchase.receipt_id)
+        };
         let invoice_unit_price = if invoice_id.is_some() {
-            if data.clear_invoice_unit_price { None } else { data.invoice_unit_price.or(old_purchase.invoice_unit_price) }
+            if data.clear_invoice_unit_price {
+                None
+            } else {
+                data.invoice_unit_price.or(old_purchase.invoice_unit_price)
+            }
         } else {
             None
         };
@@ -890,8 +1588,16 @@ pub async fn update_purchase(
         .await?;
 
         if let Some(ref p) = purchase {
-            AuditService::log(pool, "purchases", id, "update", Some(old_purchase), Some(p), user_id)
-                .await?;
+            AuditService::log(
+                pool,
+                "purchases",
+                id,
+                "update",
+                Some(old_purchase),
+                Some(p),
+                user_id,
+            )
+            .await?;
         }
         return Ok(purchase);
     }
@@ -921,8 +1627,16 @@ pub async fn update_purchase_status(
         .await?;
 
         if let Some(ref p) = purchase {
-            AuditService::log(pool, "purchases", id, "update", Some(old_purchase), Some(p), user_id)
-                .await?;
+            AuditService::log(
+                pool,
+                "purchases",
+                id,
+                "update",
+                Some(old_purchase),
+                Some(p),
+                user_id,
+            )
+            .await?;
         }
         return Ok(purchase);
     }
@@ -938,8 +1652,16 @@ pub async fn delete_purchase(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<b
 
     if result.rows_affected() > 0 {
         if let Some(ref p) = old {
-            AuditService::log(pool, "purchases", id, "delete", Some(p), None::<&Purchase>, user_id)
-                .await?;
+            AuditService::log(
+                pool,
+                "purchases",
+                id,
+                "delete",
+                Some(p),
+                None::<&Purchase>,
+                user_id,
+            )
+            .await?;
         }
         return Ok(true);
     }
@@ -1049,7 +1771,10 @@ pub async fn create_user(
 // ============================================
 
 #[allow(dead_code)]
-pub async fn get_audit_logs(pool: &PgPool, query: AuditQuery) -> Result<Vec<AuditLog>, sqlx::Error> {
+pub async fn get_audit_logs(
+    pool: &PgPool,
+    query: AuditQuery,
+) -> Result<Vec<AuditLog>, sqlx::Error> {
     sqlx::query_as!(
         AuditLog,
         r#"SELECT id, table_name, record_id, operation, old_data, new_data, user_id, created_at
@@ -1142,15 +1867,31 @@ pub async fn create_receipt(
     .fetch_one(pool)
     .await?;
 
-    AuditService::log(pool, "receipts", receipt.id, "create", None::<&Receipt>, Some(&receipt), user_id).await?;
+    AuditService::log(
+        pool,
+        "receipts",
+        receipt.id,
+        "create",
+        None::<&Receipt>,
+        Some(&receipt),
+        user_id,
+    )
+    .await?;
     Ok(receipt)
 }
 
-async fn generate_unique_receipt_number(pool: &PgPool, vendor_id: Uuid) -> Result<String, sqlx::Error> {
+async fn generate_unique_receipt_number(
+    pool: &PgPool,
+    vendor_id: Uuid,
+) -> Result<String, sqlx::Error> {
     let vendor = get_vendor_by_id(pool, vendor_id).await?;
     let vendor_prefix = vendor
         .as_ref()
-        .and_then(|v| v.short_id.clone().or_else(|| derive_vendor_short_id(&v.name)))
+        .and_then(|v| {
+            v.short_id
+                .clone()
+                .or_else(|| derive_vendor_short_id(&v.name))
+        })
         .unwrap_or_else(|| "VND".to_string());
 
     loop {
@@ -1214,7 +1955,10 @@ pub async fn update_receipt(
 
     if let Some(ref old_receipt) = old {
         let vendor_id = data.vendor_id.unwrap_or(old_receipt.vendor_id);
-        let receipt_number = data.receipt_number.clone().unwrap_or_else(|| old_receipt.receipt_number.clone());
+        let receipt_number = data
+            .receipt_number
+            .clone()
+            .unwrap_or_else(|| old_receipt.receipt_number.clone());
         let receipt_date = data.receipt_date.unwrap_or(old_receipt.receipt_date);
         let subtotal = data.subtotal.unwrap_or(old_receipt.subtotal);
         let notes = data.notes.clone().or(old_receipt.notes.clone());
@@ -1228,7 +1972,10 @@ pub async fn update_receipt(
             (rate, subtotal + tax_amount)
         } else {
             let rate = data.tax_rate.unwrap_or(old_receipt.tax_rate);
-            (rate, subtotal * (Decimal::ONE + rate / Decimal::new(100, 0)))
+            (
+                rate,
+                subtotal * (Decimal::ONE + rate / Decimal::new(100, 0)),
+            )
         };
 
         let receipt = sqlx::query_as!(
@@ -1257,7 +2004,16 @@ pub async fn update_receipt(
         .await?;
 
         if let Some(ref r) = receipt {
-            AuditService::log(pool, "receipts", id, "update", Some(old_receipt), Some(r), user_id).await?;
+            AuditService::log(
+                pool,
+                "receipts",
+                id,
+                "update",
+                Some(old_receipt),
+                Some(r),
+                user_id,
+            )
+            .await?;
         }
         return Ok(receipt);
     }
@@ -1268,9 +2024,12 @@ pub async fn delete_receipt(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bo
     let old = get_receipt_by_id(pool, id).await?;
 
     // Unlink purchases that reference this receipt (SET NULL, not delete)
-    sqlx::query!(r#"UPDATE purchases SET receipt_id = NULL WHERE receipt_id = $1"#, id)
-        .execute(pool)
-        .await?;
+    sqlx::query!(
+        r#"UPDATE purchases SET receipt_id = NULL WHERE receipt_id = $1"#,
+        id
+    )
+    .execute(pool)
+    .await?;
 
     let result = sqlx::query!(r#"DELETE FROM receipts WHERE id = $1"#, id)
         .execute(pool)
@@ -1278,7 +2037,16 @@ pub async fn delete_receipt(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bo
 
     if result.rows_affected() > 0 {
         if let Some(ref r) = old {
-            AuditService::log(pool, "receipts", id, "delete", Some(r), None::<&Receipt>, user_id).await?;
+            AuditService::log(
+                pool,
+                "receipts",
+                id,
+                "delete",
+                Some(r),
+                None::<&Receipt>,
+                user_id,
+            )
+            .await?;
         }
         return Ok(true);
     }
@@ -1313,13 +2081,13 @@ pub async fn get_receipt_pdf(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.and_then(|r| {
-        match (r.original_pdf, r.original_filename) {
+    Ok(
+        row.and_then(|r| match (r.original_pdf, r.original_filename) {
             (Some(pdf), Some(name)) => Some((pdf, name)),
             (Some(pdf), None) => Some((pdf, "receipt.pdf".to_string())),
             _ => None,
-        }
-    }))
+        }),
+    )
 }
 
 pub async fn get_receipt_with_vendor(
@@ -1341,14 +2109,18 @@ pub async fn get_receipt_with_vendor(
             r.notes,
             r.created_at,
             r.updated_at,
-            COUNT(p.id) AS purchase_count,
-            COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS purchases_total,
-            COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, 0)), 0) AS total_selling,
-            COALESCE(SUM(p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
-            COUNT(p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count
+                        COUNT(DISTINCT p.id) AS purchase_count,
+                        COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0)
+                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * p.purchase_cost ELSE 0 END), 0) AS purchases_total,
+                        COALESCE(SUM(pa.allocated_qty * COALESCE(p.invoice_unit_price, 0)), 0)
+                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * COALESCE(p.invoice_unit_price, 0) ELSE 0 END), 0) AS total_selling,
+                        COALESCE(SUM(pa.allocated_qty * (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost)), 0)
+                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) ELSE 0 END), 0) AS total_commission,
+                        COUNT(DISTINCT p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count
         FROM receipts r
         JOIN vendors v ON v.id = r.vendor_id
-        LEFT JOIN purchases p ON p.receipt_id = r.id
+                LEFT JOIN purchase_allocations pa ON pa.receipt_id = r.id
+                LEFT JOIN purchases p ON p.id = pa.purchase_id OR (pa.id IS NULL AND p.receipt_id = r.id)
         WHERE r.id = $1
         GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_rate, r.total,
                  r.original_pdf, r.notes, r.created_at, r.updated_at"#,
@@ -1376,14 +2148,18 @@ pub async fn get_receipts_with_vendor(
             r.notes,
             r.created_at,
             r.updated_at,
-            COUNT(p.id) AS purchase_count,
-            COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS purchases_total,
-            COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, 0)), 0) AS total_selling,
-            COALESCE(SUM(p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
-            COUNT(p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count
+                        COUNT(DISTINCT p.id) AS purchase_count,
+                        COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0)
+                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * p.purchase_cost ELSE 0 END), 0) AS purchases_total,
+                        COALESCE(SUM(pa.allocated_qty * COALESCE(p.invoice_unit_price, 0)), 0)
+                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * COALESCE(p.invoice_unit_price, 0) ELSE 0 END), 0) AS total_selling,
+                        COALESCE(SUM(pa.allocated_qty * (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost)), 0)
+                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) ELSE 0 END), 0) AS total_commission,
+                        COUNT(DISTINCT p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count
         FROM receipts r
         JOIN vendors v ON v.id = r.vendor_id
-        LEFT JOIN purchases p ON p.receipt_id = r.id
+                LEFT JOIN purchase_allocations pa ON pa.receipt_id = r.id
+                LEFT JOIN purchases p ON p.id = pa.purchase_id OR (pa.id IS NULL AND p.receipt_id = r.id)
         GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_rate, r.total,
                  r.original_pdf, r.notes, r.created_at, r.updated_at
         ORDER BY r.receipt_date DESC"#
@@ -1399,31 +2175,37 @@ pub async fn get_purchases_by_receipt(
     sqlx::query_as!(
         PurchaseEconomics,
         r#"SELECT 
-            pe.purchase_id as "purchase_id!",
-            pe.purchase_date as "purchase_date!",
-            pe.item_id as "item_id!",
-            pe.item_name as "item_name!",
-            pe.vendor_name,
-            pe.destination_code,
-            pe.quantity as "quantity!",
-            pe.purchase_cost as "purchase_cost!",
-            pe.total_cost,
-            pe.invoice_unit_price,
-            pe.total_selling,
-            pe.unit_commission,
-            pe.total_commission,
-            pe.tax_paid,
-            pe.tax_owed,
-            pe.status as "status!: DeliveryStatus",
-            pe.delivery_date,
-            pe.invoice_id,
-            pe.receipt_id,
-            pe.receipt_number,
-            pe.invoice_number,
-            pe.notes
-        FROM v_purchase_economics pe
-        WHERE pe.receipt_id = $1
-        ORDER BY pe.purchase_date DESC"#,
+            p.id as "purchase_id!",
+            COALESCE(inv.invoice_date::timestamptz, r.receipt_date::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00') as "purchase_date!",
+            p.item_id as "item_id!",
+            i.name as "item_name!",
+            v.name as vendor_name,
+            d.code as destination_code,
+            COALESCE(pa.allocated_qty, p.quantity) as "quantity!",
+            COALESCE(pa.unit_cost, p.purchase_cost) as "purchase_cost!",
+            (COALESCE(pa.allocated_qty, p.quantity) * COALESCE(pa.unit_cost, p.purchase_cost)) as total_cost,
+            p.invoice_unit_price,
+            (COALESCE(pa.allocated_qty, p.quantity) * p.invoice_unit_price) as total_selling,
+            (COALESCE(p.invoice_unit_price, COALESCE(pa.unit_cost, p.purchase_cost)) - COALESCE(pa.unit_cost, p.purchase_cost)) as unit_commission,
+            (COALESCE(pa.allocated_qty, p.quantity) * (COALESCE(p.invoice_unit_price, COALESCE(pa.unit_cost, p.purchase_cost)) - COALESCE(pa.unit_cost, p.purchase_cost))) as total_commission,
+            (COALESCE(pa.allocated_qty, p.quantity) * COALESCE(pa.unit_cost, p.purchase_cost) * 0.13) as tax_paid,
+            (COALESCE(pa.allocated_qty, p.quantity) * (COALESCE(p.invoice_unit_price, COALESCE(pa.unit_cost, p.purchase_cost)) - COALESCE(pa.unit_cost, p.purchase_cost)) * 0.13) as tax_owed,
+            p.status as "status!: DeliveryStatus",
+            p.delivery_date,
+            p.invoice_id,
+            r.id as receipt_id,
+            r.receipt_number,
+            inv.invoice_number,
+            p.notes
+        FROM purchases p
+        JOIN items i ON i.id = p.item_id
+        JOIN receipts r ON r.id = $1
+        JOIN vendors v ON v.id = r.vendor_id
+        LEFT JOIN destinations d ON d.id = p.destination_id
+        LEFT JOIN invoices inv ON inv.id = p.invoice_id
+        LEFT JOIN purchase_allocations pa ON pa.purchase_id = p.id AND pa.receipt_id = r.id
+        WHERE pa.id IS NOT NULL OR p.receipt_id = r.id
+        ORDER BY p.created_at DESC"#,
         receipt_id
     )
     .fetch_all(pool)
@@ -1506,4 +2288,372 @@ pub async fn get_profit_report(
     )
     .fetch_one(pool)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    async fn test_pool() -> Option<PgPool> {
+        let database_url = std::env::var("DATABASE_URL").ok()?;
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .ok()
+    }
+
+    async fn seed_purchase_with_receipt(
+        pool: &PgPool,
+    ) -> Result<(Uuid, Uuid, Uuid, Uuid, Uuid), sqlx::Error> {
+        let vendor_id = Uuid::new_v4();
+        let destination_id = Uuid::new_v4();
+        let item_id = Uuid::new_v4();
+        let receipt_id = Uuid::new_v4();
+        let invoice_id = Uuid::new_v4();
+        let purchase_id = Uuid::new_v4();
+
+        sqlx::query(
+            r#"INSERT INTO vendors (id, name) VALUES ($1, $2)"#,
+        )
+        .bind(vendor_id)
+        .bind(format!("test-vendor-{}", vendor_id))
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"INSERT INTO destinations (id, code, name) VALUES ($1, $2, $3)"#,
+        )
+        .bind(destination_id)
+        .bind(format!("D{}", &destination_id.to_string()[..8]))
+        .bind("Test Destination")
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"INSERT INTO items (id, name, default_destination_id) VALUES ($1, $2, $3)"#,
+        )
+        .bind(item_id)
+        .bind(format!("test-item-{}", item_id))
+        .bind(destination_id)
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"INSERT INTO receipts (id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind(receipt_id)
+        .bind(vendor_id)
+        .bind(format!("R{}", &receipt_id.to_string()[..10]))
+        .bind(NaiveDate::from_ymd_opt(2026, 4, 14).unwrap())
+        .bind(Decimal::new(10000, 2))
+        .bind(Decimal::new(1300, 2))
+        .bind(Decimal::new(11300, 2))
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"INSERT INTO invoices (id, destination_id, invoice_number, invoice_date, subtotal, tax_rate, total)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind(invoice_id)
+        .bind(destination_id)
+        .bind(format!("I{}", &invoice_id.to_string()[..10]))
+        .bind(NaiveDate::from_ymd_opt(2026, 4, 14).unwrap())
+        .bind(Decimal::new(12000, 2))
+        .bind(Decimal::new(1300, 2))
+        .bind(Decimal::new(13560, 2))
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"INSERT INTO purchases (id, item_id, receipt_id, invoice_id, quantity, purchase_cost, invoice_unit_price, destination_id, status)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'delivered')"#,
+        )
+        .bind(purchase_id)
+        .bind(item_id)
+        .bind(receipt_id)
+        .bind(invoice_id)
+        .bind(2_i32)
+        .bind(Decimal::new(87999, 2))
+        .bind(Decimal::new(89000, 2))
+        .bind(destination_id)
+        .execute(pool)
+        .await?;
+
+        Ok((vendor_id, destination_id, item_id, receipt_id, purchase_id))
+    }
+
+    async fn create_receipt_line_item_for_seed(
+        pool: &PgPool,
+        receipt_id: Uuid,
+        item_id: Uuid,
+        quantity: i32,
+        unit_cost: Decimal,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO receipt_line_items (id, receipt_id, item_id, quantity, unit_cost, notes)
+               VALUES ($1, $2, $3, $4, $5, 'test-line')"#,
+        )
+        .bind(id)
+        .bind(receipt_id)
+        .bind(item_id)
+        .bind(quantity)
+        .bind(unit_cost)
+        .execute(pool)
+        .await
+        .expect("create receipt line item");
+        id
+    }
+
+    async fn cleanup_seeded(
+        pool: &PgPool,
+        vendor_id: Uuid,
+        destination_id: Uuid,
+        item_id: Uuid,
+        receipt_id: Uuid,
+        purchase_id: Uuid,
+    ) {
+        let _ = sqlx::query(r#"DELETE FROM purchase_allocations WHERE purchase_id = $1"#)
+            .bind(purchase_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query(r#"DELETE FROM purchases WHERE id = $1"#)
+            .bind(purchase_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query(r#"DELETE FROM receipts WHERE id = $1"#)
+            .bind(receipt_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query(r#"DELETE FROM invoices WHERE destination_id = $1"#)
+            .bind(destination_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query(r#"DELETE FROM items WHERE id = $1"#)
+            .bind(item_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query(r#"DELETE FROM destinations WHERE id = $1"#)
+            .bind(destination_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query(r#"DELETE FROM vendors WHERE id = $1"#)
+            .bind(vendor_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn updating_receipt_number_does_not_mutate_linked_purchase() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let before = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read before")
+            .expect("purchase exists before");
+
+        let _ = update_receipt(
+            &pool,
+            receipt_id,
+            UpdateReceipt {
+                vendor_id: None,
+                receipt_number: Some(format!("RENAMED-{}", &receipt_id.to_string()[..8])),
+                receipt_date: None,
+                subtotal: None,
+                tax_amount: None,
+                tax_rate: None,
+                notes: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("receipt update")
+        .expect("receipt exists");
+
+        let after = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read after")
+            .expect("purchase exists after");
+
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.item_id, before.item_id);
+        assert_eq!(after.invoice_id, before.invoice_id);
+        assert_eq!(after.receipt_id, before.receipt_id);
+        assert_eq!(after.quantity, before.quantity);
+        assert_eq!(after.purchase_cost, before.purchase_cost);
+        assert_eq!(after.invoice_unit_price, before.invoice_unit_price);
+        assert_eq!(after.destination_id, before.destination_id);
+        assert_eq!(after.status, before.status);
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn updating_receipt_totals_does_not_mutate_linked_purchase() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let before = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read before")
+            .expect("purchase exists before");
+
+        let _ = update_receipt(
+            &pool,
+            receipt_id,
+            UpdateReceipt {
+                vendor_id: None,
+                receipt_number: None,
+                receipt_date: None,
+                subtotal: Some(Decimal::new(999999, 2)),
+                tax_amount: Some(Decimal::new(129999, 2)),
+                tax_rate: None,
+                notes: Some("edited receipt totals".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("receipt update")
+        .expect("receipt exists");
+
+        let after = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read after")
+            .expect("purchase exists after");
+
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.item_id, before.item_id);
+        assert_eq!(after.invoice_id, before.invoice_id);
+        assert_eq!(after.receipt_id, before.receipt_id);
+        assert_eq!(after.quantity, before.quantity);
+        assert_eq!(after.purchase_cost, before.purchase_cost);
+        assert_eq!(after.invoice_unit_price, before.invoice_unit_price);
+        assert_eq!(after.destination_id, before.destination_id);
+        assert_eq!(after.status, before.status);
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn allocation_cannot_exceed_receipt_line_quantity() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            1,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let err = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 2,
+            },
+        )
+        .await
+        .expect_err("should fail when allocation exceeds receipt line qty");
+
+        match err {
+            PurchaseAllocationError::Validation(msg) => {
+                assert!(msg.contains("receipt line quantity"));
+            }
+            _ => panic!("expected validation error"),
+        }
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn allocation_unit_cost_is_derived_from_receipt_line_item() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            3,
+            Decimal::new(77777, 2),
+        )
+        .await;
+
+        let allocation = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 1,
+            },
+        )
+        .await
+        .expect("create allocation");
+
+        assert_eq!(allocation.receipt_line_item_id, Some(line_item_id));
+        assert_eq!(allocation.unit_cost, Decimal::new(77777, 2));
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
 }

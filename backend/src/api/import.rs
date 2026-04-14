@@ -9,8 +9,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use uuid::Uuid;
 use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 use crate::{
     auth::AuthenticatedUser,
@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
         .route("/items", post(import_items))
         .route("/purchases", post(import_purchases))
         .route("/invoice-pdf", post(parse_invoice_pdf))
+        .route("/invoice-pdf/commit", post(commit_invoice_pdf))
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,36 +52,79 @@ pub struct ImportError {
 
 #[derive(Debug, Deserialize, Clone)]
 struct CsvPurchaseRow {
-    #[serde(alias = "item", alias = "item_id", alias = "Item", alias = "Item Name", alias = "item_name")]
+    #[serde(
+        alias = "item",
+        alias = "item_id",
+        alias = "Item",
+        alias = "Item Name",
+        alias = "item_name"
+    )]
     item: String,
-    
-    #[serde(alias = "destination", alias = "dest", alias = "Destination", alias = "dest_code", alias = "Dest", alias = "Default Destination", alias = "Default Dest")]
+
+    #[serde(
+        alias = "destination",
+        alias = "dest",
+        alias = "Destination",
+        alias = "dest_code",
+        alias = "Dest",
+        alias = "Default Destination",
+        alias = "Default Dest"
+    )]
     destination: Option<String>,
-    
+
     #[serde(alias = "qty", alias = "Qty", alias = "Quantity")]
     quantity: i32,
-    
-    #[serde(alias = "cost", alias = "unit_cost", alias = "purchase_cost", alias = "Cost", alias = "Unit Cost", alias = "Purchase Cost", alias = "Item Cost")]
+
+    #[serde(
+        alias = "cost",
+        alias = "unit_cost",
+        alias = "purchase_cost",
+        alias = "Cost",
+        alias = "Unit Cost",
+        alias = "Purchase Cost",
+        alias = "Item Cost"
+    )]
     purchase_cost: String,
-    
+
     #[serde(alias = "date", alias = "Date", alias = "purchase_date", default)]
     date: Option<String>,
-    
-    #[serde(alias = "invoice", alias = "Invoice", alias = "invoice_number", default)]
+
+    #[serde(
+        alias = "invoice",
+        alias = "Invoice",
+        alias = "invoice_number",
+        default
+    )]
     invoice: Option<String>,
-    
-    #[serde(alias = "receipt", alias = "Receipt", alias = "receipt_number", default)]
+
+    #[serde(
+        alias = "receipt",
+        alias = "Receipt",
+        alias = "receipt_number",
+        default
+    )]
     receipt: Option<String>,
-    
-    #[serde(alias = "invoice_unit_price", alias = "Invoice Unit Price", alias = "unit_price", alias = "price", default)]
+
+    #[serde(
+        alias = "invoice_unit_price",
+        alias = "Invoice Unit Price",
+        alias = "unit_price",
+        alias = "price",
+        default
+    )]
     invoice_unit_price: Option<String>,
-    
+
     #[serde(alias = "Status", alias = "status", alias = "delivery_status", default)]
     status: Option<String>,
-    
-    #[serde(alias = "delivery_date", alias = "Delivery Date", alias = "delivered", default)]
+
+    #[serde(
+        alias = "delivery_date",
+        alias = "Delivery Date",
+        alias = "delivered",
+        default
+    )]
     delivery_date: Option<String>,
-    
+
     #[serde(alias = "Notes", alias = "notes", alias = "Note", default)]
     notes: Option<String>,
 }
@@ -122,12 +166,12 @@ async fn import_vendors(
     let existing_vendors = queries::get_all_vendors(&state.pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
+
     let existing_names: HashSet<String> = existing_vendors
         .iter()
         .map(|v| v.name.to_lowercase())
         .collect();
-    
+
     let mut batch_names: HashSet<String> = HashSet::new();
     let csv_lines: Vec<String> = request.csv_data.lines().map(|s| s.to_string()).collect();
     let header_line = csv_lines.first().cloned().unwrap_or_default();
@@ -139,7 +183,7 @@ async fn import_vendors(
         match result {
             Ok(row) => {
                 let name_lower = row.name.to_lowercase();
-                
+
                 if existing_names.contains(&name_lower) {
                     duplicate_count += 1;
                     errors.push(ImportError {
@@ -160,7 +204,10 @@ async fn import_vendors(
                     continue;
                 }
 
-                let create_data = CreateVendor { name: row.name.clone(), short_id: None };
+                let create_data = CreateVendor {
+                    name: row.name.clone(),
+                    short_id: None,
+                };
                 match queries::create_vendor(&state.pool, create_data, user.user_id).await {
                     Ok(_) => {
                         success_count += 1;
@@ -202,7 +249,7 @@ async fn import_vendors(
 struct CsvDestinationRow {
     #[serde(alias = "Code", alias = "destination_code", alias = "Destination")]
     code: String,
-    
+
     #[serde(alias = "Name", alias = "destination_name")]
     name: String,
 }
@@ -224,12 +271,9 @@ async fn import_destinations(
     let existing = queries::get_all_destinations(&state.pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
-    let existing_codes: HashSet<String> = existing
-        .iter()
-        .map(|d| d.code.to_lowercase())
-        .collect();
-    
+
+    let existing_codes: HashSet<String> = existing.iter().map(|d| d.code.to_lowercase()).collect();
+
     let mut batch_codes: HashSet<String> = HashSet::new();
     let csv_lines: Vec<String> = request.csv_data.lines().map(|s| s.to_string()).collect();
     let header_line = csv_lines.first().cloned().unwrap_or_default();
@@ -241,7 +285,7 @@ async fn import_destinations(
         match result {
             Ok(row) => {
                 let code_lower = row.code.to_lowercase();
-                
+
                 if existing_codes.contains(&code_lower) {
                     duplicate_count += 1;
                     errors.push(ImportError {
@@ -309,10 +353,20 @@ async fn import_destinations(
 struct CsvItemRow {
     #[serde(alias = "Name", alias = "item_name", alias = "Item", alias = "item")]
     name: String,
-    
-    #[serde(alias = "Destination", alias = "default_destination", alias = "dest_code", alias = "Default Destination", alias = "Default Dest", alias = "Dest", alias = "dest", alias = "destination", default)]
+
+    #[serde(
+        alias = "Destination",
+        alias = "default_destination",
+        alias = "dest_code",
+        alias = "Default Destination",
+        alias = "Default Dest",
+        alias = "Dest",
+        alias = "dest",
+        alias = "destination",
+        default
+    )]
     destination: Option<String>,
-    
+
     #[serde(alias = "Notes", alias = "notes", alias = "Note", default)]
     notes: Option<String>,
 }
@@ -496,10 +550,8 @@ async fn import_purchases(
     let mut batch_keys: HashSet<String> = HashSet::new();
 
     // Create lookup maps
-    let item_by_name: HashMap<String, &ActiveItem> = items
-        .iter()
-        .map(|i| (i.name.to_lowercase(), i))
-        .collect();
+    let item_by_name: HashMap<String, &ActiveItem> =
+        items.iter().map(|i| (i.name.to_lowercase(), i)).collect();
     let dest_by_code: HashMap<String, &Destination> = destinations
         .iter()
         .map(|d| (d.code.to_lowercase(), d))
@@ -520,7 +572,7 @@ async fn import_purchases(
     for (row_idx, result) in reader.deserialize::<CsvPurchaseRow>().enumerate() {
         let row_num = row_idx + 2;
         let original_line = csv_lines.get(row_num - 1).cloned().unwrap_or_default();
-        
+
         match result {
             Ok(row) => {
                 // Find the item
@@ -624,24 +676,22 @@ async fn import_purchases(
 
                 // Parse status (optional, default pending)
                 let status = match &row.status {
-                    Some(s) if !s.is_empty() => {
-                        match s.to_lowercase().as_str() {
-                            "pending" => Some(DeliveryStatus::Pending),
-                            "in_transit" | "in transit" => Some(DeliveryStatus::InTransit),
-                            "delivered" => Some(DeliveryStatus::Delivered),
-                            "damaged" => Some(DeliveryStatus::Damaged),
-                            "returned" => Some(DeliveryStatus::Returned),
-                            "lost" => Some(DeliveryStatus::Lost),
-                            _ => {
-                                errors.push(ImportError {
+                    Some(s) if !s.is_empty() => match s.to_lowercase().as_str() {
+                        "pending" => Some(DeliveryStatus::Pending),
+                        "in_transit" | "in transit" => Some(DeliveryStatus::InTransit),
+                        "delivered" => Some(DeliveryStatus::Delivered),
+                        "damaged" => Some(DeliveryStatus::Damaged),
+                        "returned" => Some(DeliveryStatus::Returned),
+                        "lost" => Some(DeliveryStatus::Lost),
+                        _ => {
+                            errors.push(ImportError {
                                     row: row_num,
                                     message: format!("Invalid status: {} (use pending/in_transit/delivered/damaged/returned/lost)", s),
                                     original_data: original_line,
                                 });
-                                continue;
-                            }
+                            continue;
                         }
-                    }
+                    },
                     _ => Some(DeliveryStatus::Pending),
                 };
 
@@ -650,55 +700,58 @@ async fn import_purchases(
                     Some(date_str) if !date_str.is_empty() => {
                         match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
                             Ok(d) => Some(d),
-                            Err(_) => {
-                                match NaiveDate::parse_from_str(date_str, "%m/%d/%Y") {
-                                    Ok(d) => Some(d),
-                                    Err(_) => {
-                                        errors.push(ImportError {
-                                            row: row_num,
-                                            message: format!("Invalid delivery date: {} (use YYYY-MM-DD)", date_str),
-                                            original_data: original_line,
-                                        });
-                                        continue;
-                                    }
+                            Err(_) => match NaiveDate::parse_from_str(date_str, "%m/%d/%Y") {
+                                Ok(d) => Some(d),
+                                Err(_) => {
+                                    errors.push(ImportError {
+                                        row: row_num,
+                                        message: format!(
+                                            "Invalid delivery date: {} (use YYYY-MM-DD)",
+                                            date_str
+                                        ),
+                                        original_data: original_line,
+                                    });
+                                    continue;
                                 }
-                            }
+                            },
                         }
                     }
                     _ => None,
                 };
 
                 // Parse unit cost
-                let purchase_cost = match Decimal::from_str(&row.purchase_cost.replace(['$', ','], "")) {
-                    Ok(d) => d,
-                    Err(_) => {
-                        errors.push(ImportError {
-                            row: row_num,
-                            message: format!("Invalid purchase cost: {}", row.purchase_cost),
-                            original_data: original_line,
-                        });
-                        continue;
-                    }
-                };
+                let purchase_cost =
+                    match Decimal::from_str(&row.purchase_cost.replace(['$', ','], "")) {
+                        Ok(d) => d,
+                        Err(_) => {
+                            errors.push(ImportError {
+                                row: row_num,
+                                message: format!("Invalid purchase cost: {}", row.purchase_cost),
+                                original_data: original_line,
+                            });
+                            continue;
+                        }
+                    };
 
                 // Parse date or use today
                 let purchase_date = match &row.date {
                     Some(date_str) if !date_str.is_empty() => {
                         match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
                             Ok(d) => d,
-                            Err(_) => {
-                                match NaiveDate::parse_from_str(date_str, "%m/%d/%Y") {
-                                    Ok(d) => d,
-                                    Err(_) => {
-                                        errors.push(ImportError {
-                                            row: row_num,
-                                            message: format!("Invalid date: {} (use YYYY-MM-DD)", date_str),
-                                            original_data: original_line,
-                                        });
-                                        continue;
-                                    }
+                            Err(_) => match NaiveDate::parse_from_str(date_str, "%m/%d/%Y") {
+                                Ok(d) => d,
+                                Err(_) => {
+                                    errors.push(ImportError {
+                                        row: row_num,
+                                        message: format!(
+                                            "Invalid date: {} (use YYYY-MM-DD)",
+                                            date_str
+                                        ),
+                                        original_data: original_line,
+                                    });
+                                    continue;
                                 }
-                            }
+                            },
                         }
                     }
                     _ => chrono::Utc::now().date_naive(),
@@ -706,13 +759,15 @@ async fn import_purchases(
 
                 // Check for duplicates
                 let dup_key = row.duplicate_key(item.id, purchase_date);
-                
+
                 if existing_keys.contains(&dup_key) {
                     duplicate_count += 1;
                     errors.push(ImportError {
                         row: row_num,
-                        message: format!("Duplicate: {} on {} qty:{} cost:{}", 
-                            item.name, purchase_date, row.quantity, row.purchase_cost),
+                        message: format!(
+                            "Duplicate: {} on {} qty:{} cost:{}",
+                            item.name, purchase_date, row.quantity, row.purchase_cost
+                        ),
                         original_data: original_line,
                     });
                     continue;
@@ -814,7 +869,11 @@ mod tests {
     fn assert_parses<T: for<'de> Deserialize<'de> + std::fmt::Debug>(csv_data: &str) -> T {
         let results: Vec<Result<T, _>> = parse_csv(csv_data);
         assert!(!results.is_empty(), "CSV should have at least one row");
-        results.into_iter().next().unwrap().expect("First row should parse successfully")
+        results
+            .into_iter()
+            .next()
+            .unwrap()
+            .expect("First row should parse successfully")
     }
 
     /// Helper to assert parse failure
@@ -840,8 +899,16 @@ mod tests {
         #[test]
         fn includes_header_and_failed_rows() {
             let errors = vec![
-                ImportError { row: 2, message: "Error 1".into(), original_data: "data1,data2".into() },
-                ImportError { row: 3, message: "Error 2".into(), original_data: "data3,data4".into() },
+                ImportError {
+                    row: 2,
+                    message: "Error 1".into(),
+                    original_data: "data1,data2".into(),
+                },
+                ImportError {
+                    row: 3,
+                    message: "Error 2".into(),
+                    original_data: "data3,data4".into(),
+                },
             ];
             let result = build_failed_csv("col1,col2", &errors);
             assert_eq!(result, "col1,col2\ndata1,data2\ndata3,data4\n");
@@ -850,8 +917,16 @@ mod tests {
         #[test]
         fn skips_errors_without_original_data() {
             let errors = vec![
-                ImportError { row: 2, message: "Error 1".into(), original_data: "data1".into() },
-                ImportError { row: 3, message: "Error 2".into(), original_data: "".into() },
+                ImportError {
+                    row: 2,
+                    message: "Error 1".into(),
+                    original_data: "data1".into(),
+                },
+                ImportError {
+                    row: 3,
+                    message: "Error 2".into(),
+                    original_data: "".into(),
+                },
             ];
             let result = build_failed_csv("header", &errors);
             assert_eq!(result, "header\ndata1\n");
@@ -939,17 +1014,13 @@ mod tests {
 
         #[test]
         fn parses_optional_destination() {
-            let row: CsvItemRow = assert_parses(
-                "name,destination\nEcho Dot,BSC"
-            );
+            let row: CsvItemRow = assert_parses("name,destination\nEcho Dot,BSC");
             assert_eq!(row.destination, Some("BSC".to_string()));
         }
 
         #[test]
         fn parses_default_destination_alias() {
-            let row: CsvItemRow = assert_parses(
-                "Item,Default Destination\nEcho Dot,CBG"
-            );
+            let row: CsvItemRow = assert_parses("Item,Default Destination\nEcho Dot,CBG");
             assert_eq!(row.destination, Some("CBG".to_string()));
         }
 
@@ -961,18 +1032,15 @@ mod tests {
 
         #[test]
         fn parses_optional_notes() {
-            let row: CsvItemRow = assert_parses(
-                "name,notes\nEcho Dot,Test note"
-            );
+            let row: CsvItemRow = assert_parses("name,notes\nEcho Dot,Test note");
             assert_eq!(row.notes, Some("Test note".to_string()));
         }
 
         #[test]
         fn handles_extra_columns() {
             // CSV with extra columns that should be ignored
-            let row: CsvItemRow = assert_parses(
-                "Item,Extra Col,Another Extra\nEcho,ignore,also ignore"
-            );
+            let row: CsvItemRow =
+                assert_parses("Item,Extra Col,Another Extra\nEcho,ignore,also ignore");
             assert_eq!(row.name, "Echo");
         }
     }
@@ -984,9 +1052,7 @@ mod tests {
 
         #[test]
         fn parses_standard_format() {
-            let row: CsvPurchaseRow = assert_parses(
-                "item,quantity,unit_cost\nEcho Dot,5,39.99"
-            );
+            let row: CsvPurchaseRow = assert_parses("item,quantity,unit_cost\nEcho Dot,5,39.99");
             assert_eq!(row.item, "Echo Dot");
             assert_eq!(row.quantity, 5);
             assert_eq!(row.purchase_cost, "39.99");
@@ -994,9 +1060,7 @@ mod tests {
 
         #[test]
         fn parses_with_aliases() {
-            let row: CsvPurchaseRow = assert_parses(
-                "Item,Qty,Cost\nPS5,2,519.99"
-            );
+            let row: CsvPurchaseRow = assert_parses("Item,Qty,Cost\nPS5,2,519.99");
             assert_eq!(row.item, "PS5");
             assert_eq!(row.quantity, 2);
             assert_eq!(row.purchase_cost, "519.99");
@@ -1004,25 +1068,22 @@ mod tests {
 
         #[test]
         fn parses_optional_destination() {
-            let row: CsvPurchaseRow = assert_parses(
-                "item,quantity,unit_cost,destination\nEcho,3,39.99,BSC"
-            );
+            let row: CsvPurchaseRow =
+                assert_parses("item,quantity,unit_cost,destination\nEcho,3,39.99,BSC");
             assert_eq!(row.destination, Some("BSC".to_string()));
         }
 
         #[test]
         fn parses_optional_date() {
-            let row: CsvPurchaseRow = assert_parses(
-                "item,quantity,unit_cost,date\nEcho,3,39.99,2024-11-15"
-            );
+            let row: CsvPurchaseRow =
+                assert_parses("item,quantity,unit_cost,date\nEcho,3,39.99,2024-11-15");
             assert_eq!(row.date, Some("2024-11-15".to_string()));
         }
 
         #[test]
         fn parses_optional_invoice() {
-            let row: CsvPurchaseRow = assert_parses(
-                "item,quantity,unit_cost,invoice\nEcho,3,39.99,INV-001"
-            );
+            let row: CsvPurchaseRow =
+                assert_parses("item,quantity,unit_cost,invoice\nEcho,3,39.99,INV-001");
             assert_eq!(row.invoice, Some("INV-001".to_string()));
         }
 
@@ -1043,7 +1104,7 @@ mod tests {
             };
             let item_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
             let date = NaiveDate::from_ymd_opt(2024, 11, 15).unwrap();
-            
+
             let key = row.duplicate_key(item_id, date);
             assert!(key.contains("550e8400-e29b-41d4-a716-446655440000"));
             assert!(key.contains("2024-11-15"));
@@ -1099,12 +1160,14 @@ mod tests {
                 success_count: 10,
                 error_count: 2,
                 duplicate_count: 1,
-                errors: vec![
-                    ImportError { row: 3, message: "Test error".into(), original_data: "row3".into() },
-                ],
+                errors: vec![ImportError {
+                    row: 3,
+                    message: "Test error".into(),
+                    original_data: "row3".into(),
+                }],
                 failed_rows_csv: "header\nrow3\n".into(),
             };
-            
+
             let json = serde_json::to_string(&result).unwrap();
             assert!(json.contains("\"success_count\":10"));
             assert!(json.contains("\"error_count\":2"));
@@ -1119,7 +1182,7 @@ mod tests {
                 message: "Vendor not found: Unknown".into(),
                 original_data: "Unknown,item,10.00".into(),
             };
-            
+
             let json = serde_json::to_string(&error).unwrap();
             assert!(json.contains("\"row\":5"));
             assert!(json.contains("Vendor not found"));
@@ -1150,6 +1213,18 @@ pub struct ParsedInvoice {
     pub notes: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct InvoicePdfCommitErrorResponse {
+    pub error_code: String,
+    pub message: String,
+    pub invoice_level_errors: Vec<InvoiceImportValidationError>,
+    pub line_failures: Vec<InvoiceImportLineFailure>,
+}
+
+fn parse_decimal_input(raw: &str) -> Result<Decimal, ()> {
+    Decimal::from_str(&raw.replace(['$', ',', ' '], "")).map_err(|_| ())
+}
+
 async fn parse_invoice_pdf(
     _user: AuthenticatedUser,
     mut multipart: Multipart,
@@ -1178,17 +1253,31 @@ async fn parse_invoice_pdf(
     ))?;
 
     // Write to temp file
-    let tmp_dir = tempfile::tempdir()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Temp dir error: {e}")))?;
+    let tmp_dir = tempfile::tempdir().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Temp dir error: {e}"),
+        )
+    })?;
     let tmp_path = tmp_dir.path().join("invoice.pdf");
-    let mut tmp_file = tokio::fs::File::create(&tmp_path)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("File create error: {e}")))?;
-    tmp_file
-        .write_all(&pdf_bytes)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("File write error: {e}")))?;
-    tmp_file.flush().await.ok();
+    let mut tmp_file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("File create error: {e}"),
+        )
+    })?;
+    tmp_file.write_all(&pdf_bytes).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("File write error: {e}"),
+        )
+    })?;
+    tmp_file.flush().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("File flush error: {e}"),
+        )
+    })?;
 
     // Run Python parser - resolve script path relative to the project root
     let script_path = std::env::current_dir()
@@ -1199,7 +1288,12 @@ async fn parse_invoice_pdf(
         .arg(&tmp_path)
         .output()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to run PDF parser: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to run PDF parser: {e}"),
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1210,8 +1304,12 @@ async fn parse_invoice_pdf(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Parse JSON error: {e}")))?;
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Parse JSON error: {e}"),
+        )
+    })?;
 
     if let Some(err) = parsed.get("error") {
         return Err((
@@ -1239,16 +1337,335 @@ async fn parse_invoice_pdf(
         .unwrap_or_default();
 
     let result = ParsedInvoice {
-        invoice_number: parsed.get("invoice_number").and_then(|v| v.as_str()).map(String::from),
-        invoice_date: parsed.get("invoice_date").and_then(|v| v.as_str()).map(String::from),
-        bill_to: parsed.get("bill_to").and_then(|v| v.as_str()).map(String::from),
+        invoice_number: parsed
+            .get("invoice_number")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        invoice_date: parsed
+            .get("invoice_date")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        bill_to: parsed
+            .get("bill_to")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         line_items,
-        subtotal: parsed.get("subtotal").and_then(|v| v.as_str()).map(String::from),
-        tax_rate: parsed.get("tax_rate").and_then(|v| v.as_str()).map(String::from),
-        tax_amount: parsed.get("tax_amount").and_then(|v| v.as_str()).map(String::from),
-        total: parsed.get("total").and_then(|v| v.as_str()).map(String::from),
-        notes: parsed.get("notes").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from),
+        subtotal: parsed
+            .get("subtotal")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        tax_rate: parsed
+            .get("tax_rate")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        tax_amount: parsed
+            .get("tax_amount")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        total: parsed
+            .get("total")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        notes: parsed
+            .get("notes")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from),
     };
 
     Ok(Json(result))
+}
+
+async fn commit_invoice_pdf(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    mut multipart: Multipart,
+) -> Result<
+    (StatusCode, Json<CreateInvoiceFromPdfResponse>),
+    (StatusCode, Json<InvoicePdfCommitErrorResponse>),
+> {
+    let mut pdf_bytes: Option<Vec<u8>> = None;
+    let mut pdf_filename: Option<String> = None;
+    let mut payload: Option<CreateInvoiceFromPdfRequest> = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(InvoicePdfCommitErrorResponse {
+                error_code: "INVALID_MULTIPART".to_string(),
+                message: format!("Multipart error: {e}"),
+                invoice_level_errors: vec![],
+                line_failures: vec![],
+            }),
+        )
+    })? {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "file" => {
+                pdf_filename = Some(field.file_name().unwrap_or("invoice.pdf").to_string());
+                let bytes = field.bytes().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(InvoicePdfCommitErrorResponse {
+                            error_code: "FILE_READ_ERROR".to_string(),
+                            message: format!("Failed to read uploaded file: {e}"),
+                            invoice_level_errors: vec![],
+                            line_failures: vec![],
+                        }),
+                    )
+                })?;
+                pdf_bytes = Some(bytes.to_vec());
+            }
+            "payload" => {
+                let text = field.text().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(InvoicePdfCommitErrorResponse {
+                            error_code: "INVALID_PAYLOAD".to_string(),
+                            message: format!("Failed to read payload: {e}"),
+                            invoice_level_errors: vec![],
+                            line_failures: vec![],
+                        }),
+                    )
+                })?;
+                let parsed_payload: CreateInvoiceFromPdfRequest = serde_json::from_str(&text)
+                    .map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(InvoicePdfCommitErrorResponse {
+                                error_code: "INVALID_PAYLOAD_JSON".to_string(),
+                                message: format!("Invalid payload JSON: {e}"),
+                                invoice_level_errors: vec![],
+                                line_failures: vec![],
+                            }),
+                        )
+                    })?;
+                payload = Some(parsed_payload);
+            }
+            _ => {}
+        }
+    }
+
+    let payload = payload.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(InvoicePdfCommitErrorResponse {
+                error_code: "MISSING_PAYLOAD".to_string(),
+                message: "Missing payload field in multipart request".to_string(),
+                invoice_level_errors: vec![],
+                line_failures: vec![],
+            }),
+        )
+    })?;
+
+    let pdf_data = pdf_bytes.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(InvoicePdfCommitErrorResponse {
+                error_code: "MISSING_FILE".to_string(),
+                message: "Missing file field in multipart request".to_string(),
+                invoice_level_errors: vec![],
+                line_failures: vec![],
+            }),
+        )
+    })?;
+
+    let mut invoice_level_errors: Vec<InvoiceImportValidationError> = Vec::new();
+    let mut line_failures: Vec<InvoiceImportLineFailure> = Vec::new();
+
+    if payload.invoice_number.trim().is_empty() {
+        invoice_level_errors.push(InvoiceImportValidationError {
+            field: "invoice_number".to_string(),
+            code: "REQUIRED".to_string(),
+            message: "Invoice number is required".to_string(),
+        });
+    }
+
+    let invoice_date = match NaiveDate::parse_from_str(&payload.invoice_date, "%Y-%m-%d") {
+        Ok(d) => Some(d),
+        Err(_) => {
+            invoice_level_errors.push(InvoiceImportValidationError {
+                field: "invoice_date".to_string(),
+                code: "INVALID_DATE".to_string(),
+                message: "Invoice date must use YYYY-MM-DD format".to_string(),
+            });
+            None
+        }
+    };
+
+    let subtotal = match parse_decimal_input(&payload.subtotal) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            invoice_level_errors.push(InvoiceImportValidationError {
+                field: "subtotal".to_string(),
+                code: "INVALID_DECIMAL".to_string(),
+                message: format!("Invalid subtotal: {}", payload.subtotal),
+            });
+            None
+        }
+    };
+
+    let tax_rate = match payload.tax_rate.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => match parse_decimal_input(raw) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                invoice_level_errors.push(InvoiceImportValidationError {
+                    field: "tax_rate".to_string(),
+                    code: "INVALID_DECIMAL".to_string(),
+                    message: format!("Invalid tax rate: {raw}"),
+                });
+                None
+            }
+        },
+        _ => None,
+    };
+
+    let existing_items = queries::get_active_items(&state.pool).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(InvoicePdfCommitErrorResponse {
+                error_code: "ITEM_LOOKUP_FAILED".to_string(),
+                message: format!("Failed to validate items: {e}"),
+                invoice_level_errors: vec![],
+                line_failures: vec![],
+            }),
+        )
+    })?;
+    let item_ids: HashSet<Uuid> = existing_items.into_iter().map(|i| i.id).collect();
+
+    let mut resolved_lines: Vec<queries::AtomicInvoicePdfLine> = Vec::new();
+
+    for li in &payload.line_items {
+        if li.item_id.is_none() {
+            line_failures.push(InvoiceImportLineFailure {
+                line_index: li.line_index,
+                code: "ITEM_UNRESOLVED".to_string(),
+                message: "No item mapping provided for line".to_string(),
+                description: Some(li.description.clone()),
+            });
+            continue;
+        }
+
+        let item_id = li.item_id.expect("checked is_some");
+        if !item_ids.contains(&item_id) {
+            line_failures.push(InvoiceImportLineFailure {
+                line_index: li.line_index,
+                code: "ITEM_NOT_FOUND".to_string(),
+                message: "Mapped item does not exist".to_string(),
+                description: Some(li.description.clone()),
+            });
+            continue;
+        }
+
+        if li.qty <= 0 {
+            line_failures.push(InvoiceImportLineFailure {
+                line_index: li.line_index,
+                code: "INVALID_QTY".to_string(),
+                message: format!("Quantity must be positive, got {}", li.qty),
+                description: Some(li.description.clone()),
+            });
+            continue;
+        }
+
+        let invoice_unit_price = match parse_decimal_input(&li.invoice_unit_price) {
+            Ok(v) => v,
+            Err(_) => {
+                line_failures.push(InvoiceImportLineFailure {
+                    line_index: li.line_index,
+                    code: "INVALID_UNIT_PRICE".to_string(),
+                    message: format!("Invalid invoice unit price: {}", li.invoice_unit_price),
+                    description: Some(li.description.clone()),
+                });
+                continue;
+            }
+        };
+
+        if parse_decimal_input(&li.subtotal).is_err() {
+            line_failures.push(InvoiceImportLineFailure {
+                line_index: li.line_index,
+                code: "INVALID_SUBTOTAL".to_string(),
+                message: format!("Invalid line subtotal: {}", li.subtotal),
+                description: Some(li.description.clone()),
+            });
+            continue;
+        }
+
+        resolved_lines.push(queries::AtomicInvoicePdfLine {
+            line_index: li.line_index,
+            item_id,
+            qty: li.qty,
+            invoice_unit_price,
+            description: li.description.clone(),
+        });
+    }
+
+    if !invoice_level_errors.is_empty() || !line_failures.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(InvoicePdfCommitErrorResponse {
+                error_code: "INVOICE_IMPORT_VALIDATION_FAILED".to_string(),
+                message: "Import failed. No data was written.".to_string(),
+                invoice_level_errors,
+                line_failures,
+            }),
+        ));
+    }
+
+    let invoice_date = invoice_date.expect("validated above");
+    let subtotal = subtotal.expect("validated above");
+
+    let result = queries::create_invoice_from_pdf_atomic(
+        &state.pool,
+        queries::AtomicInvoicePdfCreateInput {
+            destination_id: payload.destination_id,
+            invoice_number: payload.invoice_number,
+            invoice_date,
+            subtotal,
+            tax_rate,
+            notes: payload.notes,
+            pdf_data,
+            pdf_filename: pdf_filename.unwrap_or_else(|| "invoice.pdf".to_string()),
+            lines: resolved_lines,
+        },
+        user.user_id,
+    )
+    .await
+    .map_err(|e| match e {
+        queries::AtomicInvoicePdfCreateError::PurchaseInsert {
+            line_index,
+            description,
+            source,
+        } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(InvoicePdfCommitErrorResponse {
+                error_code: "INVOICE_IMPORT_VALIDATION_FAILED".to_string(),
+                message: "Import failed. No data was written.".to_string(),
+                invoice_level_errors: vec![],
+                line_failures: vec![InvoiceImportLineFailure {
+                    line_index,
+                    code: "PURCHASE_CREATE_FAILED".to_string(),
+                    message: source.to_string(),
+                    description: Some(description),
+                }],
+            }),
+        ),
+        queries::AtomicInvoicePdfCreateError::Sql(source) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(InvoicePdfCommitErrorResponse {
+                error_code: "INVOICE_IMPORT_COMMIT_FAILED".to_string(),
+                message: format!("Import failed: {source}"),
+                invoice_level_errors: vec![],
+                line_failures: vec![],
+            }),
+        ),
+    })?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateInvoiceFromPdfResponse {
+            invoice_id: result.invoice.id,
+            purchase_count: result.purchase_count,
+            message: "Invoice import committed atomically.".to_string(),
+        }),
+    ))
 }

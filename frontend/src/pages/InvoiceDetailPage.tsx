@@ -1,4 +1,4 @@
-import { useState, useRef } from "react"
+import { Fragment, useEffect, useState, useRef } from "react"
 import { useParams, useNavigate, Link } from "react-router-dom"
 import { useQueryClient } from "@tanstack/react-query"
 import {
@@ -42,9 +42,9 @@ import {
 import { ExportCsvButton } from "@/components/ExportCsvButton"
 import { StatusSelect } from "@/components/StatusSelect"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
-import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, FileDown, Upload, Loader2 } from "lucide-react"
-import { formatCurrency, formatDate } from "@/lib/utils"
-import { invoices as invoicesApi, receipts as receiptsApi } from "@/api"
+import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, FileDown, Upload, Loader2, ChevronDown, ChevronRight } from "lucide-react"
+import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
+import { ApiError, invoices as invoicesApi, receipts as receiptsApi, purchases as purchasesApi, type PurchaseAllocation, type ReceiptLineItem } from "@/api"
 
 type InvoicePurchase = ReturnType<typeof useInvoicePurchases>["data"] extends (infer T)[] | undefined ? T : never
 
@@ -93,16 +93,25 @@ export default function InvoiceDetailPage() {
   const [editingPurchaseId, setEditingPurchaseId] = useState<string | null>(null)
   const [itemId, setItemId] = useState("")
   const [quantity, setQuantity] = useState("1")
-  const [purchaseCost, setPurchaseCost] = useState("")
   const [invoiceUnitPrice, setInvoiceUnitPrice] = useState("")
   const [destinationId, setDestinationId] = useState("")
-  const [receiptId, setReceiptId] = useState("")
   const [notes, setNotes] = useState("")
 
   // Receipt-link dialog (focused, not the full edit form)
   const [linkDialogOpen, setLinkDialogOpen] = useState(false)
   const [linkingPurchaseId, setLinkingPurchaseId] = useState<string | null>(null)
-  const [linkReceiptId, setLinkReceiptId] = useState("")
+  const [linkingPurchase, setLinkingPurchase] = useState<InvoicePurchase | null>(null)
+  const [allocations, setAllocations] = useState<PurchaseAllocation[]>([])
+  const [allocationsByPurchase, setAllocationsByPurchase] = useState<Record<string, PurchaseAllocation[]>>({})
+  const [loadingAllocations, setLoadingAllocations] = useState(false)
+  const [allocationError, setAllocationError] = useState("")
+  const [allocationWarning, setAllocationWarning] = useState("")
+  const [editingAllocationId, setEditingAllocationId] = useState<string | null>(null)
+  const [allocationReceiptId, setAllocationReceiptId] = useState("")
+  const [allocationReceiptLineItemId, setAllocationReceiptLineItemId] = useState("")
+  const [allocationReceiptLineItems, setAllocationReceiptLineItems] = useState<ReceiptLineItem[]>([])
+  const [allocationQty, setAllocationQty] = useState("1")
+  const [allocationUnitCost, setAllocationUnitCost] = useState("")
   const [showNewReceipt, setShowNewReceipt] = useState(false)
   const [newRcptVendorId, setNewRcptVendorId] = useState("")
   const [newRcptNumber, setNewRcptNumber] = useState("")
@@ -110,21 +119,109 @@ export default function InvoiceDetailPage() {
   const [newRcptSubtotal, setNewRcptSubtotal] = useState("")
   const [newRcptTaxAmount, setNewRcptTaxAmount] = useState("")
   const [newRcptFile, setNewRcptFile] = useState<File | null>(null)
-  const [linkQuantity, setLinkQuantity] = useState("1")
-  const [linkingPurchase, setLinkingPurchase] = useState<InvoicePurchase | null>(null)
   const [linkNotes, setLinkNotes] = useState("")
-  const [confirmSplit, setConfirmSplit] = useState(false)
+  const [expandedAllocations, setExpandedAllocations] = useState<Record<string, boolean>>({})
+  const [allocationApiUnavailable, setAllocationApiUnavailable] = useState(false)
+
+  const buildLegacyAllocations = (purchase: InvoicePurchase): PurchaseAllocation[] => {
+    if (!purchase.receipt_id) return []
+    const receipt = receipts.find((r) => r.id === purchase.receipt_id)
+    return [{
+      id: `legacy-${purchase.purchase_id}`,
+      purchase_id: purchase.purchase_id,
+      receipt_id: purchase.receipt_id,
+      receipt_line_item_id: null,
+      item_id: purchase.item_id,
+      item_name: purchase.item_name,
+      allocated_qty: purchase.quantity,
+      unit_cost: purchase.purchase_cost || "0",
+      receipt_number: purchase.receipt_number || receipt?.receipt_number || "linked",
+      vendor_name: purchase.vendor_name || receipt?.vendor_name || "Unknown vendor",
+      receipt_date: receipt?.receipt_date || purchase.purchase_date,
+      created_at: purchase.purchase_date,
+      updated_at: purchase.purchase_date,
+    }]
+  }
+
+  const getEffectiveAllocations = (purchase: InvoicePurchase): PurchaseAllocation[] => {
+    const rows = allocationsByPurchase[purchase.purchase_id] || []
+    if (rows.length > 0) return rows
+    return buildLegacyAllocations(purchase)
+  }
+
+  const getDisplayPurchaseCosts = (purchase: InvoicePurchase) => {
+    const allocs = getEffectiveAllocations(purchase)
+    const allocatedQty = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
+    const allocatedTotalCost = allocs.reduce(
+      (sum, a) => sum + Number.parseFloat(a.unit_cost || "0") * a.allocated_qty,
+      0
+    )
+
+    if (allocs.length > 0 && allocatedQty === purchase.quantity && allocatedQty > 0) {
+      return {
+        unitCost: allocatedTotalCost / allocatedQty,
+      }
+    }
+
+    return {
+      unitCost: Number.parseFloat(purchase.purchase_cost || "0"),
+    }
+  }
+
+  useEffect(() => {
+    const load = async () => {
+      if (!purchases.length) {
+        setAllocationsByPurchase({})
+        return
+      }
+      try {
+        const entries = await Promise.all(
+          purchases.map(async (p) => {
+            try {
+              const rows = await purchasesApi.allocations.list(p.purchase_id)
+              return [p.purchase_id, rows] as const
+            } catch (err) {
+              if (err instanceof ApiError && err.status === 404) {
+                setAllocationApiUnavailable(true)
+                return [p.purchase_id, []] as const
+              }
+              throw err
+            }
+          })
+        )
+        setAllocationsByPurchase(Object.fromEntries(entries))
+      } catch (err) {
+        alert(err instanceof Error ? err.message : "Failed to load receipt allocations")
+      }
+    }
+
+    load()
+  }, [purchases])
+
+  const resetAllocationForm = () => {
+    setEditingAllocationId(null)
+    setAllocationReceiptId("")
+    setAllocationReceiptLineItemId("")
+    setAllocationReceiptLineItems([])
+    setAllocationQty("1")
+    setAllocationUnitCost("")
+    setAllocationError("")
+    setAllocationWarning("")
+  }
 
   const openLinkDialog = (purchase: InvoicePurchase) => {
     setLinkingPurchaseId(purchase.purchase_id)
     setLinkingPurchase(purchase)
-    setLinkReceiptId(purchase.receipt_id || "")
     setLinkNotes(purchase.notes || "")
-    setLinkQuantity(String(purchase.quantity))
+    setLoadingAllocations(true)
+    const existing = getEffectiveAllocations(purchase)
+    setAllocations(existing)
+    resetAllocationForm()
+    setAllocationUnitCost("")
     setShowNewReceipt(false)
     setNewRcptFile(null)
-    setConfirmSplit(false)
     setLinkDialogOpen(true)
+    setLoadingAllocations(false)
   }
 
   const resetNewReceiptForm = () => {
@@ -134,84 +231,171 @@ export default function InvoiceDetailPage() {
     setNewRcptSubtotal("")
     setNewRcptTaxAmount("")
     setNewRcptFile(null)
-    setLinkQuantity("1")
-    setConfirmSplit(false)
   }
 
-  const resolveDestinationIdForPurchase = (purchase: InvoicePurchase): string | undefined => {
-    const byCode = destinations.find((d) => d.code === purchase.destination_code)
-    return byCode?.id || invoice?.destination_id || undefined
-  }
-
-  const ensureReceiptItemCapacity = async (receiptIdToAssign: string, selectedQty: number) => {
-    if (!linkingPurchase) return
-
-    const isSameReceipt = linkingPurchase.receipt_id === receiptIdToAssign
-    if (isSameReceipt) return
-
-    const receiptLines = await receiptsApi.purchases(receiptIdToAssign)
-    const availableQtyForItem = receiptLines
-      .filter((line) => line.item_id === linkingPurchase.item_id && !line.invoice_id)
-      .reduce((sum, line) => sum + line.quantity, 0)
-
-    if (selectedQty > availableQtyForItem) {
-      throw new Error(`Only ${availableQtyForItem} unallocated unit(s) of this item remain on the selected receipt.`)
-    }
-  }
-
-  const applyReceiptAllocation = async (receiptIdToAssign?: string) => {
-    if (!linkingPurchaseId || !linkingPurchase) return
-
-    const parsedQty = parseInt(linkQuantity, 10)
-    const selectedQty = Number.isNaN(parsedQty) ? 1 : parsedQty
-
-    if (selectedQty <= 0 || selectedQty > linkingPurchase.quantity) {
-      alert(`Quantity must be between 1 and ${linkingPurchase.quantity}`)
-      return
-    }
-
-    if (!receiptIdToAssign && selectedQty < linkingPurchase.quantity) {
-      alert("Choose a receipt when splitting quantity.")
-      return
-    }
-
-    if (receiptIdToAssign) {
-      try {
-        await ensureReceiptItemCapacity(receiptIdToAssign, selectedQty)
-      } catch (err) {
-        alert(err instanceof Error ? err.message : "Selected receipt does not have enough available quantity for this item.")
-        return
+  const reloadAllocations = async (purchaseId: string) => {
+    setLoadingAllocations(true)
+    let rows: PurchaseAllocation[] = []
+    try {
+      rows = await purchasesApi.allocations.list(purchaseId)
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) {
+        setAllocationApiUnavailable(true)
+        rows = []
+      } else {
+        setLoadingAllocations(false)
+        throw err
       }
     }
+    setAllocations(rows)
+    setAllocationsByPurchase(prev => ({ ...prev, [purchaseId]: rows }))
+    setLoadingAllocations(false)
+  }
 
-    if (selectedQty === linkingPurchase.quantity) {
-      await updatePurchase.mutateAsync({
-        id: linkingPurchaseId,
-        receipt_id: receiptIdToAssign || undefined,
-        clear_receipt: !receiptIdToAssign,
-        notes: linkNotes || undefined,
-      })
+  const loadReceiptLineItemsForAllocation = async (receiptId: string, purchase: InvoicePurchase) => {
+    const rows = await receiptsApi.lineItems.list(receiptId)
+    const sameItemRows = rows.filter((row) => row.item_id === purchase.item_id)
+    setAllocationReceiptLineItems(sameItemRows)
+
+    if (sameItemRows.length === 0) {
+      setAllocationReceiptLineItemId("")
+      setAllocationUnitCost("")
+      setAllocationWarning("Selected receipt has no line item for this product. Use Edit Receipt.")
       return
     }
 
-    const remainingQty = linkingPurchase.quantity - selectedQty
+    const candidate = sameItemRows[0]
+    setAllocationReceiptLineItemId(candidate.id)
+    setAllocationUnitCost(Number.parseFloat(candidate.unit_cost).toFixed(2))
+    setAllocationWarning("")
+  }
 
-    await updatePurchase.mutateAsync({
-      id: linkingPurchaseId,
-      quantity: remainingQty,
-    })
+  const handleAllocationReceiptChange = async (value: string) => {
+    const selectedReceiptId = value === "__none__" ? "" : value
+    setAllocationReceiptId(selectedReceiptId)
+    setAllocationReceiptLineItemId("")
+    setAllocationReceiptLineItems([])
+    setAllocationWarning("")
+    setAllocationError("")
 
-    await createPurchase.mutateAsync({
-      item_id: linkingPurchase.item_id,
-      quantity: selectedQty,
-      purchase_cost: linkingPurchase.purchase_cost,
-      invoice_unit_price: linkingPurchase.invoice_unit_price || undefined,
-      destination_id: resolveDestinationIdForPurchase(linkingPurchase),
-      receipt_id: receiptIdToAssign,
-      invoice_id: id,
-      status: linkingPurchase.status,
-      notes: linkNotes || linkingPurchase.notes || undefined,
-    })
+    if (!selectedReceiptId || !linkingPurchase) return
+
+    try {
+      await loadReceiptLineItemsForAllocation(selectedReceiptId, linkingPurchase)
+    } catch {
+      setAllocationUnitCost("")
+      setAllocationWarning("Could not read receipt line items for this receipt.")
+    }
+  }
+
+  const handleAllocationReceiptLineItemChange = (value: string) => {
+    const selectedId = value === "__none__" ? "" : value
+    setAllocationReceiptLineItemId(selectedId)
+    setAllocationWarning("")
+    setAllocationError("")
+
+    if (!selectedId) {
+      setAllocationUnitCost("")
+      return
+    }
+
+    const line = allocationReceiptLineItems.find((row) => row.id === selectedId)
+    if (!line) {
+      setAllocationUnitCost("")
+      return
+    }
+
+    setAllocationUnitCost(Number.parseFloat(line.unit_cost).toFixed(2))
+
+    const requestedQty = Number.parseInt(allocationQty || "0", 10)
+    if (requestedQty > line.remaining_qty) {
+      setAllocationWarning(`Requested qty (${requestedQty}) exceeds remaining receipt qty (${line.remaining_qty}).`)
+    }
+  }
+
+  const handleSaveAllocation = async () => {
+    if (!linkingPurchaseId || !linkingPurchase) return
+
+    const qty = Number.parseInt(allocationQty || "0", 10)
+    let unitCost = allocationUnitCost.trim()
+    if (!allocationReceiptId) {
+      setAllocationError("Select a receipt")
+      return
+    }
+    if (!qty || qty <= 0) {
+      setAllocationError("Allocated quantity must be greater than zero")
+      return
+    }
+    if (!allocationReceiptLineItemId) {
+      setAllocationError("Select a receipt line item before allocating.")
+      return
+    }
+
+    const selectedLineItem = allocationReceiptLineItems.find((row) => row.id === allocationReceiptLineItemId)
+    if (!selectedLineItem) {
+      setAllocationError("Selected receipt line item is unavailable. Reload and try again.")
+      return
+    }
+
+    if (qty > selectedLineItem.remaining_qty) {
+      setAllocationError(`Allocated qty (${qty}) exceeds remaining receipt qty (${selectedLineItem.remaining_qty}).`)
+      return
+    }
+
+    if (!selectedLineItem.unit_cost) {
+      setAllocationError("Unit cost must come from receipt line items. Use Edit Receipt to set it.")
+      return
+    }
+
+    unitCost = Number.parseFloat(selectedLineItem.unit_cost).toFixed(2)
+    setAllocationUnitCost(unitCost)
+
+    const usedByOther = allocations
+      .filter(a => a.id !== editingAllocationId)
+      .reduce((sum, a) => sum + a.allocated_qty, 0)
+    if (usedByOther + qty > linkingPurchase.quantity) {
+      setAllocationError(`Allocated qty exceeds line quantity (${usedByOther + qty}/${linkingPurchase.quantity})`)
+      return
+    }
+
+    try {
+      if (editingAllocationId) {
+        await purchasesApi.allocations.update(linkingPurchaseId, editingAllocationId, {
+          receipt_line_item_id: allocationReceiptLineItemId,
+          allocated_qty: qty,
+        })
+      } else {
+        await purchasesApi.allocations.create(linkingPurchaseId, {
+          receipt_line_item_id: allocationReceiptLineItemId,
+          allocated_qty: qty,
+        })
+      }
+
+      await updatePurchase.mutateAsync({
+        id: linkingPurchaseId,
+        notes: linkNotes || undefined,
+      })
+
+      await reloadAllocations(linkingPurchaseId)
+      resetAllocationForm()
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      queryClient.invalidateQueries({ queryKey: ["receipts"] })
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) {
+        setAllocationApiUnavailable(true)
+        setAllocationError("Allocation API is unavailable on this backend instance. Please restart backend and retry.")
+        return
+      }
+      setAllocationError(err instanceof Error ? err.message : "Failed to save allocation")
+    }
+  }
+
+  const handleDeleteAllocation = async (allocationId: string) => {
+    if (!linkingPurchaseId) return
+    await purchasesApi.allocations.delete(linkingPurchaseId, allocationId)
+    await reloadAllocations(linkingPurchaseId)
+    queryClient.invalidateQueries({ queryKey: ["invoices"] })
+    queryClient.invalidateQueries({ queryKey: ["receipts"] })
   }
 
   const handleCreateAndLink = async (e: React.FormEvent) => {
@@ -225,34 +409,25 @@ export default function InvoiceDetailPage() {
       tax_amount: newRcptTaxAmount,
     })
     await receiptsApi.uploadPdf(newReceipt.id, newRcptFile!)
-    await applyReceiptAllocation(newReceipt.id)
+    setAllocationReceiptId(newReceipt.id)
+    await reloadAllocations(linkingPurchaseId)
+    if (linkingPurchase) {
+      const remaining = Math.max(1, linkingPurchase.quantity - totalAllocatedQty)
+      setAllocationQty(String(remaining))
+    }
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
     queryClient.invalidateQueries({ queryKey: ["receipts"] })
-    setLinkDialogOpen(false)
+    setShowNewReceipt(false)
     resetNewReceiptForm()
   }
 
-  const handleLinkReceipt = async () => {
-    if (!linkingPurchaseId) return
-    await applyReceiptAllocation(linkReceiptId || undefined)
-    queryClient.invalidateQueries({ queryKey: ["invoices"] })
-    queryClient.invalidateQueries({ queryKey: ["receipts"] })
-    setConfirmSplit(false)
-    setLinkDialogOpen(false)
-  }
+  const totalAllocatedQty = allocations.reduce((sum, a) => sum + a.allocated_qty, 0)
 
-  const handleSaveLinkFlow = async () => {
-    if (!linkingPurchase) return
-
-    const parsedQty = parseInt(linkQuantity, 10)
-    const selectedQty = Number.isNaN(parsedQty) ? 1 : parsedQty
-
-    if (selectedQty < linkingPurchase.quantity && !confirmSplit) {
-      setConfirmSplit(true)
-      return
-    }
-
-    await handleLinkReceipt()
+  const toggleAllocationDrilldown = (purchaseId: string) => {
+    setExpandedAllocations((prev) => ({
+      ...prev,
+      [purchaseId]: !prev[purchaseId],
+    }))
   }
 
   // Show all items (no vendor filtering needed for outgoing invoices)
@@ -265,11 +440,8 @@ export default function InvoiceDetailPage() {
         id: editingPurchaseId,
         item_id: itemId,
         quantity: parseInt(quantity),
-        purchase_cost: purchaseCost,
         invoice_unit_price: invoiceUnitPrice || undefined,
         destination_id: destinationId || undefined,
-        receipt_id: receiptId || undefined,
-        clear_receipt: !receiptId,
         invoice_id: id,
         notes: notes || undefined,
       })
@@ -277,10 +449,9 @@ export default function InvoiceDetailPage() {
       await createPurchase.mutateAsync({
         item_id: itemId,
         quantity: parseInt(quantity),
-        purchase_cost: purchaseCost,
+        purchase_cost: "0",
         invoice_unit_price: invoiceUnitPrice || undefined,
         destination_id: destinationId || undefined,
-        receipt_id: receiptId || undefined,
         invoice_id: id,
         notes: notes || undefined,
       })
@@ -296,10 +467,8 @@ export default function InvoiceDetailPage() {
     setEditingPurchaseId(null)
     setItemId("")
     setQuantity("1")
-    setPurchaseCost("")
     setInvoiceUnitPrice("")
     setDestinationId("")
-    setReceiptId("")
     setNotes("")
   }
 
@@ -322,13 +491,11 @@ export default function InvoiceDetailPage() {
     const matchedItem = items.find((i) => i.name === p.item_name)
     setItemId(matchedItem?.id || "")
     setQuantity(String(p.quantity))
-    setPurchaseCost(p.purchase_cost)
-    setInvoiceUnitPrice(p.invoice_unit_price || "")
+    setInvoiceUnitPrice(p.invoice_unit_price ? Number.parseFloat(p.invoice_unit_price).toFixed(2) : "")
     // Find destination by code
     const matchedDest = destinations.find((d) => d.code === p.destination_code)
     setDestinationId(matchedDest?.id || "")
-    setReceiptId(p.receipt_id || "")
-    setNotes("")
+    setNotes(p.notes || "")
     setIsOpen(true)
   }
 
@@ -473,7 +640,7 @@ export default function InvoiceDetailPage() {
             <p className="text-sm text-muted-foreground">Subtotal (pre-tax)</p>
             <p className="text-2xl font-bold">{formatCurrency(invoice.subtotal)}</p>
             <p className="text-xs text-muted-foreground mt-1">
-              +{invoice.tax_rate}% tax = {formatCurrency(invoice.total)}
+              +{formatNumber(invoice.tax_rate)}% tax = {formatCurrency(invoice.total)}
             </p>
           </CardContent>
         </Card>
@@ -582,19 +749,7 @@ export default function InvoiceDetailPage() {
                         required
                       />
                     </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="purchaseCost">Purchase Cost *</Label>
-                      <Input
-                        id="purchaseCost"
-                        type="number"
-                        step="0.01"
-                        value={purchaseCost}
-                        onChange={(e) => setPurchaseCost(e.target.value)}
-                        placeholder="Your cost"
-                        required
-                      />
-                    </div>
-                    <div className="space-y-2">
+                    <div className="space-y-2 col-span-2">
                       <Label htmlFor="invoiceUnitPrice">Invoice Unit Price</Label>
                       <Input
                         id="invoiceUnitPrice"
@@ -605,6 +760,9 @@ export default function InvoiceDetailPage() {
                         placeholder="Invoice unit price"
                       />
                     </div>
+                  </div>
+                  <div className="text-xs text-muted-foreground bg-muted p-3 rounded-md">
+                    Stage 1 (invoice line): quantity and invoice price only. Purchase cost is assigned during receipt allocation (Stage 2).
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="destination">Destination</Label>
@@ -629,27 +787,6 @@ export default function InvoiceDetailPage() {
                       onChange={(e) => setNotes(e.target.value)}
                       placeholder="Any notes..."
                     />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="receipt">Receipt</Label>
-                    <Select
-                      value={receiptId || "__none__"}
-                      onValueChange={(v) => setReceiptId(v === "__none__" ? "" : v)}
-                    >
-                      <SelectTrigger>
-                        <SelectValue placeholder="Select receipt" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="__none__">
-                          <span className="text-muted-foreground">— No receipt</span>
-                        </SelectItem>
-                        {receipts.map((r) => (
-                          <SelectItem key={r.id} value={r.id}>
-                            {r.receipt_number} - {r.vendor_name} ({formatCurrency(r.total)})
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
                   </div>
                   {/* Live reconciliation hint */}
                   {invoiceUnitPrice && quantity && (
@@ -700,76 +837,144 @@ export default function InvoiceDetailPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {purchases.map((p) => (
-                  <TableRow key={p.purchase_id}>
-                    <TableCell className="font-medium">
-                      <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
-                        {p.item_name}
-                      </Link>
-                    </TableCell>
-                    <TableCell className="font-mono">{p.destination_code || "-"}</TableCell>
-                    <TableCell>
-                      {p.receipt_id ? (
-                        <div className="space-y-1">
-                          <Link
-                            to={`/receipts/${p.receipt_id}`}
-                            className="text-xs font-mono text-emerald-600 hover:underline block"
-                          >
-                            {p.receipt_number || "linked"}
+                {purchases.map((p) => {
+                  const allocs = getEffectiveAllocations(p)
+                  const allocated = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
+                  const isPartiallyAllocated = allocated > 0 && allocated < p.quantity
+                  const isExpanded = isPartiallyAllocated || !!expandedAllocations[p.purchase_id]
+                  const displayCosts = getDisplayPurchaseCosts(p)
+
+                  return (
+                    <Fragment key={p.purchase_id}>
+                      <TableRow>
+                        <TableCell className="font-medium">
+                          <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
+                            {p.item_name}
                           </Link>
-                          <button
-                            onClick={() => openLinkDialog(p)}
-                            className="text-[11px] text-muted-foreground hover:underline"
-                            title="Change receipt link or split quantity"
-                          >
-                            split / change
-                          </button>
-                        </div>
-                      ) : (
-                        <button
-                          onClick={() => openLinkDialog(p)}
-                          className="text-red-500 text-xs flex items-center gap-1 hover:underline cursor-pointer"
-                          title="Click to link a receipt"
-                        >
-                          <AlertCircle className="h-3 w-3" />
-                          unlinked
-                        </button>
+                        </TableCell>
+                        <TableCell className="font-mono">{p.destination_code || "-"}</TableCell>
+                        <TableCell>
+                          {allocs.length > 0 ? (
+                            <div className="space-y-1">
+                              <div className="text-xs text-emerald-700 font-medium">{allocated}/{p.quantity} allocated</div>
+                              <div className="text-[11px] text-muted-foreground">{allocs.length} receipt link{allocs.length > 1 ? "s" : ""}</div>
+                              <div className="flex items-center gap-3">
+                                {isPartiallyAllocated ? (
+                                  <span className="text-[11px] text-amber-700 inline-flex items-center gap-1">
+                                    <ChevronDown className="h-3 w-3" />
+                                    partially allocated (auto-expanded)
+                                  </span>
+                                ) : (
+                                  <button
+                                    onClick={() => toggleAllocationDrilldown(p.purchase_id)}
+                                    className="text-[11px] text-primary hover:underline inline-flex items-center gap-1"
+                                    title="Show allocation breakdown"
+                                  >
+                                    {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                                    {isExpanded ? "hide breakdown" : "view breakdown"}
+                                  </button>
+                                )}
+                                <button
+                                  onClick={() => openLinkDialog(p)}
+                                  className="text-[11px] text-muted-foreground hover:underline"
+                                  title="Manage allocations"
+                                >
+                                  manage allocations
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => openLinkDialog(p)}
+                              className="text-red-500 text-xs flex items-center gap-1 hover:underline cursor-pointer"
+                              title="Click to allocate to receipts"
+                            >
+                              <AlertCircle className="h-3 w-3" />
+                              unallocated
+                            </button>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right">{p.quantity}</TableCell>
+                        <TableCell className="text-right text-muted-foreground">{formatCurrency(displayCosts.unitCost)}</TableCell>
+                        <TableCell className="text-right">{p.invoice_unit_price ? formatCurrency(p.invoice_unit_price) : "-"}</TableCell>
+                        <TableCell className="text-right">{p.total_selling ? formatCurrency(p.total_selling) : formatCurrency(p.total_cost)}</TableCell>
+                        <TableCell className={`text-right ${p.total_commission ? (parseFloat(p.total_commission) >= 0 ? "text-green-600" : "text-red-600") : "text-muted-foreground"}`}>
+                          {p.total_commission ? formatCurrency(p.total_commission) : "—"}
+                        </TableCell>
+                        <TableCell>
+                          <StatusSelect
+                            value={p.status}
+                            onValueChange={(value) => handleStatusChange(p.purchase_id, value)}
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex gap-1">
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              onClick={() => handleEditPurchase(p)}
+                            >
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="text-red-600"
+                              onClick={() => handleDeletePurchase(p.purchase_id)}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+
+                      {isExpanded && (
+                        <TableRow>
+                          <TableCell colSpan={10} className="bg-muted/30 py-3">
+                            <div className="space-y-2">
+                              <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                                Allocation Breakdown
+                              </div>
+                              <div className="border rounded-md bg-background overflow-hidden">
+                                <Table>
+                                  <TableHeader>
+                                    <TableRow>
+                                      <TableHead>Receipt</TableHead>
+                                      <TableHead>Vendor</TableHead>
+                                      <TableHead>Date</TableHead>
+                                      <TableHead className="text-right">Qty</TableHead>
+                                      <TableHead className="text-right">Unit Cost</TableHead>
+                                      <TableHead className="text-right">Allocated Total</TableHead>
+                                    </TableRow>
+                                  </TableHeader>
+                                  <TableBody>
+                                    {allocs.map((a) => (
+                                      <TableRow key={a.id}>
+                                        <TableCell>
+                                          <Link to={`/receipts/${a.receipt_id}`} className="text-primary hover:underline font-mono text-xs">
+                                            {a.receipt_number}
+                                          </Link>
+                                        </TableCell>
+                                        <TableCell>{a.vendor_name}</TableCell>
+                                        <TableCell>{formatDate(a.receipt_date)}</TableCell>
+                                        <TableCell className="text-right">{a.allocated_qty}</TableCell>
+                                        <TableCell className="text-right">{formatCurrency(a.unit_cost)}</TableCell>
+                                        <TableCell className="text-right">{formatCurrency(Number(a.unit_cost) * a.allocated_qty)}</TableCell>
+                                      </TableRow>
+                                    ))}
+                                  </TableBody>
+                                </Table>
+                              </div>
+                              <div className="text-xs text-muted-foreground">
+                                Total allocated on this line: {allocated}/{p.quantity} units
+                              </div>
+                            </div>
+                          </TableCell>
+                        </TableRow>
                       )}
-                    </TableCell>
-                    <TableCell className="text-right">{p.quantity}</TableCell>
-                    <TableCell className="text-right text-muted-foreground">{formatCurrency(p.purchase_cost)}</TableCell>
-                    <TableCell className="text-right">{p.invoice_unit_price ? formatCurrency(p.invoice_unit_price) : "-"}</TableCell>
-                    <TableCell className="text-right">{p.total_selling ? formatCurrency(p.total_selling) : formatCurrency(p.total_cost)}</TableCell>
-                    <TableCell className={`text-right ${p.total_commission ? (parseFloat(p.total_commission) >= 0 ? "text-green-600" : "text-red-600") : "text-muted-foreground"}`}>
-                      {p.total_commission ? formatCurrency(p.total_commission) : "—"}
-                    </TableCell>
-                    <TableCell>
-                      <StatusSelect
-                        value={p.status}
-                        onValueChange={(value) => handleStatusChange(p.purchase_id, value)}
-                      />
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex gap-1">
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          onClick={() => handleEditPurchase(p)}
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="text-red-600"
-                          onClick={() => handleDeletePurchase(p.purchase_id)}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                    </Fragment>
+                  )
+                })}
                 {purchases.length === 0 && (
                   <EmptyTableRow colSpan={10}>
                     <div className="flex flex-col items-center gap-2 py-4">
@@ -783,6 +988,11 @@ export default function InvoiceDetailPage() {
             </Table>
           )}
         </CardContent>
+            {allocationApiUnavailable && (
+              <div className="mb-4 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                Allocation endpoints are unavailable on this backend session (404). Showing legacy receipt links where present.
+              </div>
+            )}
       </Card>
 
       {/* Focused Receipt Link Dialog */}
@@ -792,6 +1002,8 @@ export default function InvoiceDetailPage() {
           setShowNewReceipt(false)
           setLinkingPurchase(null)
           setLinkingPurchaseId(null)
+          setAllocations([])
+          resetAllocationForm()
           resetNewReceiptForm()
         }
       }}>
@@ -867,15 +1079,79 @@ export default function InvoiceDetailPage() {
                 <div className="text-muted-foreground">
                   Available quantity to allocate: {linkingPurchase?.quantity ?? 0}
                 </div>
+                <div className="text-muted-foreground">
+                  Already allocated: {totalAllocatedQty}
+                </div>
               </div>
+
+              {allocationError && (
+                <div className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-700">
+                  {allocationError}
+                </div>
+              )}
+
+              {allocationWarning && (
+                <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-700">
+                  {allocationWarning}
+                </div>
+              )}
+
+              {loadingAllocations ? (
+                <p className="text-sm text-muted-foreground">Loading allocations...</p>
+              ) : allocations.length > 0 ? (
+                <div className="space-y-2">
+                  <Label>Current Allocations</Label>
+                  <div className="border rounded-md divide-y">
+                    {allocations.map((a) => (
+                      <div key={a.id} className="p-3 text-sm flex items-center justify-between gap-2">
+                        <div>
+                          <div className="font-medium">{a.receipt_number} - {a.vendor_name}</div>
+                          <div className="text-muted-foreground">Qty {a.allocated_qty} × {formatCurrency(a.unit_cost)}</div>
+                        </div>
+                        <div className="flex gap-1">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={async () => {
+                              setEditingAllocationId(a.id)
+                              setAllocationReceiptId(a.receipt_id)
+                              setAllocationQty(String(a.allocated_qty))
+                              setAllocationUnitCost(Number.parseFloat(a.unit_cost).toFixed(2))
+                              if (linkingPurchase) {
+                                await loadReceiptLineItemsForAllocation(a.receipt_id, linkingPurchase)
+                              }
+                              if (a.receipt_line_item_id) {
+                                setAllocationReceiptLineItemId(a.receipt_line_item_id)
+                              }
+                              setAllocationError("")
+                            }}
+                          >
+                            Edit
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            className="text-red-600"
+                            onClick={() => handleDeleteAllocation(a.id)}
+                          >
+                            Remove
+                          </Button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">No allocations yet.</p>
+              )}
+
               <div className="space-y-2">
                 <Label>Receipt</Label>
                 <Select
-                  value={linkReceiptId || "__none__"}
-                  onValueChange={(v) => {
-                    setLinkReceiptId(v === "__none__" ? "" : v)
-                    setConfirmSplit(false)
-                  }}
+                  value={allocationReceiptId || "__none__"}
+                  onValueChange={handleAllocationReceiptChange}
                 >
                   <SelectTrigger className="w-full min-w-0">
                     <SelectValue placeholder="Select receipt" />
@@ -899,51 +1175,81 @@ export default function InvoiceDetailPage() {
                   type="number"
                   min={1}
                   max={linkingPurchase?.quantity || 1}
-                  value={linkQuantity}
-                  onChange={(e) => {
-                    setLinkQuantity(e.target.value)
-                    setConfirmSplit(false)
-                  }}
+                  value={allocationQty}
+                  onChange={(e) => setAllocationQty(e.target.value)}
                 />
-                <p className="text-xs text-muted-foreground">
-                  If less than total quantity, this line will be split so you can link to multiple receipts.
-                </p>
               </div>
-              {confirmSplit && linkingPurchase && parseInt(linkQuantity || "0", 10) < linkingPurchase.quantity && (
-                <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
-                  <p className="font-medium">Split confirmation</p>
-                  <p>
-                    This will split the current line into <strong>{linkQuantity}</strong> linked now and{" "}
-                    <strong>{linkingPurchase.quantity - parseInt(linkQuantity || "0", 10)}</strong> remaining.
-                  </p>
-                </div>
-              )}
+              <div className="space-y-2">
+                <Label>Receipt Line Item *</Label>
+                <Select
+                  value={allocationReceiptLineItemId || "__none__"}
+                  onValueChange={handleAllocationReceiptLineItemChange}
+                  disabled={!allocationReceiptId}
+                >
+                  <SelectTrigger className="w-full min-w-0">
+                    <SelectValue placeholder={allocationReceiptId ? "Select receipt line item" : "Select receipt first"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">
+                      <span className="text-muted-foreground">— No line item selected</span>
+                    </SelectItem>
+                    {allocationReceiptLineItems.map((line) => (
+                      <SelectItem key={line.id} value={line.id}>
+                        {line.item_name} · {line.remaining_qty}/{line.quantity} remaining @ {formatCurrency(line.unit_cost)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Unit Cost *</Label>
+                <Input
+                  className="w-full min-w-0"
+                  type="number"
+                  step="0.01"
+                  value={allocationUnitCost}
+                  readOnly
+                />
+                <p className="text-xs text-muted-foreground">Derived from receipt line items. Edit in receipt if correction is needed.</p>
+              </div>
               <div className="space-y-2">
                 <Label>Notes</Label>
                 <Input className="w-full min-w-0" value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
               </div>
               <div className="flex justify-between">
-                <Button
-                  variant="link"
-                  className="px-0 text-emerald-600"
-                  onClick={() => setShowNewReceipt(true)}
-                >
-                  <Plus className="h-4 w-4 mr-1" />
-                  New Receipt
-                </Button>
+                <div className="flex items-center gap-3">
+                  <Button
+                    variant="link"
+                    className="px-0 text-emerald-600"
+                    onClick={() => setShowNewReceipt(true)}
+                  >
+                    <Plus className="h-4 w-4 mr-1" />
+                    New Receipt
+                  </Button>
+                  {allocationReceiptId && (
+                    <Button
+                      type="button"
+                      variant="link"
+                      className="px-0"
+                      onClick={() => navigate(`/receipts/${allocationReceiptId}`)}
+                    >
+                      Edit Receipt
+                    </Button>
+                  )}
+                </div>
                 <div className="flex gap-2">
-                  {confirmSplit && (
-                    <Button variant="outline" onClick={() => setConfirmSplit(false)}>
-                      Back
+                  {editingAllocationId && (
+                    <Button variant="outline" onClick={resetAllocationForm}>
+                      Reset
                     </Button>
                   )}
                   <Button variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
-                  <Button onClick={handleSaveLinkFlow} disabled={updatePurchase.isPending || createPurchase.isPending}>
-                    {updatePurchase.isPending || createPurchase.isPending
+                  <Button onClick={handleSaveAllocation} disabled={updatePurchase.isPending || createReceipt.isPending}>
+                    {updatePurchase.isPending || createReceipt.isPending
                       ? "Saving..."
-                      : confirmSplit
-                        ? "Confirm Split & Save"
-                        : "Save"}
+                      : editingAllocationId
+                        ? "Update Allocation"
+                        : "Add Allocation"}
                   </Button>
                 </div>
               </div>

@@ -26,8 +26,9 @@ async fn main() -> Result<()> {
         .init();
 
     // Get database URL from environment
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://bg_tracker:bg_tracker_dev@localhost:5432/bg_tracker".to_string());
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://bg_tracker:bg_tracker_dev@localhost:5432/bg_tracker".to_string()
+    });
 
     // Create database connection pool
     let pool = PgPoolOptions::new()

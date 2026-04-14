@@ -54,7 +54,10 @@ async fn login(
         .ok_or((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()))?;
 
     if !user.is_active {
-        return Err((StatusCode::UNAUTHORIZED, "User account is disabled".to_string()));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "User account is disabled".to_string(),
+        ));
     }
 
     let is_valid = verify_password(&req.password, &user.password_hash)

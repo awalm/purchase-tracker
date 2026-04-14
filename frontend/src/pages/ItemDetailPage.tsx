@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { Fragment, useEffect, useState } from "react"
 import { useParams, useNavigate, Link } from "react-router-dom"
 import { useQueryClient } from "@tanstack/react-query"
 import {
@@ -39,9 +39,9 @@ import {
 } from "@/components/ui/select"
 import { ExportCsvButton } from "@/components/ExportCsvButton"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
-import { ArrowLeft, Package, AlertCircle, Plus } from "lucide-react"
+import { ArrowLeft, Package, AlertCircle, Plus, ChevronDown, ChevronRight } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
-import { receipts as receiptsApi } from "@/api"
+import { ApiError, purchases as purchasesApi, receipts as receiptsApi, type PurchaseAllocation } from "@/api"
 
 export default function ItemDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -80,6 +80,85 @@ export default function ItemDetailPage() {
   const [newInvDate, setNewInvDate] = useState("")
   const [newInvSubtotal, setNewInvSubtotal] = useState("")
   const [newInvTaxRate, setNewInvTaxRate] = useState("13.00")
+  const [allocationsByPurchase, setAllocationsByPurchase] = useState<Record<string, PurchaseAllocation[]>>({})
+  const [expandedAllocations, setExpandedAllocations] = useState<Record<string, boolean>>({})
+
+  useEffect(() => {
+    const loadAllocations = async () => {
+      if (!purchases.length) {
+        setAllocationsByPurchase({})
+        return
+      }
+
+      const entries = await Promise.all(
+        purchases.map(async (p) => {
+          try {
+            const rows = await purchasesApi.allocations.list(p.purchase_id)
+            return [p.purchase_id, rows] as const
+          } catch (err) {
+            if (err instanceof ApiError && err.status === 404) {
+              return [p.purchase_id, []] as const
+            }
+            throw err
+          }
+        })
+      )
+
+      setAllocationsByPurchase(Object.fromEntries(entries))
+    }
+
+    loadAllocations().catch((err) => {
+      alert(err instanceof Error ? err.message : "Failed to load allocations")
+    })
+  }, [purchases])
+
+  const getEffectiveAllocations = (p: (typeof purchases)[0]): PurchaseAllocation[] => {
+    const rows = allocationsByPurchase[p.purchase_id] || []
+    if (rows.length > 0) return rows
+    if (!p.receipt_id) return []
+
+    const receipt = receipts.find((r) => r.id === p.receipt_id)
+    return [{
+      id: `legacy-${p.purchase_id}`,
+      purchase_id: p.purchase_id,
+      receipt_id: p.receipt_id,
+      receipt_line_item_id: null,
+      item_id: p.item_id,
+      item_name: p.item_name,
+      allocated_qty: p.quantity,
+      unit_cost: p.purchase_cost || "0",
+      receipt_number: p.receipt_number || receipt?.receipt_number || "linked",
+      vendor_name: p.vendor_name || receipt?.vendor_name || "Unknown vendor",
+      receipt_date: receipt?.receipt_date || p.purchase_date,
+      created_at: p.purchase_date,
+      updated_at: p.purchase_date,
+    }]
+  }
+
+  const getDisplayCosts = (p: (typeof purchases)[0]) => {
+    const allocs = getEffectiveAllocations(p)
+    const allocatedQty = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
+    const allocatedTotalCost = allocs.reduce(
+      (sum, a) => sum + Number.parseFloat(a.unit_cost || "0") * a.allocated_qty,
+      0
+    )
+
+    if (allocs.length > 0 && allocatedQty === p.quantity && allocatedQty > 0) {
+      return {
+        unitCost: allocatedTotalCost / allocatedQty,
+        totalCost: allocatedTotalCost,
+      }
+    }
+
+    return {
+      unitCost: Number.parseFloat(p.purchase_cost || "0"),
+      totalCost: Number.parseFloat(p.total_cost || "0"),
+    }
+  }
+
+  const toggleAllocationDrilldown = (purchaseId: string) => {
+    setExpandedAllocations((prev) => ({ ...prev, [purchaseId]: !prev[purchaseId] }))
+  }
 
   const resetNewForms = () => {
     setNewRcptVendorId(""); setNewRcptNumber(""); setNewRcptDate(""); setNewRcptSubtotal(""); setNewRcptTaxAmount(""); setNewRcptFile(null)
@@ -152,7 +231,7 @@ export default function ItemDetailPage() {
   if (!item) return <div className="text-muted-foreground">Item not found</div>
 
   const totalQuantity = purchases.reduce((sum, p) => sum + p.quantity, 0)
-  const totalCost = purchases.reduce((sum, p) => sum + parseFloat(p.total_cost || "0"), 0)
+  const totalCost = purchases.reduce((sum, p) => sum + getDisplayCosts(p).totalCost, 0)
   const totalSelling = purchases.reduce((sum, p) => sum + parseFloat(p.total_selling || "0"), 0)
   const totalCommission = purchases.reduce((sum, p) => sum + parseFloat(p.total_commission || "0"), 0)
   const linkedReceipts = new Set(purchases.filter((p) => p.receipt_id).map((p) => p.receipt_id))
@@ -262,6 +341,7 @@ export default function ItemDetailPage() {
                   <TableHead>Date</TableHead>
                   <TableHead>Dest</TableHead>
                   <TableHead>Receipt</TableHead>
+                  <TableHead>Allocations</TableHead>
                   <TableHead>Invoice</TableHead>
                   <TableHead className="text-right">Qty</TableHead>
                   <TableHead className="text-right">Unit Cost</TableHead>
@@ -272,8 +352,15 @@ export default function ItemDetailPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {purchases.map((p) => (
-                  <TableRow key={p.purchase_id}>
+                {purchases.map((p) => {
+                  const allocs = getEffectiveAllocations(p)
+                  const totalAllocated = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
+                  const isExpanded = !!expandedAllocations[p.purchase_id]
+                  const displayCosts = getDisplayCosts(p)
+
+                  return (
+                  <Fragment key={p.purchase_id}>
+                    <TableRow>
                     <TableCell className="text-sm">{formatDate(p.purchase_date)}</TableCell>
                     <TableCell className="font-mono">{p.destination_code || "-"}</TableCell>
                     <TableCell>
@@ -296,6 +383,19 @@ export default function ItemDetailPage() {
                       )}
                     </TableCell>
                     <TableCell>
+                      {allocs.length > 0 ? (
+                        <button
+                          onClick={() => toggleAllocationDrilldown(p.purchase_id)}
+                          className="text-xs text-primary hover:underline inline-flex items-center gap-1"
+                        >
+                          {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                          {totalAllocated}/{p.quantity}
+                        </button>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">none</span>
+                      )}
+                    </TableCell>
+                    <TableCell>
                       {p.invoice_id ? (
                         <Link
                           to={`/invoices/${p.invoice_id}`}
@@ -315,8 +415,8 @@ export default function ItemDetailPage() {
                       )}
                     </TableCell>
                     <TableCell className="text-right">{p.quantity}</TableCell>
-                    <TableCell className="text-right text-muted-foreground">{formatCurrency(p.purchase_cost)}</TableCell>
-                    <TableCell className="text-right">{formatCurrency(p.total_cost)}</TableCell>
+                    <TableCell className="text-right text-muted-foreground">{formatCurrency(displayCosts.unitCost)}</TableCell>
+                    <TableCell className="text-right">{formatCurrency(displayCosts.totalCost)}</TableCell>
                     <TableCell className="text-right">{p.invoice_unit_price ? formatCurrency(p.invoice_unit_price) : "-"}</TableCell>
                     <TableCell className={`text-right ${p.total_commission ? (parseFloat(p.total_commission) >= 0 ? "text-green-600" : "text-red-600") : "text-muted-foreground"}`}>
                       {p.total_commission ? formatCurrency(p.total_commission) : "—"}
@@ -332,9 +432,47 @@ export default function ItemDetailPage() {
                       </span>
                     </TableCell>
                   </TableRow>
-                ))}
+
+                  {isExpanded && allocs.length > 0 && (
+                    <TableRow>
+                      <TableCell colSpan={11} className="bg-muted/30 py-2">
+                        <div className="border rounded-md bg-background overflow-hidden">
+                          <Table>
+                            <TableHeader>
+                              <TableRow>
+                                <TableHead>Receipt</TableHead>
+                                <TableHead>Vendor</TableHead>
+                                <TableHead>Date</TableHead>
+                                <TableHead className="text-right">Qty</TableHead>
+                                <TableHead className="text-right">Unit Cost</TableHead>
+                                <TableHead className="text-right">Allocated Total</TableHead>
+                              </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                              {allocs.map((a) => (
+                                <TableRow key={a.id}>
+                                  <TableCell>
+                                    <Link to={`/receipts/${a.receipt_id}`} className="text-primary hover:underline font-mono text-xs">
+                                      {a.receipt_number}
+                                    </Link>
+                                  </TableCell>
+                                  <TableCell>{a.vendor_name}</TableCell>
+                                  <TableCell>{formatDate(a.receipt_date)}</TableCell>
+                                  <TableCell className="text-right">{a.allocated_qty}</TableCell>
+                                  <TableCell className="text-right">{formatCurrency(a.unit_cost)}</TableCell>
+                                  <TableCell className="text-right">{formatCurrency(Number(a.unit_cost) * a.allocated_qty)}</TableCell>
+                                </TableRow>
+                              ))}
+                            </TableBody>
+                          </Table>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )}
+                  </Fragment>
+                )})}
                 {purchases.length === 0 && (
-                  <EmptyTableRow colSpan={10}>
+                  <EmptyTableRow colSpan={11}>
                     <div className="flex flex-col items-center gap-2 py-4">
                       <Package className="h-8 w-8" />
                       <p>No purchases for this item yet</p>

@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Multipart, Path, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::Response,
     routing::get,
     Json, Router,
@@ -18,9 +18,19 @@ use super::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_receipts).post(create_receipt))
-        .route("/{id}", get(get_receipt_detail).put(update_receipt).delete(delete_receipt))
+        .route(
+            "/{id}",
+            get(get_receipt_detail)
+                .put(update_receipt)
+                .delete(delete_receipt),
+        )
         .route("/{id}/purchases", get(get_receipt_purchases))
-        .route("/{id}/document", get(download_document).post(upload_document))
+        .route("/{id}/line-items", get(list_receipt_line_items).post(create_receipt_line_item))
+        .route("/{id}/line-items/{line_item_id}", axum::routing::put(update_receipt_line_item).delete(delete_receipt_line_item))
+        .route(
+            "/{id}/document",
+            get(download_document).post(upload_document),
+        )
 }
 
 async fn list_receipts(
@@ -59,6 +69,68 @@ async fn get_receipt_purchases(
     Ok(Json(purchases))
 }
 
+async fn list_receipt_line_items(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<ReceiptLineItemWithItem>>, (StatusCode, String)> {
+    let _receipt = queries::get_receipt_by_id(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Receipt not found".to_string()))?;
+
+    let rows = queries::get_receipt_line_items(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(rows))
+}
+
+async fn create_receipt_line_item(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(id): Path<Uuid>,
+    Json(data): Json<CreateReceiptLineItem>,
+) -> Result<(StatusCode, Json<ReceiptLineItemWithItem>), (StatusCode, String)> {
+    let row = queries::create_receipt_line_item(&state.pool, id, data)
+        .await
+        .map_err(map_validation_error)?;
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+async fn update_receipt_line_item(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path((id, line_item_id)): Path<(Uuid, Uuid)>,
+    Json(data): Json<UpdateReceiptLineItem>,
+) -> Result<Json<ReceiptLineItemWithItem>, (StatusCode, String)> {
+    let row = queries::update_receipt_line_item(&state.pool, id, line_item_id, data)
+        .await
+        .map_err(map_validation_error)?;
+    Ok(Json(row))
+}
+
+async fn delete_receipt_line_item(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path((id, line_item_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let deleted = queries::delete_receipt_line_item(&state.pool, id, line_item_id)
+        .await
+        .map_err(map_validation_error)?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "Receipt line item not found".to_string()))
+    }
+}
+
+fn map_validation_error(err: queries::PurchaseAllocationError) -> (StatusCode, String) {
+    match err {
+        queries::PurchaseAllocationError::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
+        queries::PurchaseAllocationError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+        queries::PurchaseAllocationError::Sql(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 async fn create_receipt(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -91,7 +163,7 @@ async fn delete_receipt(
     let deleted = queries::delete_receipt(&state.pool, id, user.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
+
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -118,10 +190,7 @@ async fn upload_document(
     {
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
-            let filename = field
-                .file_name()
-                .unwrap_or("receipt.pdf")
-                .to_string();
+            let filename = field.file_name().unwrap_or("receipt.pdf").to_string();
             let data = field
                 .bytes()
                 .await

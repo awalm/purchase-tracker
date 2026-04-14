@@ -6,6 +6,12 @@ export class ApiError extends Error {
   }
 }
 
+export class ApiValidationError<T = unknown> extends ApiError {
+  constructor(status: number, message: string, public details: T) {
+    super(status, message);
+  }
+}
+
 async function request<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -327,6 +333,24 @@ export const receipts = {
       invoice_number: string | null;
       notes: string | null;
     }[]>(`/receipts/${id}/purchases`),
+  lineItems: {
+    list: (id: string) =>
+      request<ReceiptLineItem[]>(`/receipts/${id}/line-items`),
+    create: (id: string, data: { item_id: string; quantity: number; unit_cost: string; notes?: string }) =>
+      request<ReceiptLineItem>(`/receipts/${id}/line-items`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    update: (id: string, lineItemId: string, data: { item_id?: string; quantity?: number; unit_cost?: string; notes?: string }) =>
+      request<ReceiptLineItem>(`/receipts/${id}/line-items/${lineItemId}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    delete: (id: string, lineItemId: string) =>
+      request<void>(`/receipts/${id}/line-items/${lineItemId}`, {
+        method: 'DELETE',
+      }),
+  },
   create: (data: {
     vendor_id: string;
     receipt_number?: string;
@@ -419,6 +443,28 @@ export const purchases = {
     }),
   delete: (id: string) =>
     request<void>(`/purchases/${id}`, { method: 'DELETE' }),
+  allocations: {
+    list: (purchaseId: string) =>
+      request<PurchaseAllocation[]>(`/purchases/${purchaseId}/allocations`),
+    create: (purchaseId: string, data: { receipt_line_item_id: string; allocated_qty: number }) =>
+      request<PurchaseAllocation>(`/purchases/${purchaseId}/allocations`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    update: (
+      purchaseId: string,
+      allocationId: string,
+      data: { receipt_line_item_id?: string; allocated_qty?: number }
+    ) =>
+      request<PurchaseAllocation>(`/purchases/${purchaseId}/allocations/${allocationId}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    delete: (purchaseId: string, allocationId: string) =>
+      request<void>(`/purchases/${purchaseId}/allocations/${allocationId}`, {
+        method: 'DELETE',
+      }),
+  },
 };
 
 // Reports
@@ -550,6 +596,38 @@ export const importApi = {
     }
     return response.json();
   },
+  invoicePdfCommit: async (file: File, payload: InvoicePdfCommitPayload): Promise<InvoicePdfCommitResponse> => {
+    const token = localStorage.getItem('token');
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('payload', JSON.stringify(payload));
+
+    const response = await fetch(`${API_BASE}/import/invoice-pdf/commit`, {
+      method: 'POST',
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const raw = await response.text();
+      let details: InvoicePdfCommitErrorResponse | null = null;
+      try {
+        details = JSON.parse(raw) as InvoicePdfCommitErrorResponse;
+      } catch {
+        details = null;
+      }
+
+      if (details && typeof details.message === 'string') {
+        throw new ApiValidationError(response.status, details.message || response.statusText, details);
+      }
+
+      throw new ApiError(response.status, raw || response.statusText);
+    }
+
+    return response.json();
+  },
 };
 
 // Parsed invoice types
@@ -570,4 +648,79 @@ export interface ParsedInvoice {
   tax_amount: string | null;
   total: string | null;
   notes: string | null;
+}
+
+export interface InvoicePdfCommitLineInput {
+  line_index: number;
+  description: string;
+  qty: number;
+  invoice_unit_price: string;
+  subtotal: string;
+  item_id: string | null;
+}
+
+export interface InvoicePdfCommitPayload {
+  destination_id: string;
+  invoice_number: string;
+  invoice_date: string;
+  subtotal: string;
+  tax_rate?: string;
+  notes?: string;
+  line_items: InvoicePdfCommitLineInput[];
+}
+
+export interface InvoicePdfFieldError {
+  field: string;
+  code: string;
+  message: string;
+}
+
+export interface InvoicePdfLineFailure {
+  line_index: number;
+  code: string;
+  message: string;
+  description: string | null;
+}
+
+export interface InvoicePdfCommitErrorResponse {
+  error_code: string;
+  message: string;
+  invoice_level_errors: InvoicePdfFieldError[];
+  line_failures: InvoicePdfLineFailure[];
+}
+
+export interface InvoicePdfCommitResponse {
+  invoice_id: string;
+  purchase_count: number;
+  message: string;
+}
+
+export interface PurchaseAllocation {
+  id: string;
+  purchase_id: string;
+  receipt_id: string;
+  receipt_line_item_id: string | null;
+  item_id: string | null;
+  item_name: string | null;
+  allocated_qty: number;
+  unit_cost: string;
+  receipt_number: string;
+  vendor_name: string;
+  receipt_date: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ReceiptLineItem {
+  id: string;
+  receipt_id: string;
+  item_id: string;
+  item_name: string;
+  quantity: number;
+  unit_cost: string;
+  notes: string | null;
+  allocated_qty: number;
+  remaining_qty: number;
+  created_at: string;
+  updated_at: string;
 }

@@ -14,6 +14,71 @@ A buying group tracking application replacing the current Excel-based system.
 
 ---
 
+## CURRENT DOMAIN CONTRACT (2026-04-14)
+
+This section is authoritative for current product behavior and supersedes older model notes below where they conflict.
+
+### Concepts
+
+1. **Receipt**
+    - Source document on the **buy-side** (vendor invoice/receipt upload).
+    - Conceptually broken into receipt line items that carry: `vendor`, `item`, `qty`, `purchase_cost`.
+    - Receipt totals (`subtotal`, `tax`, `total`) are document-level metadata.
+
+2. **Invoice**
+    - Source document on the **sell-side** (destination invoice upload).
+    - Broken into invoice line items that carry: `item`, `qty`, `invoice_unit_price` (sell price).
+    - Commission/profit is **derived**, not manually entered.
+
+3. **Reconcile**
+    - Reconciliation links one invoice line to one-or-many receipt line slices.
+    - A single invoice line may be costed from multiple receipts.
+    - Linking does **not** mutate source receipt/invoice document facts.
+
+### Non-negotiable invariants
+
+- Editing receipt document fields (e.g., number/date/subtotal/tax/notes) must **never** mutate invoice line quantities/prices.
+- Editing invoice document fields must **never** mutate receipt line quantities/costs.
+- Quantity/price parity is a reconciliation concern, not a bidirectional overwrite operation.
+- Derived economics (commission/tax/profit) come from linked data and views/queries, not manual mirroring.
+- Allocation `unit_cost` is derived from `receipt_line_items.unit_cost` only (no manual override in invoice-link flow).
+- Allocated qty for a receipt line item may never exceed that receipt line's declared qty.
+- For derived timeline fields, never silently default to "today". Use nearest source date; fallback sentinel is `1970-01-01`.
+
+### Current implementation mapping
+
+- `purchases` currently represent invoice-side line shells (`item`, `qty`, `invoice_unit_price`) and legacy direct links.
+- `receipt_line_items` are now the buy-side source-of-truth lines (`item`, `qty`, `unit_cost`) per receipt.
+- `purchase_allocations` reconcile purchase lines to specific `receipt_line_items` with `allocated_qty`; `unit_cost` is inherited from receipt line items.
+- This means the effective link object is **Purchase Allocation** (not raw receipt/invoice rows directly mutating each other).
+
+### Status vs target concept
+
+- ✅ **Matches:** invoice-line to many receipt allocations; source docs stay independent; reconciliation is explicit.
+- ✅ **Implemented:** first-class `receipt_line_items` table and receipt-line-based allocation enforcement.
+- ⚠️ **Transitional:** legacy `purchases.receipt_id` still exists for compatibility during migration/backfill.
+
+### Terminology note
+
+- Existing name `purchases` is overloaded historically.
+- Product meaning going forward: `purchases` = invoice-side trackable line entries, `purchase_allocations` = reconciliation/cost attribution units.
+
+### Verification / tests (must remain green)
+
+Backend regression coverage includes:
+
+1. Receipt edits do not mutate linked purchase invoice-line fields.
+2. Allocation cannot exceed receipt line quantity.
+3. Allocation unit cost is derived from receipt line item.
+
+If any of these fail, treat as domain-contract breakage.
+
+### Remaining migration item
+
+1. Remove legacy `purchases.receipt_id` fallback path after full backfill and production verification.
+
+---
+
 ## 1. Technology Stack
 
 | Layer | Technology | Purpose |

@@ -1,8 +1,8 @@
 import { useState, useRef } from "react"
 import { useNavigate } from "react-router-dom"
-import { useInvoices, useCreateInvoice, useUpdateInvoice, useDeleteInvoice, useDestinations, useItems, useCreatePurchase } from "@/hooks/useApi"
+import { useInvoices, useCreateInvoice, useUpdateInvoice, useDeleteInvoice, useDestinations, useItems } from "@/hooks/useApi"
 import { useMultiSelect } from "@/hooks/useMultiSelect"
-import { importApi, invoices as invoicesApi, type ParsedInvoice } from "@/api"
+import { ApiValidationError, importApi, type InvoicePdfCommitErrorResponse, type InvoicePdfLineFailure, type ParsedInvoice } from "@/api"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { DateInput } from "@/components/ui/date-input"
@@ -35,7 +35,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Plus, Trash2, CheckCircle2, AlertCircle, Clock, Upload, FileText } from "lucide-react"
-import { formatCurrency, formatDate } from "@/lib/utils"
+import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
 
 interface Invoice {
   id: string
@@ -103,7 +103,6 @@ export default function InvoicesPage() {
   const updateInvoice = useUpdateInvoice()
   const deleteInvoice = useDeleteInvoice()
   const { data: activeItems = [] } = useItems()
-  const createPurchase = useCreatePurchase()
 
   // Form state
   const [isOpen, setIsOpen] = useState(false)
@@ -126,6 +125,7 @@ export default function InvoicesPage() {
   const [parsedInvoice, setParsedInvoice] = useState<ParsedInvoice | null>(null)
   const [pdfDestinationId, setPdfDestinationId] = useState("")
   const [pdfError, setPdfError] = useState("")
+  const [pdfLineFailures, setPdfLineFailures] = useState<InvoicePdfLineFailure[]>([])
   // Per-line-item overrides: index → item_id (for unmatched items the user manually maps)
   const [lineItemOverrides, setLineItemOverrides] = useState<Record<number, string>>({})
   // "Create New Item" dialog state: which line item index is being created
@@ -137,6 +137,7 @@ export default function InvoicesPage() {
     setPdfFile(file)
     setPdfParsing(true)
     setPdfError("")
+    setPdfLineFailures([])
     setParsedInvoice(null)
     setLineItemOverrides({})
     setNewItemForLineIdx(null)
@@ -156,7 +157,6 @@ export default function InvoicesPage() {
   // Resolve item for a line item: override → name match → null
   const resolveItem = (li: ParsedInvoice["line_items"][0], idx: number) => {
     const overrideId = lineItemOverrides[idx]
-    if (overrideId === "__skip__") return null
     if (overrideId) return activeItems.find(ai => ai.id === overrideId) ?? null
     return activeItems.find(ai => ai.name.toLowerCase() === li.description.toLowerCase()) ?? null
   }
@@ -164,77 +164,73 @@ export default function InvoicesPage() {
   // Compute select value for a line item dropdown
   const getLineItemSelectValue = (li: ParsedInvoice["line_items"][0], idx: number): string => {
     const overrideId = lineItemOverrides[idx]
-    if (overrideId === "__skip__") return "__none__"
     if (overrideId) return overrideId
     const autoMatch = activeItems.find(ai => ai.name.toLowerCase() === li.description.toLowerCase())
     return autoMatch ? autoMatch.id : "__none__"
   }
 
+  const unresolvedLineCount = parsedInvoice
+    ? parsedInvoice.line_items.filter((li, idx) => resolveItem(li, idx) === null).length
+    : 0
+
+  const lineFailureByIndex = pdfLineFailures.reduce<Record<number, InvoicePdfLineFailure[]>>((acc, failure) => {
+    if (!acc[failure.line_index]) acc[failure.line_index] = []
+    acc[failure.line_index].push(failure)
+    return acc
+  }, {})
+
   const [pdfCreating, setPdfCreating] = useState(false)
   const [pdfCreateStatus, setPdfCreateStatus] = useState("")
 
   const handlePdfCreate = async () => {
-    if (!parsedInvoice || !pdfDestinationId) return
+    if (!parsedInvoice || !pdfDestinationId || !pdfFile) return
     setPdfCreating(true)
     setPdfError("")
-    setPdfCreateStatus("Creating invoice...")
+    setPdfLineFailures([])
+    setPdfCreateStatus("Committing atomic import...")
 
     try {
-      const invoiceDate = parsedInvoice.invoice_date || new Date().toISOString().split("T")[0]
-
-      const { id: invoiceId } = await createInvoice.mutateAsync({
-        destination_id: pdfDestinationId,
-        invoice_number: parsedInvoice.invoice_number || "UNKNOWN",
-        invoice_date: invoiceDate,
-        subtotal: parsedInvoice.subtotal || "0",
-        tax_rate: parsedInvoice.tax_rate || undefined,
-        notes: parsedInvoice.notes || undefined,
+      const invoiceDate = parsedInvoice.invoice_date || ""
+      const invoiceNumber = parsedInvoice.invoice_number || ""
+      const invoiceSubtotal = parsedInvoice.subtotal || ""
+      const lineItems = parsedInvoice.line_items.map((li, idx) => {
+        const item = resolveItem(li, idx)
+        return {
+          line_index: idx,
+          description: li.description,
+          qty: li.qty,
+          invoice_unit_price: li.invoice_unit_price,
+          subtotal: li.subtotal,
+          item_id: item?.id ?? null,
+        }
       })
 
-      // Upload the original PDF to the new invoice
-      if (invoiceId && pdfFile) {
-        try {
-          setPdfCreateStatus("Attaching PDF document...")
-          await invoicesApi.uploadPdf(invoiceId, pdfFile)
-        } catch {
-          // non-critical — invoice is created, just PDF attachment failed
-        }
-      }
-
-      if (parsedInvoice.line_items.length > 0 && invoiceId) {
-        for (let i = 0; i < parsedInvoice.line_items.length; i++) {
-          const li = parsedInvoice.line_items[i]
-          const item = resolveItem(li, i)
-          if (!item) continue
-
-          // Create purchase linked to invoice
-          // purchase_cost is unknown until reconciled with a receipt — use 0 as placeholder
-          try {
-            setPdfCreateStatus(`Creating purchase: ${li.description} x${li.qty}...`)
-            await createPurchase.mutateAsync({
-              item_id: item.id,
-              quantity: li.qty,
-              purchase_cost: "0",
-              invoice_unit_price: li.invoice_unit_price,
-              destination_id: pdfDestinationId,
-              invoice_id: invoiceId,
-              status: "delivered",
-            })
-          } catch {
-            // skip items that fail
-          }
-        }
-      }
+      await importApi.invoicePdfCommit(pdfFile, {
+        destination_id: pdfDestinationId,
+        invoice_number: invoiceNumber,
+        invoice_date: invoiceDate,
+        subtotal: invoiceSubtotal,
+        tax_rate: parsedInvoice.tax_rate || undefined,
+        notes: parsedInvoice.notes || undefined,
+        line_items: lineItems,
+      })
 
       setPdfDialogOpen(false)
       setParsedInvoice(null)
       setPdfDestinationId("")
       setPdfError("")
+      setPdfLineFailures([])
       setPdfFile(null)
       setLineItemOverrides({})
       setNewItemForLineIdx(null)
     } catch (err) {
-      setPdfError(err instanceof Error ? err.message : "Failed to create invoice")
+      if (err instanceof ApiValidationError) {
+        const details = err.details as InvoicePdfCommitErrorResponse
+        setPdfError(err.message)
+        setPdfLineFailures(details.line_failures || [])
+      } else {
+        setPdfError(err instanceof Error ? err.message : "Failed to create invoice")
+      }
     } finally {
       setPdfCreating(false)
       setPdfCreateStatus("")
@@ -314,7 +310,7 @@ export default function InvoicesPage() {
               { header: "Order #", accessor: (inv: Invoice) => inv.order_number },
               { header: "Date", accessor: (inv: Invoice) => inv.invoice_date },
               { header: "Subtotal", accessor: (inv: Invoice) => inv.subtotal },
-              { header: "Tax Rate", accessor: (inv: Invoice) => inv.tax_rate },
+              { header: "Tax Rate", accessor: (inv: Invoice) => formatNumber(inv.tax_rate) },
               { header: "Total", accessor: (inv: Invoice) => inv.total },
               { header: "Purchase Count", accessor: (inv: Invoice) => inv.purchase_count },
               { header: "Purchases Total", accessor: (inv: Invoice) => inv.purchases_total },
@@ -338,6 +334,7 @@ export default function InvoicesPage() {
               setParsedInvoice(null)
               setPdfDestinationId("")
               setPdfError("")
+              setPdfLineFailures([])
               setPdfFile(null)
               setLineItemOverrides({})
               setNewItemForLineIdx(null)
@@ -389,6 +386,15 @@ export default function InvoicesPage() {
                   </div>
                 )}
 
+                {pdfLineFailures.length > 0 && (
+                  <div className="text-xs text-red-700 bg-red-50 border border-red-200 p-3 rounded space-y-1">
+                    <div className="font-medium">Line-level issues:</div>
+                    {pdfLineFailures.map((f, idx) => (
+                      <div key={`${f.line_index}-${idx}`}>Line {f.line_index + 1}: {f.message}</div>
+                    ))}
+                  </div>
+                )}
+
                 {parsedInvoice && (
                   <div className="space-y-4">
                     <div className="bg-muted p-3 rounded-md space-y-2 text-sm">
@@ -412,7 +418,7 @@ export default function InvoicesPage() {
                       </div>
                       {parsedInvoice.tax_rate && (
                         <div className="flex justify-between">
-                          <span className="text-muted-foreground">Tax ({parsedInvoice.tax_rate}%)</span>
+                          <span className="text-muted-foreground">Tax ({formatNumber(parsedInvoice.tax_rate)}%)</span>
                           <span>{parsedInvoice.tax_amount ? formatCurrency(parsedInvoice.tax_amount) : "—"}</span>
                         </div>
                       )}
@@ -442,14 +448,22 @@ export default function InvoicesPage() {
                               {parsedInvoice.line_items.map((item, i) => {
                                 const resolved = resolveItem(item, i)
                                 const selectValue = getLineItemSelectValue(item, i)
+                                const lineFailures = lineFailureByIndex[i] || []
                                 return (
-                                <TableRow key={i} className={resolved ? "" : "bg-amber-50"}>
+                                <TableRow key={i} className={lineFailures.length > 0 ? "bg-red-50" : (resolved ? "" : "bg-amber-50")}>
                                   <TableCell className="text-xs px-1">
-                                    {resolved ? <CheckCircle2 className="h-3 w-3 text-green-600" /> : <AlertCircle className="h-3 w-3 text-amber-500" />}
+                                    {lineFailures.length > 0
+                                      ? <AlertCircle className="h-3 w-3 text-red-600" />
+                                      : (resolved ? <CheckCircle2 className="h-3 w-3 text-green-600" /> : <AlertCircle className="h-3 w-3 text-amber-500" />)}
                                   </TableCell>
                                   <TableCell className="text-xs">
                                     <div className="space-y-1">
                                       <span>{item.description}</span>
+                                      {lineFailures.length > 0 && (
+                                        <div className="text-[10px] text-red-600 font-medium">
+                                          {lineFailures.map((f) => f.message).join(" • ")}
+                                        </div>
+                                      )}
                                       {resolved && (
                                         <div className="text-[10px] text-green-600 font-medium">→ {resolved.name}</div>
                                       )}
@@ -463,10 +477,7 @@ export default function InvoicesPage() {
                                           setLineItemOverrides(prev => {
                                             const next = { ...prev }
                                             if (v === "__none__") {
-                                              // If there's an auto-match, store explicit skip
-                                              const autoMatch = activeItems.find(ai => ai.name.toLowerCase() === item.description.toLowerCase())
-                                              if (autoMatch) next[i] = "__skip__"
-                                              else delete next[i]
+                                              delete next[i]
                                             } else {
                                               // If choosing the auto-match item, remove override (let auto-match work)
                                               const autoMatch = activeItems.find(ai => ai.name.toLowerCase() === item.description.toLowerCase())
@@ -482,7 +493,7 @@ export default function InvoicesPage() {
                                         </SelectTrigger>
                                         <SelectContent>
                                           <SelectItem value="__none__">
-                                            <span className="text-amber-600">— Skip</span>
+                                            <span className="text-amber-600">— Unmapped (will fail)</span>
                                           </SelectItem>
                                           <SelectItem value="__create__">
                                             <span className="text-blue-600">+ Create New Item</span>
@@ -535,15 +546,14 @@ export default function InvoicesPage() {
                       {parsedInvoice.line_items.length > 0 && pdfDestinationId && (() => {
                         const resolved = parsedInvoice.line_items.map((li, idx) => ({ li, item: resolveItem(li, idx), idx }))
                         const matched = resolved.filter(r => r.item !== null).length
-                        const skipped = resolved.filter(r => r.item === null).length
-                        const notes: string[] = []
-                        if (matched > 0) notes.push(`${matched} purchase${matched > 1 ? "s" : ""}`)
-                        if (skipped > 0) notes.push(`${skipped} skipped`)
-                        return notes.length > 0 ? (
-                          <div className="text-xs text-muted-foreground bg-muted px-3 py-2 rounded-md">
-                            Will create: {notes.join(", ")}
+                        const unresolved = resolved.filter(r => r.item === null).length
+                        return (
+                          <div className={`text-xs px-3 py-2 rounded-md ${unresolved > 0 ? "text-amber-700 bg-amber-50" : "text-muted-foreground bg-muted"}`}>
+                            {unresolved > 0
+                              ? `Resolve all line items to continue (${matched}/${parsedInvoice.line_items.length} mapped)`
+                              : `Ready to create: ${matched} invoice line record${matched > 1 ? "s" : ""}`}
                           </div>
-                        ) : null
+                        )
                       })()}
                       <div className="flex justify-end gap-2">
                         <Button variant="outline" onClick={() => setPdfDialogOpen(false)} disabled={pdfCreating}>
@@ -551,7 +561,7 @@ export default function InvoicesPage() {
                         </Button>
                         <Button
                           onClick={handlePdfCreate}
-                          disabled={!pdfDestinationId || pdfCreating}
+                          disabled={!pdfDestinationId || pdfCreating || unresolvedLineCount > 0 || !pdfFile}
                         >
                           <FileText className="h-4 w-4 mr-2" />
                           Create Invoice

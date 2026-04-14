@@ -17,7 +17,20 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_purchases).post(create_purchase))
         .route("/economics", get(list_economics))
-        .route("/{id}", get(get_purchase).put(update_purchase).delete(delete_purchase))
+        .route(
+            "/{id}",
+            get(get_purchase)
+                .put(update_purchase)
+                .delete(delete_purchase),
+        )
+        .route(
+            "/{id}/allocations",
+            get(list_allocations).post(create_allocation),
+        )
+        .route(
+            "/{id}/allocations/{allocation_id}",
+            axum::routing::put(update_allocation).delete(delete_allocation),
+        )
         .route("/{id}/status", patch(update_status))
 }
 
@@ -97,10 +110,72 @@ async fn delete_purchase(
     let deleted = queries::delete_purchase(&state.pool, id, user.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
+
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((StatusCode::NOT_FOUND, "Purchase not found".to_string()))
+    }
+}
+
+async fn list_allocations(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<PurchaseAllocationWithReceipt>>, (StatusCode, String)> {
+    let allocations = queries::get_purchase_allocations(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(allocations))
+}
+
+async fn create_allocation(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(id): Path<Uuid>,
+    Json(data): Json<CreatePurchaseAllocation>,
+) -> Result<(StatusCode, Json<PurchaseAllocationWithReceipt>), (StatusCode, String)> {
+    let allocation = queries::create_purchase_allocation(&state.pool, id, data)
+        .await
+        .map_err(map_allocation_error)?;
+    Ok((StatusCode::CREATED, Json(allocation)))
+}
+
+async fn update_allocation(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path((id, allocation_id)): Path<(Uuid, Uuid)>,
+    Json(data): Json<UpdatePurchaseAllocation>,
+) -> Result<Json<PurchaseAllocationWithReceipt>, (StatusCode, String)> {
+    let allocation = queries::update_purchase_allocation(&state.pool, id, allocation_id, data)
+        .await
+        .map_err(map_allocation_error)?;
+    Ok(Json(allocation))
+}
+
+async fn delete_allocation(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path((id, allocation_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let deleted = queries::delete_purchase_allocation(&state.pool, id, allocation_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "Allocation not found".to_string()))
+    }
+}
+
+fn map_allocation_error(err: queries::PurchaseAllocationError) -> (StatusCode, String) {
+    match err {
+        queries::PurchaseAllocationError::Validation(msg) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, msg)
+        }
+        queries::PurchaseAllocationError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+        queries::PurchaseAllocationError::Sql(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
     }
 }

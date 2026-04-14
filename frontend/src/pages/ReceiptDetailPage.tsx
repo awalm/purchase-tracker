@@ -1,6 +1,6 @@
 import { useState } from "react"
 import { useParams, useNavigate, Link } from "react-router-dom"
-import { useQueryClient } from "@tanstack/react-query"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   useReceipt,
   useReceiptPurchases,
@@ -11,7 +11,7 @@ import {
   useDestinations,
   useInvoices,
 } from "@/hooks/useApi"
-import { receipts as receiptsApi } from "@/api"
+import { receipts as receiptsApi, type ReceiptLineItem } from "@/api"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -50,7 +50,7 @@ import {
   AlertCircle,
   CheckCircle2,
 } from "lucide-react"
-import { formatCurrency, formatDate } from "@/lib/utils"
+import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
 
 export default function ReceiptDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -67,6 +67,22 @@ export default function ReceiptDetailPage() {
   const createPurchase = useCreatePurchase()
   const updatePurchase = useUpdatePurchase()
   const deletePurchase = useDeletePurchase()
+
+  const {
+    data: receiptLineItems = [],
+    isLoading: loadingReceiptLineItems,
+  } = useQuery({
+    queryKey: ["receipts", id, "line-items"],
+    queryFn: () => receiptsApi.lineItems.list(id || ""),
+    enabled: !!id,
+  })
+
+  const [lineItemDialogOpen, setLineItemDialogOpen] = useState(false)
+  const [editingLineItemId, setEditingLineItemId] = useState<string | null>(null)
+  const [lineItemId, setLineItemId] = useState("")
+  const [lineItemQty, setLineItemQty] = useState("1")
+  const [lineItemUnitCost, setLineItemUnitCost] = useState("")
+  const [lineItemNotes, setLineItemNotes] = useState("")
 
   const [isOpen, setIsOpen] = useState(false)
   const [editingPurchaseId, setEditingPurchaseId] = useState<string | null>(null)
@@ -85,6 +101,57 @@ export default function ReceiptDetailPage() {
     setDestinationId("")
     setInvoiceId("")
     setPurchaseNotes("")
+  }
+
+  const resetLineItemForm = () => {
+    setEditingLineItemId(null)
+    setLineItemId("")
+    setLineItemQty("1")
+    setLineItemUnitCost("")
+    setLineItemNotes("")
+  }
+
+  const handleLineItemSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!id) return
+
+    if (editingLineItemId) {
+      await receiptsApi.lineItems.update(id, editingLineItemId, {
+        item_id: lineItemId,
+        quantity: Number.parseInt(lineItemQty, 10),
+        unit_cost: lineItemUnitCost,
+        notes: lineItemNotes || undefined,
+      })
+    } else {
+      await receiptsApi.lineItems.create(id, {
+        item_id: lineItemId,
+        quantity: Number.parseInt(lineItemQty, 10),
+        unit_cost: lineItemUnitCost,
+        notes: lineItemNotes || undefined,
+      })
+    }
+
+    queryClient.invalidateQueries({ queryKey: ["receipts", id, "line-items"] })
+    queryClient.invalidateQueries({ queryKey: ["receipts"] })
+    setLineItemDialogOpen(false)
+    resetLineItemForm()
+  }
+
+  const handleEditLineItem = (line: ReceiptLineItem) => {
+    setEditingLineItemId(line.id)
+    setLineItemId(line.item_id)
+    setLineItemQty(String(line.quantity))
+    setLineItemUnitCost(Number.parseFloat(line.unit_cost).toFixed(2))
+    setLineItemNotes(line.notes || "")
+    setLineItemDialogOpen(true)
+  }
+
+  const handleDeleteLineItem = async (line: ReceiptLineItem) => {
+    if (!id) return
+    if (!confirm(`Delete line item ${line.item_name}?`)) return
+    await receiptsApi.lineItems.delete(id, line.id)
+    queryClient.invalidateQueries({ queryKey: ["receipts", id, "line-items"] })
+    queryClient.invalidateQueries({ queryKey: ["receipts"] })
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -122,7 +189,7 @@ export default function ReceiptDetailPage() {
     const matchedItem = items.find((i) => i.name === p.item_name)
     setItemId(matchedItem?.id || "")
     setQuantity(String(p.quantity))
-    setPurchaseCost(p.purchase_cost)
+    setPurchaseCost(Number.parseFloat(p.purchase_cost).toFixed(2))
     const matchedDest = destinations.find((d) => d.code === p.destination_code)
     setDestinationId(matchedDest?.id || "")
     setInvoiceId(p.invoice_id || "")
@@ -223,15 +290,21 @@ export default function ReceiptDetailPage() {
         </div>
         <div className="flex gap-2">
           {receipt.has_pdf ? (
-            <Button variant="outline" asChild>
-              <a
-                href={receiptsApi.downloadPdfUrl(id!)}
-                target="_blank"
-                rel="noopener"
-              >
+            <Button
+              variant="outline"
+              onClick={() => {
+                const token = localStorage.getItem('token')
+                const url = receiptsApi.downloadPdfUrl(id!)
+                fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+                  .then(res => res.blob())
+                  .then(blob => {
+                    const blobUrl = URL.createObjectURL(blob)
+                    window.open(blobUrl, '_blank')
+                  })
+              }}
+            >
                 <FileText className="h-4 w-4 mr-2" />
                 View Document
-              </a>
             </Button>
           ) : (
             <Button variant="outline" onClick={handleUploadPdf}>
@@ -258,7 +331,7 @@ export default function ReceiptDetailPage() {
               {formatCurrency(receipt.total)}
             </div>
             <p className="text-sm text-muted-foreground">
-              Receipt Total ({receipt.tax_rate}% HST)
+              Receipt Total ({formatNumber(receipt.tax_rate)}% HST)
             </p>
           </CardContent>
         </Card>
@@ -279,6 +352,121 @@ export default function ReceiptDetailPage() {
       </div>
 
       {/* Line Items Table */}
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between">
+          <CardTitle>Receipt Line Items (Source of Truth)</CardTitle>
+          <Dialog
+            open={lineItemDialogOpen}
+            onOpenChange={(open) => {
+              setLineItemDialogOpen(open)
+              if (!open) resetLineItemForm()
+            }}
+          >
+            <DialogTrigger asChild>
+              <Button size="sm" onClick={resetLineItemForm}>
+                <Plus className="h-4 w-4 mr-2" />
+                Add Receipt Line
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="max-w-md">
+              <DialogHeader>
+                <DialogTitle>{editingLineItemId ? "Edit Receipt Line" : "Add Receipt Line"}</DialogTitle>
+              </DialogHeader>
+              <form onSubmit={handleLineItemSubmit} className="space-y-4">
+                <div className="space-y-2">
+                  <Label>Item *</Label>
+                  <Select value={lineItemId} onValueChange={setLineItemId} required>
+                    <SelectTrigger>
+                      <SelectValue placeholder="Select item" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {items.map((it) => (
+                        <SelectItem key={it.id} value={it.id}>
+                          {it.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label>Quantity *</Label>
+                    <Input type="number" min={1} value={lineItemQty} onChange={(e) => setLineItemQty(e.target.value)} required />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Unit Cost *</Label>
+                    <Input type="number" step="0.01" value={lineItemUnitCost} onChange={(e) => setLineItemUnitCost(e.target.value)} required />
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <Label>Notes</Label>
+                  <Input value={lineItemNotes} onChange={(e) => setLineItemNotes(e.target.value)} />
+                </div>
+                <div className="flex justify-end gap-2">
+                  <Button type="button" variant="outline" onClick={() => setLineItemDialogOpen(false)}>
+                    Cancel
+                  </Button>
+                  <Button type="submit">{editingLineItemId ? "Save" : "Add"}</Button>
+                </div>
+              </form>
+            </DialogContent>
+          </Dialog>
+        </CardHeader>
+        <CardContent>
+          {loadingReceiptLineItems ? (
+            <p className="text-muted-foreground">Loading receipt lines...</p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Item</TableHead>
+                  <TableHead className="text-right">Qty</TableHead>
+                  <TableHead className="text-right">Allocated</TableHead>
+                  <TableHead className="text-right">Remaining</TableHead>
+                  <TableHead className="text-right">Unit Cost</TableHead>
+                  <TableHead className="text-right">Line Total</TableHead>
+                  <TableHead>Notes</TableHead>
+                  <TableHead className="w-20">Actions</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {receiptLineItems.map((line) => (
+                  <TableRow key={line.id}>
+                    <TableCell className="font-medium">{line.item_name}</TableCell>
+                    <TableCell className="text-right">{line.quantity}</TableCell>
+                    <TableCell className="text-right">{line.allocated_qty}</TableCell>
+                    <TableCell className={`text-right ${line.remaining_qty < 0 ? "text-red-600" : ""}`}>{line.remaining_qty}</TableCell>
+                    <TableCell className="text-right">{formatCurrency(line.unit_cost)}</TableCell>
+                    <TableCell className="text-right">{formatCurrency(Number(line.unit_cost) * line.quantity)}</TableCell>
+                    <TableCell className="text-muted-foreground">{line.notes || "-"}</TableCell>
+                    <TableCell>
+                      <div className="flex gap-1">
+                        <Button size="icon" variant="ghost" onClick={() => handleEditLineItem(line)}>
+                          <Pencil className="h-4 w-4" />
+                        </Button>
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          className="text-red-600"
+                          onClick={() => handleDeleteLineItem(line)}
+                          disabled={line.allocated_qty > 0}
+                          title={line.allocated_qty > 0 ? "Cannot delete while allocated" : "Delete"}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {receiptLineItems.length === 0 && (
+                  <EmptyTableRow colSpan={8} message="No receipt lines yet" />
+                )}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle>Line Items ({purchases.length})</CardTitle>

@@ -83,7 +83,7 @@ async fn delete_item(
     let deleted = queries::delete_item(&state.pool, id, user.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
+
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {

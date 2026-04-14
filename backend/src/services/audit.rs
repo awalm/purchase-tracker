@@ -6,15 +6,18 @@ pub struct AuditService;
 
 impl AuditService {
     /// Records an audit log entry
-    pub async fn log<T: Serialize, U: Serialize>(
-        pool: &PgPool,
+    pub async fn log_with_executor<'e, E, T: Serialize, U: Serialize>(
+        executor: E,
         table_name: &str,
         record_id: Uuid,
         operation: &str,
         old_data: Option<&T>,
         new_data: Option<&U>,
         user_id: Uuid,
-    ) -> sqlx::Result<()> {
+    ) -> sqlx::Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         let old_data_json = old_data.and_then(|d| serde_json::to_value(d).ok());
         let new_data_json = new_data.and_then(|d| serde_json::to_value(d).ok());
 
@@ -28,9 +31,25 @@ impl AuditService {
             new_data_json,
             user_id
         )
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(())
+    }
+
+    /// Records an audit log entry
+    pub async fn log<T: Serialize, U: Serialize>(
+        pool: &PgPool,
+        table_name: &str,
+        record_id: Uuid,
+        operation: &str,
+        old_data: Option<&T>,
+        new_data: Option<&U>,
+        user_id: Uuid,
+    ) -> sqlx::Result<()> {
+        Self::log_with_executor(
+            pool, table_name, record_id, operation, old_data, new_data, user_id,
+        )
+        .await
     }
 }

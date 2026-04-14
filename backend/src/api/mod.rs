@@ -8,7 +8,7 @@ pub mod receipts;
 pub mod reports;
 pub mod vendors;
 
-use axum::{Router, routing::get, http::StatusCode};
+use axum::{http::StatusCode, routing::get, Router};
 use sqlx::PgPool;
 
 #[derive(Clone)]
@@ -30,7 +30,6 @@ pub fn router() -> Router<AppState> {
         .nest("/vendors", vendors::router())
         .nest("/destinations", destinations::router())
         .nest("/items", items::router())
-
         .nest("/invoices", invoices::router())
         .nest("/receipts", receipts::router())
         .nest("/purchases", purchases::router())

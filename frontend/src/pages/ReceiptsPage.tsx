@@ -38,7 +38,7 @@ import {
 import { EmptyTableRow } from "@/components/EmptyTableRow"
 import { ExportCsvButton } from "@/components/ExportCsvButton"
 import { Plus, Trash2, Pencil, FileText, Upload, CheckCircle2, AlertCircle, Clock } from "lucide-react"
-import { formatCurrency, formatDate } from "@/lib/utils"
+import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
 
 type Receipt = ReturnType<typeof useReceipts>["data"] extends (infer T)[] | undefined ? T : never
 
@@ -201,7 +201,7 @@ export default function ReceiptsPage() {
               { header: "Vendor", accessor: (r) => r.vendor_name },
               { header: "Date", accessor: (r) => r.receipt_date },
               { header: "Subtotal", accessor: (r) => r.subtotal },
-              { header: "Tax Rate", accessor: (r) => r.tax_rate },
+              { header: "Tax Rate", accessor: (r) => formatNumber(r.tax_rate) },
               { header: "Total", accessor: (r) => r.total },
               { header: "Purchase Count", accessor: (r) => r.purchase_count },
               { header: "Purchases Total", accessor: (r) => r.purchases_total },

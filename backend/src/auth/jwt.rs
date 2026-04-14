@@ -31,7 +31,7 @@ impl Claims {
     pub fn new(user_id: Uuid, username: String) -> Self {
         let now = Utc::now();
         let exp = now + Duration::hours(24);
-        
+
         Self {
             sub: user_id,
             username,
@@ -41,7 +41,11 @@ impl Claims {
     }
 }
 
-pub fn create_token(user_id: Uuid, username: String, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
+pub fn create_token(
+    user_id: Uuid,
+    username: String,
+    secret: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
     let claims = Claims::new(user_id, username);
     encode(
         &Header::default(),
@@ -83,16 +87,17 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let state = AppState::from_ref(state);
-        
+
         let auth_header = parts
             .headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .ok_or((StatusCode::UNAUTHORIZED, "Missing authorization header"))?;
 
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .ok_or((StatusCode::UNAUTHORIZED, "Invalid authorization header format"))?;
+        let token = auth_header.strip_prefix("Bearer ").ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Invalid authorization header format",
+        ))?;
 
         let claims = verify_token(token, &state.jwt_secret)
             .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid or expired token"))?;
@@ -112,7 +117,7 @@ mod tests {
     fn test_password_hashing() {
         let password = "test_password123";
         let hash = hash_password(password).unwrap();
-        
+
         assert!(verify_password(password, &hash).unwrap());
         assert!(!verify_password("wrong_password", &hash).unwrap());
     }
@@ -122,10 +127,10 @@ mod tests {
         let secret = "test_secret";
         let user_id = Uuid::new_v4();
         let username = "test_user".to_string();
-        
+
         let token = create_token(user_id, username.clone(), secret).unwrap();
         let claims = verify_token(&token, secret).unwrap();
-        
+
         assert_eq!(claims.sub, user_id);
         assert_eq!(claims.username, username);
     }

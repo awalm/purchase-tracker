@@ -105,6 +105,93 @@ BEGIN
   END IF;
 END $$;
 
+-- ============================================
+-- PURCHASE ALLOCATIONS (Phase 1)
+-- Keep invoice lines intact while allocating qty/cost to one or more receipts.
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS purchase_allocations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  purchase_id UUID NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,
+  receipt_id UUID NOT NULL REFERENCES receipts(id) ON DELETE CASCADE,
+  allocated_qty INTEGER NOT NULL CHECK (allocated_qty > 0),
+  unit_cost DECIMAL(10, 4) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (purchase_id, receipt_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_purchase_allocations_purchase ON purchase_allocations(purchase_id);
+CREATE INDEX IF NOT EXISTS idx_purchase_allocations_receipt ON purchase_allocations(receipt_id);
+
+DROP TRIGGER IF EXISTS update_purchase_allocations_updated_at ON purchase_allocations;
+CREATE TRIGGER update_purchase_allocations_updated_at
+BEFORE UPDATE ON purchase_allocations
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- ============================================
+-- RECEIPT LINE ITEMS (Phase 2)
+-- Source-of-truth lines for qty/cost on each receipt.
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS receipt_line_items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  receipt_id UUID NOT NULL REFERENCES receipts(id) ON DELETE CASCADE,
+  item_id UUID NOT NULL REFERENCES items(id),
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  unit_cost DECIMAL(10, 4) NOT NULL,
+  notes TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (receipt_id, item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_receipt_line_items_receipt ON receipt_line_items(receipt_id);
+CREATE INDEX IF NOT EXISTS idx_receipt_line_items_item ON receipt_line_items(item_id);
+
+DROP TRIGGER IF EXISTS update_receipt_line_items_updated_at ON receipt_line_items;
+CREATE TRIGGER update_receipt_line_items_updated_at
+BEFORE UPDATE ON receipt_line_items
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+ALTER TABLE purchase_allocations
+  ADD COLUMN IF NOT EXISTS receipt_line_item_id UUID REFERENCES receipt_line_items(id) ON DELETE RESTRICT;
+
+CREATE INDEX IF NOT EXISTS idx_purchase_allocations_receipt_line_item
+  ON purchase_allocations(receipt_line_item_id);
+
+-- Backfill receipt_line_items from legacy purchases linked directly to receipts.
+-- Timestamp is derived from receipt/invoice date; if unknown, use obvious epoch sentinel.
+INSERT INTO receipt_line_items (receipt_id, item_id, quantity, unit_cost, notes, created_at, updated_at)
+SELECT
+  p.receipt_id,
+  p.item_id,
+  SUM(p.quantity)::INT,
+  CASE
+    WHEN SUM(p.quantity) = 0 THEN MAX(p.purchase_cost)
+    ELSE SUM((p.quantity::numeric) * p.purchase_cost) / NULLIF(SUM(p.quantity), 0)
+  END,
+  'legacy backfill',
+  COALESCE(r.receipt_date::timestamptz, MIN(inv.invoice_date)::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+  COALESCE(r.receipt_date::timestamptz, MIN(inv.invoice_date)::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00')
+FROM purchases p
+LEFT JOIN receipts r ON r.id = p.receipt_id
+LEFT JOIN invoices inv ON inv.id = p.invoice_id
+WHERE p.receipt_id IS NOT NULL
+GROUP BY p.receipt_id, p.item_id, r.receipt_date
+ON CONFLICT (receipt_id, item_id) DO NOTHING;
+
+-- Backfill allocation linkage to receipt_line_items and enforce receipt-derived unit_cost.
+UPDATE purchase_allocations pa
+SET receipt_line_item_id = rli.id,
+    unit_cost = rli.unit_cost
+FROM purchases p
+JOIN receipt_line_items rli
+  ON rli.item_id = p.item_id
+WHERE pa.purchase_id = p.id
+  AND rli.receipt_id = pa.receipt_id
+  AND pa.receipt_line_item_id IS NULL;
+
 -- 9. Recreate v_purchase_economics
 -- Vendor now comes from the receipt (LEFT JOIN), not the item.
 -- vendor_name is NULL when no receipt is linked.
@@ -113,7 +200,7 @@ END $$;
 CREATE OR REPLACE VIEW v_purchase_economics AS
 SELECT 
     p.id AS purchase_id,
-    p.created_at AS purchase_date,
+  COALESCE(inv.invoice_date::timestamptz, r.receipt_date::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS purchase_date,
     p.item_id,
     i.name AS item_name,
     v.name AS vendor_name,

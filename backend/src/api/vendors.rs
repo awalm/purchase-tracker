@@ -16,7 +16,10 @@ use super::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_vendors).post(create_vendor))
-        .route("/{id}", get(get_vendor).put(update_vendor).delete(delete_vendor))
+        .route(
+            "/{id}",
+            get(get_vendor).put(update_vendor).delete(delete_vendor),
+        )
 }
 
 async fn list_vendors(
@@ -71,7 +74,7 @@ async fn delete_vendor(
     let deleted = queries::delete_vendor(&state.pool, id, user.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
+
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
