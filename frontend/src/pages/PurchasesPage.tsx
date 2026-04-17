@@ -45,6 +45,7 @@ import { EmptyTableRow } from "@/components/EmptyTableRow"
 import { Plus, Trash2, Pencil, AlertCircle } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
 import { PURCHASE_STATUSES } from "@/lib/constants"
+import { assessPurchaseReconciliation } from "@/lib/purchaseReconciliation"
 
 function PurchasePreviewTable({ rows }: { rows: PreviewRow<PurchasePreview>[] }) {
   return (
@@ -430,15 +431,24 @@ export default function PurchasesPage() {
                 <TableHead className="text-right">Cost</TableHead>
                 <TableHead className="text-right">Selling</TableHead>
                 <TableHead className="text-right">Commission</TableHead>
+                <TableHead>Reconciliation</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead className="w-20">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {purchases.map((p) => {
+                const reconciliation = assessPurchaseReconciliation({
+                  quantity: p.quantity,
+                  purchase_cost: p.purchase_cost,
+                  receipt_id: p.receipt_id,
+                  invoice_id: p.invoice_id,
+                  invoice_unit_price: p.invoice_unit_price,
+                  destination_code: p.destination_code,
+                })
                 const isUnlinked = !p.receipt_id && !p.invoice_id
                 return (
-                <TableRow key={p.purchase_id} className={isUnlinked ? "bg-red-50" : ""}>
+                <TableRow key={p.purchase_id} className={isUnlinked ? "bg-red-50" : (!reconciliation.isReconciled ? "bg-amber-50/40" : "")}>
                   <TableCell>{formatDate(p.purchase_date)}</TableCell>
                   <TableCell className="font-medium">
                     <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
@@ -484,6 +494,29 @@ export default function PurchasesPage() {
                     {p.total_commission ? formatCurrency(p.total_commission) : "-"}
                   </TableCell>
                   <TableCell>
+                    {reconciliation.isReconciled ? (
+                      <span className="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">
+                        Reconciled
+                      </span>
+                    ) : (
+                      <div className="space-y-1">
+                        <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700">
+                          Needs attention
+                        </span>
+                        {reconciliation.reasons.slice(0, 2).map((reason) => (
+                          <div key={reason} className="text-[11px] text-amber-700">
+                            {reason}
+                          </div>
+                        ))}
+                        {reconciliation.reasons.length > 2 && (
+                          <div className="text-[11px] text-muted-foreground">
+                            +{reconciliation.reasons.length - 2} more
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </TableCell>
+                  <TableCell>
                     <StatusSelect
                       value={p.status}
                       onValueChange={(value) => handleStatusChange(p.purchase_id, value)}
@@ -511,7 +544,7 @@ export default function PurchasesPage() {
                 </TableRow>
                 )
               })}
-              {purchases.length === 0 && <EmptyTableRow colSpan={12} message="No purchases yet" />}
+              {purchases.length === 0 && <EmptyTableRow colSpan={13} message="No purchases yet" />}
             </TableBody>
           </Table>
         </CardContent>

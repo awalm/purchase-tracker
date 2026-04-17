@@ -14,6 +14,16 @@ CREATE TABLE vendors (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Server-side alias cache for OCR/import vendor labels
+CREATE TABLE vendor_import_aliases (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    normalized_alias VARCHAR(255) NOT NULL UNIQUE,
+    raw_alias VARCHAR(255) NOT NULL,
+    vendor_id UUID NOT NULL REFERENCES vendors(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Destinations (who you SELL/SHIP to: CBG, BSC)
 CREATE TABLE destinations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -53,6 +63,8 @@ CREATE TABLE receipts (
     subtotal DECIMAL(12, 4) NOT NULL,
     tax_rate DECIMAL(5, 2) NOT NULL DEFAULT 13.00,
     total DECIMAL(12, 4) NOT NULL,
+    payment_card_last4 VARCHAR(4) CHECK (payment_card_last4 ~ '^[0-9]{4}$'),
+    ingestion_metadata JSONB,
     original_pdf BYTEA,
     original_filename VARCHAR(255),
     notes TEXT,
@@ -70,6 +82,7 @@ CREATE TABLE invoices (
     subtotal DECIMAL(12, 4) NOT NULL,
     tax_rate DECIMAL(5, 2) NOT NULL DEFAULT 13.00,
     total DECIMAL(12, 4) NOT NULL,
+    reconciliation_state VARCHAR(32) NOT NULL DEFAULT 'open' CHECK (reconciliation_state IN ('open', 'in_review', 'reconciled', 'locked')),
     original_pdf BYTEA,
     original_filename VARCHAR(255),
     notes TEXT,
@@ -303,6 +316,7 @@ CREATE INDEX idx_purchases_created ON purchases(created_at);
 CREATE INDEX idx_receipts_vendor ON receipts(vendor_id);
 CREATE INDEX idx_receipts_number ON receipts(receipt_number);
 CREATE INDEX idx_receipts_date ON receipts(receipt_date);
+CREATE INDEX idx_vendor_import_aliases_vendor ON vendor_import_aliases(vendor_id);
 
 CREATE INDEX idx_invoices_destination ON invoices(destination_id);
 CREATE INDEX idx_invoices_number ON invoices(invoice_number);
@@ -323,6 +337,8 @@ END;
 $$ language 'plpgsql';
 
 CREATE TRIGGER update_vendors_updated_at BEFORE UPDATE ON vendors
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_vendor_import_aliases_updated_at BEFORE UPDATE ON vendor_import_aliases
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 CREATE TRIGGER update_destinations_updated_at BEFORE UPDATE ON destinations
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

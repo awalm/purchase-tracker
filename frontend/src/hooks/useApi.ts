@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { vendors, destinations, items, invoices, receipts, purchases, reports } from "@/api"
+import type { ReceiptIngestionMetadata } from "@/api"
 
 // ============================================
 // Vendors
@@ -8,6 +9,14 @@ export function useVendors() {
   return useQuery({
     queryKey: ["vendors"],
     queryFn: vendors.list,
+  })
+}
+
+export function useVendor(id: string) {
+  return useQuery({
+    queryKey: ["vendors", id],
+    queryFn: () => vendors.get(id),
+    enabled: !!id,
   })
 }
 
@@ -32,6 +41,30 @@ export function useDeleteVendor() {
   return useMutation({
     mutationFn: (id: string) => vendors.delete(id),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["vendors"] }),
+  })
+}
+
+export function useVendorImportAliases(vendorId: string) {
+  return useQuery({
+    queryKey: ["vendors", vendorId, "import-aliases"],
+    queryFn: () => vendors.importAliases.list(vendorId),
+    enabled: !!vendorId,
+  })
+}
+
+export function useCreateVendorImportAlias(vendorId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (rawAlias: string) => vendors.importAliases.create(vendorId, rawAlias),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["vendors", vendorId, "import-aliases"] }),
+  })
+}
+
+export function useDeleteVendorImportAlias(vendorId: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (aliasId: string) => vendors.importAliases.delete(vendorId, aliasId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["vendors", vendorId, "import-aliases"] }),
   })
 }
 
@@ -214,10 +247,13 @@ export function useCreateReceipt() {
   return useMutation({
     mutationFn: (data: {
       vendor_id: string
+      source_vendor_alias?: string
       receipt_number?: string
       receipt_date: string
       subtotal: string
       tax_amount?: string
+      payment_card_last4?: string
+      ingestion_metadata?: ReceiptIngestionMetadata
       notes?: string
     }) => receipts.create(data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["receipts"] }),
@@ -244,7 +280,13 @@ export function useDeleteReceipt() {
 // ============================================
 // Purchases
 // ============================================
-export function usePurchases(params?: { status?: string; destination_id?: string }) {
+export function usePurchases(params?: {
+  status?: string
+  destination_id?: string
+  vendor_id?: string
+  limit?: number
+  offset?: number
+}) {
   return useQuery({
     queryKey: ["purchases", params],
     queryFn: () => purchases.list(params),

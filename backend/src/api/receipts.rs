@@ -25,8 +25,15 @@ pub fn router() -> Router<AppState> {
                 .delete(delete_receipt),
         )
         .route("/{id}/purchases", get(get_receipt_purchases))
-        .route("/{id}/line-items", get(list_receipt_line_items).post(create_receipt_line_item))
-        .route("/{id}/line-items/{line_item_id}", axum::routing::put(update_receipt_line_item).delete(delete_receipt_line_item))
+        .route("/{id}/metadata-audit", get(get_receipt_metadata_audit))
+        .route(
+            "/{id}/line-items",
+            get(list_receipt_line_items).post(create_receipt_line_item),
+        )
+        .route(
+            "/{id}/line-items/{line_item_id}",
+            axum::routing::put(update_receipt_line_item).delete(delete_receipt_line_item),
+        )
         .route(
             "/{id}/document",
             get(download_document).post(upload_document),
@@ -65,8 +72,24 @@ async fn get_receipt_purchases(
 
     let purchases = queries::get_purchases_by_receipt(&state.pool, id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(map_receipt_reconciliation_error)?;
     Ok(Json(purchases))
+}
+
+async fn get_receipt_metadata_audit(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<ReceiptMetadataAuditEntry>>, (StatusCode, String)> {
+    let _receipt = queries::get_receipt_by_id(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Receipt not found".to_string()))?;
+
+    let rows = queries::get_receipt_metadata_audit(&state.pool, id, Some(25))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(rows))
 }
 
 async fn list_receipt_line_items(
@@ -119,16 +142,49 @@ async fn delete_receipt_line_item(
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((StatusCode::NOT_FOUND, "Receipt line item not found".to_string()))
+        Err((
+            StatusCode::NOT_FOUND,
+            "Receipt line item not found".to_string(),
+        ))
     }
 }
 
 fn map_validation_error(err: queries::PurchaseAllocationError) -> (StatusCode, String) {
     match err {
-        queries::PurchaseAllocationError::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
+        queries::PurchaseAllocationError::Validation(msg) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, msg)
+        }
         queries::PurchaseAllocationError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-        queries::PurchaseAllocationError::Sql(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        queries::PurchaseAllocationError::Sql(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
     }
+}
+
+fn map_receipt_reconciliation_error(
+    err: queries::ReceiptReconciliationError,
+) -> (StatusCode, String) {
+    match err {
+        queries::ReceiptReconciliationError::Validation(msg) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, msg)
+        }
+        queries::ReceiptReconciliationError::Sql(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    }
+}
+
+fn map_receipt_write_error(err: sqlx::Error) -> (StatusCode, String) {
+    if let sqlx::Error::Database(db_err) = &err {
+        if db_err.constraint() == Some("receipts_receipt_number_key") {
+            return (
+                StatusCode::CONFLICT,
+                "Receipt number already exists. Use a unique receipt number.".to_string(),
+            );
+        }
+    }
+
+    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }
 
 async fn create_receipt(
@@ -136,9 +192,22 @@ async fn create_receipt(
     user: AuthenticatedUser,
     Json(data): Json<CreateReceipt>,
 ) -> Result<(StatusCode, Json<Receipt>), (StatusCode, String)> {
+    let source_vendor_alias = data
+        .source_vendor_alias
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    if let Some(alias) = source_vendor_alias.as_deref() {
+        queries::upsert_vendor_import_alias(&state.pool, alias, data.vendor_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
     let receipt = queries::create_receipt(&state.pool, data, user.user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(map_receipt_write_error)?;
     Ok((StatusCode::CREATED, Json(receipt)))
 }
 
@@ -150,7 +219,7 @@ async fn update_receipt(
 ) -> Result<Json<Receipt>, (StatusCode, String)> {
     let receipt = queries::update_receipt(&state.pool, id, data, user.user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(map_receipt_write_error)?
         .ok_or((StatusCode::NOT_FOUND, "Receipt not found".to_string()))?;
     Ok(Json(receipt))
 }

@@ -1,4 +1,5 @@
 import { useState } from "react"
+import { Link } from "react-router-dom"
 import { useQueryClient } from "@tanstack/react-query"
 import { useItems, useDeleteItem } from "@/hooks/useApi"
 import { useMultiSelect } from "@/hooks/useMultiSelect"
@@ -168,7 +169,11 @@ Echo Dot,BSC,Sample item`}
                       className="h-4 w-4 rounded border-gray-300"
                     />
                   </TableCell>
-                  <TableCell className="font-medium truncate max-w-0">{item.name}</TableCell>
+                  <TableCell className="font-medium truncate max-w-0">
+                    <Link to={`/items/${item.id}`} className="text-blue-600 hover:underline">
+                      {item.name}
+                    </Link>
+                  </TableCell>
                   <TableCell>{item.default_destination_code || "-"}</TableCell>
                   <TableCell className="text-muted-foreground text-sm truncate max-w-0">
                     {item.notes || "-"}

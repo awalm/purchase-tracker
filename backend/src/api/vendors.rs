@@ -1,9 +1,10 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::get,
+    routing::{delete, get},
     Json, Router,
 };
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
@@ -13,12 +14,25 @@ use crate::{
 
 use super::AppState;
 
+#[derive(Debug, Deserialize)]
+struct UpsertVendorImportAliasRequest {
+    raw_alias: String,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_vendors).post(create_vendor))
         .route(
             "/{id}",
             get(get_vendor).put(update_vendor).delete(delete_vendor),
+        )
+        .route(
+            "/{id}/import-aliases",
+            get(list_vendor_import_aliases).post(upsert_vendor_import_alias),
+        )
+        .route(
+            "/{id}/import-aliases/{alias_id}",
+            delete(delete_vendor_import_alias),
         )
 }
 
@@ -79,5 +93,70 @@ async fn delete_vendor(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((StatusCode::NOT_FOUND, "Vendor not found".to_string()))
+    }
+}
+
+async fn list_vendor_import_aliases(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<VendorImportAlias>>, (StatusCode, String)> {
+    let vendor_exists = queries::get_vendor_by_id(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some();
+
+    if !vendor_exists {
+        return Err((StatusCode::NOT_FOUND, "Vendor not found".to_string()));
+    }
+
+    let aliases = queries::get_vendor_import_aliases_by_vendor(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(aliases))
+}
+
+async fn upsert_vendor_import_alias(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<UpsertVendorImportAliasRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let vendor_exists = queries::get_vendor_by_id(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some();
+
+    if !vendor_exists {
+        return Err((StatusCode::NOT_FOUND, "Vendor not found".to_string()));
+    }
+
+    if payload.raw_alias.trim().is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "raw_alias is required".to_string(),
+        ));
+    }
+
+    queries::upsert_vendor_import_alias(&state.pool, &payload.raw_alias, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_vendor_import_alias(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path((id, alias_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let deleted = queries::delete_vendor_import_alias(&state.pool, id, alias_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "Alias not found".to_string()))
     }
 }

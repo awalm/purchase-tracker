@@ -7,6 +7,7 @@ use axum::{
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use tokio::io::AsyncWriteExt;
@@ -25,7 +26,10 @@ pub fn router() -> Router<AppState> {
         .route("/destinations", post(import_destinations))
         .route("/items", post(import_items))
         .route("/purchases", post(import_purchases))
+        .route("/receipts", post(import_receipts))
+        .route("/receipts/preview", post(preview_receipts))
         .route("/invoice-pdf", post(parse_invoice_pdf))
+        .route("/receipt-image", post(parse_receipt_image))
         .route("/invoice-pdf/commit", post(commit_invoice_pdf))
 }
 
@@ -139,6 +143,186 @@ impl CsvPurchaseRow {
             self.purchase_cost.replace(['$', ',', ' '], "")
         )
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct CsvReceiptRow {
+    #[serde(
+        alias = "vendor",
+        alias = "Vendor",
+        alias = "vendor_name",
+        alias = "Vendor Name",
+        alias = "vendor_id"
+    )]
+    vendor: String,
+
+    #[serde(
+        alias = "receipt_number",
+        alias = "receipt",
+        alias = "Receipt",
+        alias = "Receipt Number",
+        alias = "number",
+        default
+    )]
+    receipt_number: Option<String>,
+
+    #[serde(
+        alias = "receipt_date",
+        alias = "Receipt Date",
+        alias = "date",
+        alias = "Date"
+    )]
+    receipt_date: String,
+
+    #[serde(alias = "subtotal", alias = "Subtotal")]
+    subtotal: String,
+
+    #[serde(
+        alias = "tax_amount",
+        alias = "Tax Amount",
+        alias = "tax",
+        alias = "Tax",
+        default
+    )]
+    tax_amount: Option<String>,
+
+    #[serde(
+        alias = "payment_card_last4",
+        alias = "Payment Card Last 4",
+        alias = "card_last4",
+        alias = "last4",
+        default
+    )]
+    payment_card_last4: Option<String>,
+
+    #[serde(alias = "notes", alias = "Notes", alias = "note", default)]
+    notes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PreviewRow<T> {
+    row: usize,
+    data: T,
+    is_duplicate: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PreviewErrorRow {
+    row: usize,
+    message: String,
+    original_data: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PreviewResult<T> {
+    valid_rows: Vec<PreviewRow<T>>,
+    error_rows: Vec<PreviewErrorRow>,
+    total_count: usize,
+    valid_count: usize,
+    error_count: usize,
+    duplicate_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ReceiptPreview {
+    vendor_name: String,
+    receipt_number: Option<String>,
+    receipt_date: String,
+    subtotal: String,
+    tax_amount: Option<String>,
+    payment_card_last4: Option<String>,
+    notes: Option<String>,
+}
+
+fn receipt_duplicate_key(vendor_id: Uuid, receipt_number: &str) -> String {
+    format!("{}|{}", vendor_id, receipt_number.trim().to_lowercase())
+}
+
+fn parse_date_yyyy_mm_dd_or_mm_dd_yyyy(value: &str) -> Result<NaiveDate, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Date is required".to_string());
+    }
+
+    NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
+        .or_else(|_| NaiveDate::parse_from_str(trimmed, "%m/%d/%Y"))
+        .map_err(|_| format!("Invalid date: {} (use YYYY-MM-DD)", value))
+}
+
+fn parse_decimal(value: &str, field_name: &str) -> Result<Decimal, String> {
+    let cleaned = value.replace(['$', ',', ' '], "");
+    Decimal::from_str(&cleaned).map_err(|_| format!("Invalid {}: {}", field_name, value))
+}
+
+fn parse_optional_decimal(
+    value: Option<&str>,
+    field_name: &str,
+) -> Result<Option<Decimal>, String> {
+    match value.map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        Some(v) => parse_decimal(v, field_name).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn normalize_optional_last4(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if trimmed.len() != 4 || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "Invalid payment_card_last4: {} (must be exactly 4 digits)",
+            raw
+        ));
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+fn normalize_import_alias_key(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn resolve_vendor<'a>(
+    vendor_ref: &str,
+    vendors: &'a [Vendor],
+    vendor_by_name: &HashMap<String, &'a Vendor>,
+    vendor_by_short_id: &HashMap<String, &'a Vendor>,
+    vendor_by_alias: &HashMap<String, Uuid>,
+) -> Option<&'a Vendor> {
+    let trimmed = vendor_ref.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized_alias = normalize_import_alias_key(trimmed);
+    if let Some(vendor_id) = vendor_by_alias.get(&normalized_alias) {
+        if let Some(vendor) = vendors.iter().find(|v| v.id == *vendor_id) {
+            return Some(vendor);
+        }
+    }
+
+    if let Ok(vendor_id) = Uuid::from_str(trimmed) {
+        return vendors.iter().find(|v| v.id == vendor_id);
+    }
+
+    if let Some(v) = vendor_by_name.get(&trimmed.to_lowercase()) {
+        return Some(*v);
+    }
+
+    if let Some(v) = vendor_by_short_id.get(&trimmed.to_lowercase()) {
+        return Some(*v);
+    }
+
+    None
 }
 
 // ==================== VENDORS ====================
@@ -832,6 +1016,430 @@ async fn import_purchases(
     }))
 }
 
+async fn preview_receipts(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Json(request): Json<ImportCsvRequest>,
+) -> Result<Json<PreviewResult<ReceiptPreview>>, (StatusCode, String)> {
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .trim(csv::Trim::All)
+        .from_reader(request.csv_data.as_bytes());
+
+    let vendors = queries::get_all_vendors(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let receipts = queries::get_all_receipts(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let vendor_by_name: HashMap<String, &Vendor> =
+        vendors.iter().map(|v| (v.name.to_lowercase(), v)).collect();
+    let vendor_by_short_id: HashMap<String, &Vendor> = vendors
+        .iter()
+        .filter_map(|v| v.short_id.as_ref().map(|sid| (sid.to_lowercase(), v)))
+        .collect();
+    let vendor_by_alias: HashMap<String, Uuid> = queries::get_vendor_import_aliases(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|a| (a.normalized_alias, a.vendor_id))
+        .collect();
+
+    let mut existing_keys: HashSet<String> = HashSet::new();
+    for r in receipts {
+        if !r.receipt_number.trim().is_empty() {
+            existing_keys.insert(receipt_duplicate_key(r.vendor_id, &r.receipt_number));
+        }
+    }
+
+    let mut batch_keys: HashSet<String> = HashSet::new();
+    let mut valid_rows: Vec<PreviewRow<ReceiptPreview>> = Vec::new();
+    let mut error_rows: Vec<PreviewErrorRow> = Vec::new();
+    let mut duplicate_count = 0;
+
+    let csv_lines: Vec<String> = request.csv_data.lines().map(|s| s.to_string()).collect();
+
+    for (row_idx, result) in reader.deserialize::<CsvReceiptRow>().enumerate() {
+        let row_num = row_idx + 2;
+        let original_line = csv_lines.get(row_num - 1).cloned().unwrap_or_default();
+
+        match result {
+            Ok(row) => {
+                let vendor = match resolve_vendor(
+                    &row.vendor,
+                    &vendors,
+                    &vendor_by_name,
+                    &vendor_by_short_id,
+                    &vendor_by_alias,
+                ) {
+                    Some(v) => v,
+                    None => {
+                        error_rows.push(PreviewErrorRow {
+                            row: row_num,
+                            message: format!("Vendor not found: {}", row.vendor),
+                            original_data: original_line,
+                        });
+                        continue;
+                    }
+                };
+
+                let receipt_date = match parse_date_yyyy_mm_dd_or_mm_dd_yyyy(&row.receipt_date) {
+                    Ok(d) => d,
+                    Err(message) => {
+                        error_rows.push(PreviewErrorRow {
+                            row: row_num,
+                            message,
+                            original_data: original_line,
+                        });
+                        continue;
+                    }
+                };
+
+                let subtotal = match parse_decimal(&row.subtotal, "subtotal") {
+                    Ok(v) => v,
+                    Err(message) => {
+                        error_rows.push(PreviewErrorRow {
+                            row: row_num,
+                            message,
+                            original_data: original_line,
+                        });
+                        continue;
+                    }
+                };
+
+                let tax_amount =
+                    match parse_optional_decimal(row.tax_amount.as_deref(), "tax_amount") {
+                        Ok(v) => v,
+                        Err(message) => {
+                            error_rows.push(PreviewErrorRow {
+                                row: row_num,
+                                message,
+                                original_data: original_line,
+                            });
+                            continue;
+                        }
+                    };
+
+                let payment_card_last4 =
+                    match normalize_optional_last4(row.payment_card_last4.as_deref()) {
+                        Ok(v) => v,
+                        Err(message) => {
+                            error_rows.push(PreviewErrorRow {
+                                row: row_num,
+                                message,
+                                original_data: original_line,
+                            });
+                            continue;
+                        }
+                    };
+
+                let receipt_number = row
+                    .receipt_number
+                    .as_ref()
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty());
+
+                if let Some(number) = receipt_number.as_ref() {
+                    let key = receipt_duplicate_key(vendor.id, number);
+                    if existing_keys.contains(&key) {
+                        duplicate_count += 1;
+                        error_rows.push(PreviewErrorRow {
+                            row: row_num,
+                            message: format!(
+                                "Duplicate receipt for vendor {}: {}",
+                                vendor.name, number
+                            ),
+                            original_data: original_line,
+                        });
+                        continue;
+                    }
+
+                    if batch_keys.contains(&key) {
+                        duplicate_count += 1;
+                        error_rows.push(PreviewErrorRow {
+                            row: row_num,
+                            message:
+                                "Duplicate in CSV: same vendor + receipt number appears earlier"
+                                    .to_string(),
+                            original_data: original_line,
+                        });
+                        continue;
+                    }
+
+                    batch_keys.insert(key);
+                }
+
+                valid_rows.push(PreviewRow {
+                    row: row_num,
+                    data: ReceiptPreview {
+                        vendor_name: vendor.name.clone(),
+                        receipt_number,
+                        receipt_date: receipt_date.to_string(),
+                        subtotal: subtotal.to_string(),
+                        tax_amount: tax_amount.map(|t| t.to_string()),
+                        payment_card_last4,
+                        notes: row
+                            .notes
+                            .as_ref()
+                            .map(|n| n.trim().to_string())
+                            .filter(|n| !n.is_empty()),
+                    },
+                    is_duplicate: false,
+                });
+            }
+            Err(e) => {
+                error_rows.push(PreviewErrorRow {
+                    row: row_num,
+                    message: format!("CSV parse error: {}", e),
+                    original_data: original_line,
+                });
+            }
+        }
+    }
+
+    let total_count = valid_rows.len() + error_rows.len();
+
+    Ok(Json(PreviewResult {
+        valid_count: valid_rows.len(),
+        error_count: error_rows.len(),
+        duplicate_count,
+        total_count,
+        valid_rows,
+        error_rows,
+    }))
+}
+
+async fn import_receipts(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Json(request): Json<ImportCsvRequest>,
+) -> Result<Json<ImportResult>, (StatusCode, String)> {
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .trim(csv::Trim::All)
+        .from_reader(request.csv_data.as_bytes());
+
+    let vendors = queries::get_all_vendors(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let receipts = queries::get_all_receipts(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let vendor_by_name: HashMap<String, &Vendor> =
+        vendors.iter().map(|v| (v.name.to_lowercase(), v)).collect();
+    let vendor_by_short_id: HashMap<String, &Vendor> = vendors
+        .iter()
+        .filter_map(|v| v.short_id.as_ref().map(|sid| (sid.to_lowercase(), v)))
+        .collect();
+    let vendor_by_alias: HashMap<String, Uuid> = queries::get_vendor_import_aliases(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|a| (a.normalized_alias, a.vendor_id))
+        .collect();
+
+    let mut existing_keys: HashSet<String> = HashSet::new();
+    for r in receipts {
+        if !r.receipt_number.trim().is_empty() {
+            existing_keys.insert(receipt_duplicate_key(r.vendor_id, &r.receipt_number));
+        }
+    }
+
+    let mut batch_keys: HashSet<String> = HashSet::new();
+    let mut success_count = 0;
+    let mut duplicate_count = 0;
+    let mut errors: Vec<ImportError> = Vec::new();
+
+    let csv_lines: Vec<String> = request.csv_data.lines().map(|s| s.to_string()).collect();
+    let header_line = csv_lines.first().cloned().unwrap_or_default();
+
+    for (row_idx, result) in reader.deserialize::<CsvReceiptRow>().enumerate() {
+        let row_num = row_idx + 2;
+        let original_line = csv_lines.get(row_num - 1).cloned().unwrap_or_default();
+
+        match result {
+            Ok(row) => {
+                let vendor = match resolve_vendor(
+                    &row.vendor,
+                    &vendors,
+                    &vendor_by_name,
+                    &vendor_by_short_id,
+                    &vendor_by_alias,
+                ) {
+                    Some(v) => v,
+                    None => {
+                        errors.push(ImportError {
+                            row: row_num,
+                            message: format!("Vendor not found: {}", row.vendor),
+                            original_data: original_line,
+                        });
+                        continue;
+                    }
+                };
+
+                let receipt_date = match parse_date_yyyy_mm_dd_or_mm_dd_yyyy(&row.receipt_date) {
+                    Ok(d) => d,
+                    Err(message) => {
+                        errors.push(ImportError {
+                            row: row_num,
+                            message,
+                            original_data: original_line,
+                        });
+                        continue;
+                    }
+                };
+
+                let subtotal = match parse_decimal(&row.subtotal, "subtotal") {
+                    Ok(v) => v,
+                    Err(message) => {
+                        errors.push(ImportError {
+                            row: row_num,
+                            message,
+                            original_data: original_line,
+                        });
+                        continue;
+                    }
+                };
+
+                let tax_amount =
+                    match parse_optional_decimal(row.tax_amount.as_deref(), "tax_amount") {
+                        Ok(v) => v,
+                        Err(message) => {
+                            errors.push(ImportError {
+                                row: row_num,
+                                message,
+                                original_data: original_line,
+                            });
+                            continue;
+                        }
+                    };
+
+                let payment_card_last4 =
+                    match normalize_optional_last4(row.payment_card_last4.as_deref()) {
+                        Ok(v) => v,
+                        Err(message) => {
+                            errors.push(ImportError {
+                                row: row_num,
+                                message,
+                                original_data: original_line,
+                            });
+                            continue;
+                        }
+                    };
+
+                let receipt_number = row
+                    .receipt_number
+                    .as_ref()
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty());
+
+                if let Some(number) = receipt_number.as_ref() {
+                    let key = receipt_duplicate_key(vendor.id, number);
+                    if existing_keys.contains(&key) {
+                        duplicate_count += 1;
+                        errors.push(ImportError {
+                            row: row_num,
+                            message: format!(
+                                "Duplicate receipt for vendor {}: {}",
+                                vendor.name, number
+                            ),
+                            original_data: original_line,
+                        });
+                        continue;
+                    }
+
+                    if batch_keys.contains(&key) {
+                        duplicate_count += 1;
+                        errors.push(ImportError {
+                            row: row_num,
+                            message:
+                                "Duplicate in CSV: same vendor + receipt number appears earlier"
+                                    .to_string(),
+                            original_data: original_line,
+                        });
+                        continue;
+                    }
+
+                    batch_keys.insert(key.clone());
+                    existing_keys.insert(key);
+                }
+
+                let source_vendor_alias = row.vendor.trim().to_string();
+
+                if !source_vendor_alias.is_empty() {
+                    if let Err(e) = queries::upsert_vendor_import_alias(
+                        &state.pool,
+                        &source_vendor_alias,
+                        vendor.id,
+                    )
+                    .await
+                    {
+                        errors.push(ImportError {
+                            row: row_num,
+                            message: format!("Database error: {}", e),
+                            original_data: original_line,
+                        });
+                        continue;
+                    }
+                }
+
+                let create_receipt = CreateReceipt {
+                    vendor_id: vendor.id,
+                    source_vendor_alias: if source_vendor_alias.is_empty() {
+                        None
+                    } else {
+                        Some(source_vendor_alias)
+                    },
+                    receipt_number,
+                    receipt_date,
+                    subtotal,
+                    tax_amount,
+                    tax_rate: None,
+                    payment_card_last4,
+                    ingestion_metadata: Some(json!({
+                        "source": "csv",
+                        "auto_parsed": false,
+                        "ingestion_version": "csv-v1"
+                    })),
+                    notes: row
+                        .notes
+                        .as_ref()
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty()),
+                };
+
+                match queries::create_receipt(&state.pool, create_receipt, user.user_id).await {
+                    Ok(_) => success_count += 1,
+                    Err(e) => errors.push(ImportError {
+                        row: row_num,
+                        message: format!("Database error: {}", e),
+                        original_data: original_line,
+                    }),
+                }
+            }
+            Err(e) => {
+                errors.push(ImportError {
+                    row: row_num,
+                    message: format!("CSV parse error: {}", e),
+                    original_data: original_line,
+                });
+            }
+        }
+    }
+
+    let failed_rows_csv = build_failed_csv(&header_line, &errors);
+
+    Ok(Json(ImportResult {
+        success_count,
+        error_count: errors.len(),
+        duplicate_count,
+        errors,
+        failed_rows_csv,
+    }))
+}
+
 // Helper to build failed rows CSV
 fn build_failed_csv(header_line: &str, errors: &[ImportError]) -> String {
     if errors.is_empty() {
@@ -1213,6 +1821,37 @@ pub struct ParsedInvoice {
     pub notes: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ParsedReceiptLineItem {
+    pub description: String,
+    pub quantity: i32,
+    pub unit_cost: Option<String>,
+    pub line_total: Option<String>,
+    pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ParsedReceipt {
+    pub vendor_name: Option<String>,
+    #[serde(default)]
+    pub suggested_vendor_id: Option<Uuid>,
+    pub receipt_number: Option<String>,
+    pub receipt_date: Option<String>,
+    pub subtotal: Option<String>,
+    pub tax: Option<String>,
+    pub total: Option<String>,
+    pub card_last4: Option<String>,
+    #[serde(default)]
+    pub confidence_score: Option<f32>,
+    #[serde(default)]
+    pub parse_engine: Option<String>,
+    #[serde(default)]
+    pub parse_version: Option<String>,
+    pub line_items: Vec<ParsedReceiptLineItem>,
+    pub warnings: Vec<String>,
+    pub raw_text_lines: Option<Vec<String>>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct InvoicePdfCommitErrorResponse {
     pub error_code: String,
@@ -1374,6 +2013,127 @@ async fn parse_invoice_pdf(
     };
 
     Ok(Json(result))
+}
+
+async fn parse_receipt_image(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    mut multipart: Multipart,
+) -> Result<Json<ParsedReceipt>, (StatusCode, String)> {
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name = "receipt-upload".to_string();
+    let mut content_type = "application/octet-stream".to_string();
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {e}")))?
+    {
+        if field.name() == Some("file") {
+            file_name = field.file_name().unwrap_or("receipt-upload").to_string();
+            if let Some(ct) = field.content_type() {
+                content_type = ct.to_string();
+            }
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Read error: {e}")))?;
+            file_bytes = Some(bytes.to_vec());
+            break;
+        }
+    }
+
+    let file_bytes = file_bytes.ok_or((
+        StatusCode::BAD_REQUEST,
+        "No file field in upload".to_string(),
+    ))?;
+
+    let ocr_service_url =
+        std::env::var("OCR_SERVICE_URL").unwrap_or_else(|_| "http://localhost:8001".to_string());
+    let endpoint = format!("{}/parse-receipt", ocr_service_url.trim_end_matches('/'));
+
+    let client = reqwest::Client::new();
+    let part = match reqwest::multipart::Part::bytes(file_bytes.clone())
+        .file_name(file_name.clone())
+        .mime_str(&content_type)
+    {
+        Ok(p) => p,
+        Err(_) => reqwest::multipart::Part::bytes(file_bytes).file_name(file_name),
+    };
+    let form = reqwest::multipart::Form::new().part("file", part);
+
+    let response = client
+        .post(&endpoint)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Receipt OCR service is unavailable: {e}"),
+            )
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unable to read OCR error body>".to_string());
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Receipt OCR service failed ({status}): {body}"),
+        ));
+    }
+
+    let mut parsed = response.json::<ParsedReceipt>().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Receipt OCR service returned invalid JSON: {e}"),
+        )
+    })?;
+
+    if parsed.suggested_vendor_id.is_none() {
+        if let Some(vendor_name) = parsed
+            .vendor_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let from_alias = queries::resolve_vendor_id_by_import_alias(&state.pool, vendor_name)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let suggested_vendor_id = if from_alias.is_some() {
+                from_alias
+            } else {
+                let vendors = queries::get_all_vendors(&state.pool)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                let vendor_name_lower = vendor_name.to_lowercase();
+
+                vendors
+                    .iter()
+                    .find(|v| v.name.to_lowercase() == vendor_name_lower)
+                    .map(|v| v.id)
+                    .or_else(|| {
+                        vendors
+                            .iter()
+                            .find(|v| {
+                                v.short_id
+                                    .as_deref()
+                                    .map(|sid| sid.eq_ignore_ascii_case(vendor_name))
+                                    .unwrap_or(false)
+                            })
+                            .map(|v| v.id)
+                    })
+            };
+
+            parsed.suggested_vendor_id = suggested_vendor_id;
+        }
+    }
+
+    Ok(Json(parsed))
 }
 
 async fn commit_invoice_pdf(

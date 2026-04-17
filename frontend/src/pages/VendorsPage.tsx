@@ -1,4 +1,5 @@
 import { useState } from "react"
+import { Link } from "react-router-dom"
 import { useQueryClient } from "@tanstack/react-query"
 import { useVendors, useCreateVendor, useUpdateVendor, useDeleteVendor } from "@/hooks/useApi"
 import { importApi, type VendorPreview, type PreviewRow } from "@/api"
@@ -205,7 +206,11 @@ export default function VendorsPage() {
             <TableBody>
               {vendors.map((vendor) => (
                 <TableRow key={vendor.id}>
-                  <TableCell>{vendor.name}</TableCell>
+                  <TableCell>
+                    <Link className="text-blue-600 hover:underline" to={`/vendors/${vendor.id}`}>
+                      {vendor.name}
+                    </Link>
+                  </TableCell>
                   <TableCell className="font-mono">{vendor.short_id || "—"}</TableCell>
                   <TableCell>
                     <RowActions

@@ -42,12 +42,12 @@ import {
 import { ExportCsvButton } from "@/components/ExportCsvButton"
 import { StatusSelect } from "@/components/StatusSelect"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
+import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
 import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, FileDown, Upload, Loader2, ChevronDown, ChevronRight } from "lucide-react"
-import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
+import { formatCurrency, formatDate } from "@/lib/utils"
 import { ApiError, invoices as invoicesApi, receipts as receiptsApi, purchases as purchasesApi, type PurchaseAllocation, type ReceiptLineItem } from "@/api"
 
 type InvoicePurchase = ReturnType<typeof useInvoicePurchases>["data"] extends (infer T)[] | undefined ? T : never
-
 
 export default function InvoiceDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -60,6 +60,7 @@ export default function InvoiceDetailPage() {
   const { data: destinations = [] } = useDestinations()
   const { data: receipts = [] } = useReceipts()
   const { data: vendors = [] } = useVendors()
+  const invoiceLocked = invoice?.reconciliation_state === "locked"
 
   const createPurchase = useCreatePurchase()
   const updatePurchase = useUpdatePurchase()
@@ -68,7 +69,11 @@ export default function InvoiceDetailPage() {
 
   // PDF upload state
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const backupInputRef = useRef<HTMLInputElement>(null)
   const [isUploadingPdf, setIsUploadingPdf] = useState(false)
+  const [isExportingBackup, setIsExportingBackup] = useState(false)
+  const [isImportingBackup, setIsImportingBackup] = useState(false)
+  const [isSavingReconciliationState, setIsSavingReconciliationState] = useState(false)
 
   const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -77,13 +82,105 @@ export default function InvoiceDetailPage() {
     setIsUploadingPdf(true)
     try {
       await invoicesApi.uploadPdf(id, file)
-      queryClient.invalidateQueries({ queryKey: ["invoice", id] })
+      queryClient.invalidateQueries({ queryKey: ["invoices", id] })
     } catch (err) {
       alert(err instanceof Error ? err.message : "Failed to upload PDF")
     } finally {
       setIsUploadingPdf(false)
       if (fileInputRef.current) {
         fileInputRef.current.value = ""
+      }
+    }
+  }
+
+  const handleFinalizeInvoice = async () => {
+    if (!id || !invoice || invoiceLocked) return
+
+    const invoiceSubtotal = Number.parseFloat(invoice.subtotal || "0")
+    const invoicePurchasesTotal = purchases.reduce((sum, purchase) => {
+      const invoicePrice = purchase.invoice_unit_price
+        ? Number.parseFloat(purchase.invoice_unit_price)
+        : Number.NaN
+      const unitPrice = Number.isFinite(invoicePrice)
+        ? invoicePrice
+        : Number.parseFloat(purchase.purchase_cost || "0")
+      return sum + purchase.quantity * unitPrice
+    }, 0)
+
+    const lineCount = purchases.length
+    const receiptedCount = purchases.filter((purchase) => {
+      const allocs = getEffectiveAllocations(purchase)
+      return Boolean(purchase.receipt_id) || allocs.length > 0
+    }).length
+
+    const difference = invoiceSubtotal - invoicePurchasesTotal
+    const issues: string[] = []
+    if (lineCount === 0) issues.push("No line items are linked to this invoice.")
+    if (Math.abs(difference) >= 0.01) {
+      issues.push(`Invoice subtotal and line totals differ by ${formatCurrency(Math.abs(difference))}.`)
+    }
+    if (lineCount > 0 && receiptedCount < lineCount) {
+      issues.push(`${receiptedCount}/${lineCount} line items are receipted.`)
+    }
+
+    const confirmMessage = issues.length > 0
+      ? `Finalize invoice with unresolved checks?\n\n- ${issues.join("\n- ")}\n\nFinalizing will lock this invoice and include it in dashboard reporting.`
+      : "Finalize this invoice? This will lock it and include it in dashboard reporting."
+
+    if (!confirm(confirmMessage)) return
+
+    setIsSavingReconciliationState(true)
+    try {
+      await invoicesApi.update(id, { reconciliation_state: "locked" })
+      queryClient.invalidateQueries({ queryKey: ["invoices", id] })
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      queryClient.invalidateQueries({ queryKey: ["reports"] })
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to finalize invoice")
+    } finally {
+      setIsSavingReconciliationState(false)
+    }
+  }
+
+  const handleExportBackup = async () => {
+    if (!id || !invoice) return
+
+    setIsExportingBackup(true)
+    try {
+      const blob = await invoicesApi.downloadBackup(id)
+      const safeInvoiceNumber = invoice.invoice_number.replace(/[^a-zA-Z0-9_-]+/g, "_")
+      const downloadUrl = URL.createObjectURL(blob)
+      const link = document.createElement("a")
+      link.href = downloadUrl
+      link.download = `invoice_${safeInvoiceNumber}_backup.zip`
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(downloadUrl)
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to export invoice backup")
+    } finally {
+      setIsExportingBackup(false)
+    }
+  }
+
+  const handleImportBackup = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    setIsImportingBackup(true)
+    try {
+      const restored = await invoicesApi.importBackup(file)
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      queryClient.invalidateQueries({ queryKey: ["receipts"] })
+      queryClient.invalidateQueries({ queryKey: ["purchases"] })
+      navigate(`/invoices/${restored.invoice_id}`)
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to restore invoice backup")
+    } finally {
+      setIsImportingBackup(false)
+      if (backupInputRef.current) {
+        backupInputRef.current.value = ""
       }
     }
   }
@@ -113,15 +210,12 @@ export default function InvoiceDetailPage() {
   const [allocationQty, setAllocationQty] = useState("1")
   const [allocationUnitCost, setAllocationUnitCost] = useState("")
   const [showNewReceipt, setShowNewReceipt] = useState(false)
-  const [newRcptVendorId, setNewRcptVendorId] = useState("")
-  const [newRcptNumber, setNewRcptNumber] = useState("")
-  const [newRcptDate, setNewRcptDate] = useState("")
-  const [newRcptSubtotal, setNewRcptSubtotal] = useState("")
-  const [newRcptTaxAmount, setNewRcptTaxAmount] = useState("")
-  const [newRcptFile, setNewRcptFile] = useState<File | null>(null)
   const [linkNotes, setLinkNotes] = useState("")
   const [expandedAllocations, setExpandedAllocations] = useState<Record<string, boolean>>({})
   const [allocationApiUnavailable, setAllocationApiUnavailable] = useState(false)
+  const [allocatableReceiptIds, setAllocatableReceiptIds] = useState<string[]>([])
+  const [loadingAllocatableReceipts, setLoadingAllocatableReceipts] = useState(false)
+  const receiptLineItemsCacheRef = useRef<Record<string, ReceiptLineItem[]>>({})
 
   const buildLegacyAllocations = (purchase: InvoicePurchase): PurchaseAllocation[] => {
     if (!purchase.receipt_id) return []
@@ -160,11 +254,14 @@ export default function InvoiceDetailPage() {
     if (allocs.length > 0 && allocatedQty === purchase.quantity && allocatedQty > 0) {
       return {
         unitCost: allocatedTotalCost / allocatedQty,
+        totalCost: allocatedTotalCost,
       }
     }
 
+    const unitCost = Number.parseFloat(purchase.purchase_cost || "0")
     return {
-      unitCost: Number.parseFloat(purchase.purchase_cost || "0"),
+      unitCost,
+      totalCost: unitCost * purchase.quantity,
     }
   }
 
@@ -210,27 +307,19 @@ export default function InvoiceDetailPage() {
   }
 
   const openLinkDialog = (purchase: InvoicePurchase) => {
+    if (invoiceLocked) return
     setLinkingPurchaseId(purchase.purchase_id)
     setLinkingPurchase(purchase)
     setLinkNotes(purchase.notes || "")
     setLoadingAllocations(true)
     const existing = getEffectiveAllocations(purchase)
     setAllocations(existing)
+    setAllocatableReceiptIds([])
     resetAllocationForm()
     setAllocationUnitCost("")
     setShowNewReceipt(false)
-    setNewRcptFile(null)
     setLinkDialogOpen(true)
     setLoadingAllocations(false)
-  }
-
-  const resetNewReceiptForm = () => {
-    setNewRcptVendorId("")
-    setNewRcptNumber("")
-    setNewRcptDate("")
-    setNewRcptSubtotal("")
-    setNewRcptTaxAmount("")
-    setNewRcptFile(null)
   }
 
   const reloadAllocations = async (purchaseId: string) => {
@@ -250,11 +339,58 @@ export default function InvoiceDetailPage() {
     setAllocations(rows)
     setAllocationsByPurchase(prev => ({ ...prev, [purchaseId]: rows }))
     setLoadingAllocations(false)
+    return rows
+  }
+
+  const getAllocationCapsForLine = (
+    line: ReceiptLineItem,
+    options?: {
+      allocationRows?: PurchaseAllocation[]
+      editingId?: string | null
+    }
+  ) => {
+    const allocationRows = options?.allocationRows ?? allocations
+    const editingId = options?.editingId ?? editingAllocationId
+
+    const editingAllocation = editingId
+      ? allocationRows.find((a) => a.id === editingId)
+      : undefined
+    const editingQtyOnLine =
+      editingAllocation?.receipt_line_item_id === line.id ? editingAllocation.allocated_qty : 0
+
+    const usedByOther = allocationRows
+      .filter((a) => a.id !== editingId)
+      .reduce((sum, a) => sum + a.allocated_qty, 0)
+
+    const purchaseCapacity = linkingPurchase
+      ? Math.max(0, linkingPurchase.quantity - usedByOther)
+      : Math.max(0, line.remaining_qty + editingQtyOnLine)
+    const receiptCapacity = Math.max(0, line.remaining_qty + editingQtyOnLine)
+    const maxAllocatable = Math.max(0, Math.min(receiptCapacity, purchaseCapacity))
+
+    return {
+      purchaseCapacity,
+      receiptCapacity,
+      maxAllocatable,
+    }
+  }
+
+  const getReceiptLineItemsCached = async (receiptId: string): Promise<ReceiptLineItem[]> => {
+    const cached = receiptLineItemsCacheRef.current[receiptId]
+    if (cached) {
+      return cached
+    }
+
+    const rows = await receiptsApi.lineItems.list(receiptId)
+    receiptLineItemsCacheRef.current[receiptId] = rows
+    return rows
   }
 
   const loadReceiptLineItemsForAllocation = async (receiptId: string, purchase: InvoicePurchase) => {
-    const rows = await receiptsApi.lineItems.list(receiptId)
-    const sameItemRows = rows.filter((row) => row.item_id === purchase.item_id)
+    const rows = await getReceiptLineItemsCached(receiptId)
+    const sameItemRows = rows
+      .filter((row) => row.item_id === purchase.item_id)
+      .sort((a, b) => b.remaining_qty - a.remaining_qty)
     setAllocationReceiptLineItems(sameItemRows)
 
     if (sameItemRows.length === 0) {
@@ -267,8 +403,75 @@ export default function InvoiceDetailPage() {
     const candidate = sameItemRows[0]
     setAllocationReceiptLineItemId(candidate.id)
     setAllocationUnitCost(Number.parseFloat(candidate.unit_cost).toFixed(2))
+    const caps = getAllocationCapsForLine(candidate)
+    if (caps.maxAllocatable > 0) {
+      setAllocationQty(String(caps.maxAllocatable))
+    } else {
+      setAllocationQty("")
+      setAllocationWarning("No allocatable quantity remains for this line.")
+      return
+    }
     setAllocationWarning("")
   }
+
+  const refreshAllocatableReceipts = async (purchase: InvoicePurchase) => {
+    setLoadingAllocatableReceipts(true)
+
+    try {
+      const candidateIds = (
+        await Promise.all(
+          receipts.map(async (receipt) => {
+            const rows = await getReceiptLineItemsCached(receipt.id)
+            const sameItemRows = rows.filter((row) => row.item_id === purchase.item_id)
+            const hasAllocatableLine = sameItemRows.some(
+              (line) => getAllocationCapsForLine(line).maxAllocatable > 0
+            )
+            return hasAllocatableLine ? receipt.id : null
+          })
+        )
+      ).filter((candidateId): candidateId is string => Boolean(candidateId))
+
+      setAllocatableReceiptIds(candidateIds)
+
+      if (candidateIds.length === 0) {
+        setAllocationReceiptId("")
+        setAllocationReceiptLineItemId("")
+        setAllocationReceiptLineItems([])
+        setAllocationUnitCost("")
+        setAllocationQty("")
+        setAllocationWarning("No receipts currently have allocatable line items for this product.")
+        return
+      }
+
+      const currentSelectionIsValid =
+        allocationReceiptId.length > 0 && candidateIds.includes(allocationReceiptId)
+      const nextReceiptId = currentSelectionIsValid ? allocationReceiptId : candidateIds[0]
+
+      if (!currentSelectionIsValid || allocationReceiptLineItems.length === 0) {
+        await handleAllocationReceiptChange(nextReceiptId)
+      }
+    } catch (err) {
+      setAllocatableReceiptIds([])
+      setAllocationError(
+        err instanceof Error ? err.message : "Failed to load allocatable receipts"
+      )
+    } finally {
+      setLoadingAllocatableReceipts(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!linkDialogOpen || showNewReceipt || !linkingPurchase) return
+
+    void refreshAllocatableReceipts(linkingPurchase)
+  }, [
+    linkDialogOpen,
+    showNewReceipt,
+    linkingPurchase?.purchase_id,
+    allocations,
+    editingAllocationId,
+    receipts,
+  ])
 
   const handleAllocationReceiptChange = async (value: string) => {
     const selectedReceiptId = value === "__none__" ? "" : value
@@ -307,22 +510,37 @@ export default function InvoiceDetailPage() {
 
     setAllocationUnitCost(Number.parseFloat(line.unit_cost).toFixed(2))
 
-    const requestedQty = Number.parseInt(allocationQty || "0", 10)
-    if (requestedQty > line.remaining_qty) {
-      setAllocationWarning(`Requested qty (${requestedQty}) exceeds remaining receipt qty (${line.remaining_qty}).`)
+    const caps = getAllocationCapsForLine(line)
+    if (caps.maxAllocatable <= 0) {
+      setAllocationQty("")
+      setAllocationWarning("No allocatable quantity remains for this line.")
+      return
     }
+
+    setAllocationQty(String(caps.maxAllocatable))
+
+    if (caps.maxAllocatable < caps.receiptCapacity) {
+      setAllocationWarning(`Purchase line has only ${caps.purchaseCapacity} qty left, so max allocatable here is ${caps.maxAllocatable}.`)
+      return
+    }
+
+    setAllocationWarning("")
   }
 
   const handleSaveAllocation = async () => {
+    if (invoiceLocked) {
+      alert("Finalized invoices are locked.")
+      return
+    }
     if (!linkingPurchaseId || !linkingPurchase) return
 
-    const qty = Number.parseInt(allocationQty || "0", 10)
+    const requestedQty = Number.parseInt(allocationQty || "0", 10)
     let unitCost = allocationUnitCost.trim()
     if (!allocationReceiptId) {
       setAllocationError("Select a receipt")
       return
     }
-    if (!qty || qty <= 0) {
+    if (!requestedQty || requestedQty <= 0) {
       setAllocationError("Allocated quantity must be greater than zero")
       return
     }
@@ -337,18 +555,27 @@ export default function InvoiceDetailPage() {
       return
     }
 
-    if (qty > selectedLineItem.remaining_qty) {
-      setAllocationError(`Allocated qty (${qty}) exceeds remaining receipt qty (${selectedLineItem.remaining_qty}).`)
-      return
-    }
-
     if (!selectedLineItem.unit_cost) {
       setAllocationError("Unit cost must come from receipt line items. Use Edit Receipt to set it.")
       return
     }
 
+    const caps = getAllocationCapsForLine(selectedLineItem)
+    if (caps.maxAllocatable <= 0) {
+      setAllocationError("No allocatable quantity remains for this receipt line.")
+      return
+    }
+
+    const qty = Math.min(requestedQty, caps.maxAllocatable)
+    if (qty < requestedQty) {
+      setAllocationWarning(
+        `Requested qty (${requestedQty}) exceeds max allocatable qty (${caps.maxAllocatable}); allocating ${qty} instead.`
+      )
+    }
+
     unitCost = Number.parseFloat(selectedLineItem.unit_cost).toFixed(2)
     setAllocationUnitCost(unitCost)
+    setAllocationQty(String(qty))
 
     const usedByOther = allocations
       .filter(a => a.id !== editingAllocationId)
@@ -376,8 +603,22 @@ export default function InvoiceDetailPage() {
         notes: linkNotes || undefined,
       })
 
-      await reloadAllocations(linkingPurchaseId)
-      resetAllocationForm()
+      const refreshedAllocations = await reloadAllocations(linkingPurchaseId)
+      const allocatedQty = refreshedAllocations.reduce((sum, row) => sum + row.allocated_qty, 0)
+      const remainingQty = Math.max(0, linkingPurchase.quantity - allocatedQty)
+
+      if (!editingAllocationId && remainingQty === 0) {
+        setLinkDialogOpen(false)
+        setShowNewReceipt(false)
+        setLinkingPurchase(null)
+        setLinkingPurchaseId(null)
+        setAllocations([])
+        setAllocatableReceiptIds([])
+        resetAllocationForm()
+      } else {
+        resetAllocationForm()
+      }
+
       queryClient.invalidateQueries({ queryKey: ["invoices"] })
       queryClient.invalidateQueries({ queryKey: ["receipts"] })
     } catch (err) {
@@ -391,6 +632,10 @@ export default function InvoiceDetailPage() {
   }
 
   const handleDeleteAllocation = async (allocationId: string) => {
+    if (invoiceLocked) {
+      alert("Finalized invoices are locked.")
+      return
+    }
     if (!linkingPurchaseId) return
     await purchasesApi.allocations.delete(linkingPurchaseId, allocationId)
     await reloadAllocations(linkingPurchaseId)
@@ -398,36 +643,85 @@ export default function InvoiceDetailPage() {
     queryClient.invalidateQueries({ queryKey: ["receipts"] })
   }
 
-  const handleCreateAndLink = async (e: React.FormEvent) => {
-    e.preventDefault()
+  const handleCreateReceipt = async (data: ReceiptFormSubmitData) => {
+    if (invoiceLocked) {
+      alert("Finalized invoices are locked.")
+      return
+    }
     if (!linkingPurchaseId) return
+
     const newReceipt = await createReceipt.mutateAsync({
-      vendor_id: newRcptVendorId,
-      ...(newRcptNumber.trim() ? { receipt_number: newRcptNumber.trim() } : {}),
-      receipt_date: newRcptDate,
-      subtotal: newRcptSubtotal,
-      tax_amount: newRcptTaxAmount,
+      vendor_id: data.vendor_id,
+      ...(data.receipt_number.trim() ? { receipt_number: data.receipt_number.trim() } : {}),
+      receipt_date: data.receipt_date,
+      subtotal: data.subtotal,
+      tax_amount: data.tax_amount,
+      payment_card_last4: data.payment_card_last4.trim() || undefined,
+      notes: data.notes || undefined,
     })
-    await receiptsApi.uploadPdf(newReceipt.id, newRcptFile!)
+
+    if (data.document_file) {
+      await receiptsApi.uploadPdf(newReceipt.id, data.document_file)
+    }
+
     setAllocationReceiptId(newReceipt.id)
     await reloadAllocations(linkingPurchaseId)
+
+    if (linkingPurchase) {
+      try {
+        await loadReceiptLineItemsForAllocation(newReceipt.id, linkingPurchase)
+      } catch {
+        setAllocationWarning("Could not load line items from the new receipt yet.")
+      }
+    }
+
     if (linkingPurchase) {
       const remaining = Math.max(1, linkingPurchase.quantity - totalAllocatedQty)
       setAllocationQty(String(remaining))
     }
+
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
     queryClient.invalidateQueries({ queryKey: ["receipts"] })
     setShowNewReceipt(false)
-    resetNewReceiptForm()
   }
 
   const totalAllocatedQty = allocations.reduce((sum, a) => sum + a.allocated_qty, 0)
+  const selectedAllocationLineItem = allocationReceiptLineItems.find((row) => row.id === allocationReceiptLineItemId)
+  const allocationCaps = selectedAllocationLineItem
+    ? getAllocationCapsForLine(selectedAllocationLineItem)
+    : null
+  const allocationMaxQty = allocationCaps?.maxAllocatable ?? 0
 
-  const toggleAllocationDrilldown = (purchaseId: string) => {
-    setExpandedAllocations((prev) => ({
-      ...prev,
-      [purchaseId]: !prev[purchaseId],
-    }))
+  const handleAllocationQtyChange = (value: string) => {
+    if (!selectedAllocationLineItem) return
+    if (value.trim() === "") {
+      setAllocationQty("")
+      return
+    }
+
+    const parsed = Number.parseInt(value, 10)
+    if (!Number.isFinite(parsed)) return
+
+    const maxQty = getAllocationCapsForLine(selectedAllocationLineItem).maxAllocatable
+    if (maxQty <= 0) {
+      setAllocationQty("")
+      return
+    }
+
+    const clamped = Math.min(Math.max(parsed, 1), maxQty)
+    setAllocationQty(String(clamped))
+  }
+
+  const toggleAllocationDrilldown = (purchaseId: string, defaultExpanded = false) => {
+    setExpandedAllocations((prev) => {
+      const hasUserState = Object.prototype.hasOwnProperty.call(prev, purchaseId)
+      const currentExpanded = hasUserState ? !!prev[purchaseId] : defaultExpanded
+
+      return {
+        ...prev,
+        [purchaseId]: !currentExpanded,
+      }
+    })
   }
 
   // Show all items (no vendor filtering needed for outgoing invoices)
@@ -435,6 +729,10 @@ export default function InvoiceDetailPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (invoiceLocked) {
+      alert("Finalized invoices are locked.")
+      return
+    }
     if (editingPurchaseId) {
       await updatePurchase.mutateAsync({
         id: editingPurchaseId,
@@ -486,6 +784,10 @@ export default function InvoiceDetailPage() {
   }
 
   const handleEditPurchase = (p: typeof purchases[0]) => {
+    if (invoiceLocked) {
+      alert("Finalized invoices are locked.")
+      return
+    }
     setEditingPurchaseId(p.purchase_id)
     // Find item ID by name
     const matchedItem = items.find((i) => i.name === p.item_name)
@@ -500,11 +802,19 @@ export default function InvoiceDetailPage() {
   }
 
   const handleStatusChange = async (purchaseId: string, newStatus: string) => {
+    if (invoiceLocked) {
+      alert("Finalized invoices are locked.")
+      return
+    }
     await updatePurchase.mutateAsync({ id: purchaseId, status: newStatus })
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
   }
 
   const handleDeletePurchase = async (purchaseId: string) => {
+    if (invoiceLocked) {
+      alert("Finalized invoices are locked.")
+      return
+    }
     if (confirm("Remove this purchase from the invoice?")) {
       await deletePurchase.mutateAsync(purchaseId)
       queryClient.invalidateQueries({ queryKey: ["invoices"] })
@@ -515,18 +825,30 @@ export default function InvoiceDetailPage() {
   if (!invoice) return <div className="text-muted-foreground">Invoice not found</div>
 
   const invoiceSubtotal = parseFloat(invoice.subtotal)
-  const purchasesTotal = parseFloat(invoice.purchases_total || "0")
+  const purchasesTotal = purchases.reduce((sum, purchase) => {
+    const invoicePrice = purchase.invoice_unit_price
+      ? Number.parseFloat(purchase.invoice_unit_price)
+      : Number.NaN
+    const unitPrice = Number.isFinite(invoicePrice)
+      ? invoicePrice
+      : Number.parseFloat(purchase.purchase_cost || "0")
+    return sum + purchase.quantity * unitPrice
+  }, 0)
   const difference = invoiceSubtotal - purchasesTotal
   const isReconciled = Math.abs(difference) < 0.01
-  const purchaseCount = invoice.purchase_count || 0
-
+  const purchaseCount = purchases.length
   const totalQuantity = purchases.reduce((sum, p) => sum + p.quantity, 0)
-  const totalCost = purchases.reduce((sum, p) => sum + parseFloat(p.total_cost || "0"), 0)
+  const totalCost = purchases.reduce((sum, p) => sum + getDisplayPurchaseCosts(p).totalCost, 0)
   const totalCommission = purchases.reduce((sum, p) => sum + parseFloat(p.total_commission || "0"), 0)
-  const hasAnyPrice = purchases.some(p => p.invoice_unit_price !== null)
-  const receiptedCount = invoice.receipted_count || purchases.filter(p => p.receipt_id).length
+  const hasAnyPrice = purchases.some((p) => p.invoice_unit_price !== null)
+  const receiptedCount = purchases.filter((p) => {
+    const allocs = getEffectiveAllocations(p)
+    return Boolean(p.receipt_id) || allocs.length > 0
+  }).length
   const totalPurchases = purchases.length
-  const fullyReconciled = isReconciled && totalPurchases > 0 && receiptedCount === totalPurchases
+  const isFinalized = invoice.reconciliation_state === "locked"
+  const hasReceiptGap = totalPurchases > 0 && receiptedCount < totalPurchases
+  const canFinalize = isReconciled && totalPurchases > 0 && !hasReceiptGap
 
   return (
     <div className="space-y-6">
@@ -542,13 +864,20 @@ export default function InvoiceDetailPage() {
             {invoice.order_number && ` · Order: ${invoice.order_number}`}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           {/* Hidden file input for PDF upload */}
           <input
             ref={fileInputRef}
             type="file"
             accept=".pdf"
             onChange={handlePdfUpload}
+            className="hidden"
+          />
+          <input
+            ref={backupInputRef}
+            type="file"
+            accept=".zip"
+            onChange={handleImportBackup}
             className="hidden"
           />
           
@@ -609,52 +938,104 @@ export default function InvoiceDetailPage() {
             data={purchases}
             size="sm"
           />
-          {fullyReconciled ? (
-            <span className="flex items-center gap-1 text-green-600 bg-green-50 px-3 py-1.5 rounded-full text-sm font-medium">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleExportBackup}
+            disabled={isExportingBackup || purchases.length === 0}
+          >
+            {isExportingBackup ? (
+              <>
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                Exporting Backup...
+              </>
+            ) : (
+              <>
+                <FileDown className="h-4 w-4 mr-2" />
+                Export Backup
+              </>
+            )}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => backupInputRef.current?.click()}
+            disabled={isImportingBackup}
+          >
+            {isImportingBackup ? (
+              <>
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                Restoring...
+              </>
+            ) : (
+              <>
+                <Upload className="h-4 w-4 mr-2" />
+                Restore Backup
+              </>
+            )}
+          </Button>
+          {isFinalized ? (
+            <span className="flex items-center gap-1 text-green-700 bg-green-50 px-3 py-1.5 rounded-full text-sm font-medium">
               <CheckCircle2 className="h-4 w-4" />
-              Reconciled
+              Finalized
             </span>
           ) : (
-            <>
-              {!isReconciled && (
-                <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
-                  <AlertCircle className="h-4 w-4" />
-                  {purchaseCount === 0 ? "No purchases linked" : `${formatCurrency(Math.abs(difference))} ${difference > 0 ? "unaccounted" : "over"}`}
-                </span>
+            <Button
+              size="sm"
+              onClick={handleFinalizeInvoice}
+              disabled={isSavingReconciliationState}
+            >
+              {isSavingReconciliationState ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Finalizing...
+                </>
+              ) : (
+                "Finalize Invoice"
               )}
-              {totalPurchases > 0 && receiptedCount < totalPurchases && (
-                <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
-                  <AlertCircle className="h-4 w-4" />
-                  {receiptedCount}/{totalPurchases} receipted
-                </span>
-              )}
-            </>
+            </Button>
+          )}
+          {!isFinalized && canFinalize && (
+            <span className="flex items-center gap-1 text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-full text-sm font-medium">
+              <CheckCircle2 className="h-4 w-4" />
+              Ready to finalize
+            </span>
+          )}
+          {!isFinalized && !isReconciled && (
+            <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
+              <AlertCircle className="h-4 w-4" />
+              {purchaseCount === 0 ? "No purchases linked" : `${formatCurrency(Math.abs(difference))} ${difference > 0 ? "unaccounted" : "over"}`}
+            </span>
+          )}
+          {!isFinalized && hasReceiptGap && (
+            <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
+              <AlertCircle className="h-4 w-4" />
+              {receiptedCount}/{totalPurchases} receipted
+            </span>
+          )}
+          {isFinalized && (!isReconciled || hasReceiptGap) && (
+            <span className="flex items-center gap-1 text-amber-700 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
+              <AlertCircle className="h-4 w-4" />
+              Finalized with unresolved checks
+            </span>
           )}
         </div>
       </div>
 
+      {isFinalized && (
+        <div className="rounded-md border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-800">
+          This invoice is finalized and locked. Line items and receipt allocations are read-only.
+        </div>
+      )}
+
       {/* Summary Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         <Card>
           <CardContent className="pt-6">
             <p className="text-sm text-muted-foreground">Subtotal (pre-tax)</p>
             <p className="text-2xl font-bold">{formatCurrency(invoice.subtotal)}</p>
             <p className="text-xs text-muted-foreground mt-1">
-              +{formatNumber(invoice.tax_rate)}% tax = {formatCurrency(invoice.total)}
-            </p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-muted-foreground">Purchases Total</p>
-            <p className="text-2xl font-bold">{formatCurrency(purchasesTotal)}</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-muted-foreground">Difference</p>
-            <p className={`text-2xl font-bold ${isReconciled ? "text-green-600" : "text-amber-600"}`}>
-              {formatCurrency(difference)}
+              + tax = {formatCurrency(invoice.total)}
             </p>
           </CardContent>
         </Card>
@@ -710,7 +1091,7 @@ export default function InvoiceDetailPage() {
                 <Button onClick={() => {
                   resetForm()
                   if (invoice) setDestinationId(invoice.destination_id)
-                }}>
+                }} disabled={isFinalized}>
                   <Plus className="h-4 w-4 mr-2" />
                   Add Line Item
                 </Button>
@@ -825,7 +1206,6 @@ export default function InvoiceDetailPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Item</TableHead>
-                  <TableHead>Dest</TableHead>
                   <TableHead>Receipts</TableHead>
                   <TableHead className="text-right">Qty</TableHead>
                   <TableHead className="text-right">Purchase Cost</TableHead>
@@ -841,7 +1221,10 @@ export default function InvoiceDetailPage() {
                   const allocs = getEffectiveAllocations(p)
                   const allocated = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
                   const isPartiallyAllocated = allocated > 0 && allocated < p.quantity
-                  const isExpanded = isPartiallyAllocated || !!expandedAllocations[p.purchase_id]
+                  const hasUserExpansionState = Object.prototype.hasOwnProperty.call(expandedAllocations, p.purchase_id)
+                  const isExpanded = hasUserExpansionState
+                    ? !!expandedAllocations[p.purchase_id]
+                    : isPartiallyAllocated
                   const displayCosts = getDisplayPurchaseCosts(p)
 
                   return (
@@ -852,18 +1235,23 @@ export default function InvoiceDetailPage() {
                             {p.item_name}
                           </Link>
                         </TableCell>
-                        <TableCell className="font-mono">{p.destination_code || "-"}</TableCell>
                         <TableCell>
                           {allocs.length > 0 ? (
                             <div className="space-y-1">
-                              <div className="text-xs text-emerald-700 font-medium">{allocated}/{p.quantity} allocated</div>
+                              <div className={`text-xs font-medium ${isPartiallyAllocated ? "text-amber-700" : "text-emerald-700"}`}>
+                                {allocated}/{p.quantity} allocated
+                              </div>
                               <div className="text-[11px] text-muted-foreground">{allocs.length} receipt link{allocs.length > 1 ? "s" : ""}</div>
                               <div className="flex items-center gap-3">
                                 {isPartiallyAllocated ? (
-                                  <span className="text-[11px] text-amber-700 inline-flex items-center gap-1">
-                                    <ChevronDown className="h-3 w-3" />
-                                    partially allocated (auto-expanded)
-                                  </span>
+                                  <button
+                                    onClick={() => toggleAllocationDrilldown(p.purchase_id, isPartiallyAllocated)}
+                                    className="text-[11px] text-amber-700 hover:text-amber-800 hover:underline inline-flex items-center gap-1"
+                                    title={isExpanded ? "Hide allocation breakdown" : "Show allocation breakdown"}
+                                  >
+                                    {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                                    partially allocated
+                                  </button>
                                 ) : (
                                   <button
                                     onClick={() => toggleAllocationDrilldown(p.purchase_id)}
@@ -874,24 +1262,45 @@ export default function InvoiceDetailPage() {
                                     {isExpanded ? "hide breakdown" : "view breakdown"}
                                   </button>
                                 )}
-                                <button
-                                  onClick={() => openLinkDialog(p)}
-                                  className="text-[11px] text-muted-foreground hover:underline"
-                                  title="Manage allocations"
-                                >
-                                  manage allocations
-                                </button>
+                                {isPartiallyAllocated && (
+                                  !isFinalized && (
+                                  <button
+                                    onClick={() => openLinkDialog(p)}
+                                    className="text-[11px] text-amber-700 hover:text-amber-800 hover:underline inline-flex items-center gap-1"
+                                    title="Link remaining quantity to a receipt"
+                                  >
+                                    <AlertCircle className="h-3 w-3" />
+                                    link receipt
+                                  </button>
+                                  )
+                                )}
+                                {!isFinalized && (
+                                  <button
+                                    onClick={() => openLinkDialog(p)}
+                                    className="text-[11px] text-muted-foreground hover:underline"
+                                    title="Manage allocations"
+                                  >
+                                    manage allocations
+                                  </button>
+                                )}
                               </div>
                             </div>
                           ) : (
-                            <button
-                              onClick={() => openLinkDialog(p)}
-                              className="text-red-500 text-xs flex items-center gap-1 hover:underline cursor-pointer"
-                              title="Click to allocate to receipts"
-                            >
-                              <AlertCircle className="h-3 w-3" />
-                              unallocated
-                            </button>
+                            isFinalized ? (
+                              <span className="text-red-500 text-xs flex items-center gap-1">
+                                <AlertCircle className="h-3 w-3" />
+                                unallocated
+                              </span>
+                            ) : (
+                              <button
+                                onClick={() => openLinkDialog(p)}
+                                className="text-red-500 text-xs flex items-center gap-1 hover:underline cursor-pointer"
+                                title="Click to allocate to receipts"
+                              >
+                                <AlertCircle className="h-3 w-3" />
+                                unallocated
+                              </button>
+                            )
                           )}
                         </TableCell>
                         <TableCell className="text-right">{p.quantity}</TableCell>
@@ -905,6 +1314,7 @@ export default function InvoiceDetailPage() {
                           <StatusSelect
                             value={p.status}
                             onValueChange={(value) => handleStatusChange(p.purchase_id, value)}
+                            disabled={isFinalized}
                           />
                         </TableCell>
                         <TableCell>
@@ -913,6 +1323,7 @@ export default function InvoiceDetailPage() {
                               size="icon"
                               variant="ghost"
                               onClick={() => handleEditPurchase(p)}
+                              disabled={isFinalized}
                             >
                               <Pencil className="h-4 w-4" />
                             </Button>
@@ -921,6 +1332,7 @@ export default function InvoiceDetailPage() {
                               variant="ghost"
                               className="text-red-600"
                               onClick={() => handleDeletePurchase(p.purchase_id)}
+                              disabled={isFinalized}
                             >
                               <Trash2 className="h-4 w-4" />
                             </Button>
@@ -930,12 +1342,25 @@ export default function InvoiceDetailPage() {
 
                       {isExpanded && (
                         <TableRow>
-                          <TableCell colSpan={10} className="bg-muted/30 py-3">
-                            <div className="space-y-2">
-                              <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-                                Allocation Breakdown
+                          <TableCell colSpan={9} className="bg-muted/30 py-3">
+                            <div className={`ml-6 border-l-2 pl-4 space-y-2 ${isPartiallyAllocated ? "border-amber-300" : "border-muted-foreground/20"}`}>
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                                  Receipt Allocation Breakdown
+                                </div>
+                                {!isFinalized && isPartiallyAllocated && (
+                                  <button
+                                    onClick={() => openLinkDialog(p)}
+                                    className="text-[11px] text-amber-700 hover:text-amber-800 hover:underline inline-flex items-center gap-1"
+                                    title="Link remaining quantity to a receipt"
+                                  >
+                                    <AlertCircle className="h-3 w-3" />
+                                    link receipt
+                                  </button>
+                                )}
                               </div>
-                              <div className="border rounded-md bg-background overflow-hidden">
+
+                              <div className={`border rounded-md bg-background overflow-hidden ${isPartiallyAllocated ? "border-amber-200" : ""}`}>
                                 <Table>
                                   <TableHeader>
                                     <TableRow>
@@ -965,7 +1390,8 @@ export default function InvoiceDetailPage() {
                                   </TableBody>
                                 </Table>
                               </div>
-                              <div className="text-xs text-muted-foreground">
+
+                              <div className={`text-xs ${isPartiallyAllocated ? "text-amber-700" : "text-muted-foreground"}`}>
                                 Total allocated on this line: {allocated}/{p.quantity} units
                               </div>
                             </div>
@@ -976,7 +1402,7 @@ export default function InvoiceDetailPage() {
                   )
                 })}
                 {purchases.length === 0 && (
-                  <EmptyTableRow colSpan={10}>
+                  <EmptyTableRow colSpan={9}>
                     <div className="flex flex-col items-center gap-2 py-4">
                       <Package className="h-8 w-8" />
                       <p>No purchases linked to this invoice yet</p>
@@ -1003,73 +1429,31 @@ export default function InvoiceDetailPage() {
           setLinkingPurchase(null)
           setLinkingPurchaseId(null)
           setAllocations([])
+          setAllocatableReceiptIds([])
           resetAllocationForm()
-          resetNewReceiptForm()
         }
       }}>
-        <DialogContent className="w-[calc(100vw-2rem)] max-w-md sm:max-w-lg">
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-md sm:max-w-xl">
           <DialogHeader>
-            <DialogTitle>{showNewReceipt ? "New Receipt" : "Link Receipt"}</DialogTitle>
+            <DialogTitle>{showNewReceipt ? "Add Receipt" : "Link Receipt"}</DialogTitle>
           </DialogHeader>
           {showNewReceipt ? (
-            <form onSubmit={handleCreateAndLink} className="space-y-4 min-w-0">
-              <div className="space-y-2">
-                <Label>Vendor *</Label>
-                <Select value={newRcptVendorId} onValueChange={setNewRcptVendorId} required>
-                  <SelectTrigger className="w-full min-w-0">
-                    <SelectValue placeholder="Select vendor" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {vendors.map((v) => (
-                      <SelectItem key={v.id} value={v.id}>{v.name}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-2">
-                <Label>Receipt Number</Label>
-                <Input className="w-full min-w-0" value={newRcptNumber} onChange={(e) => setNewRcptNumber(e.target.value)} placeholder="Auto-generated if empty" />
-              </div>
-              <div className="space-y-2">
-                <Label>Date *</Label>
-                <Input className="w-full min-w-0" type="date" value={newRcptDate} onChange={(e) => setNewRcptDate(e.target.value)} required />
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>Subtotal *</Label>
-                  <Input className="w-full min-w-0" type="number" step="0.01" value={newRcptSubtotal} onChange={(e) => setNewRcptSubtotal(e.target.value)} placeholder="0.00" required />
-                </div>
-                <div className="space-y-2">
-                  <Label>Tax Amount *</Label>
-                  <Input className="w-full min-w-0" type="number" step="0.01" value={newRcptTaxAmount} onChange={(e) => setNewRcptTaxAmount(e.target.value)} placeholder="0.00" required />
-                </div>
-              </div>
-              <div className="space-y-2">
-                <Label>Receipt Document *</Label>
-                <Input
-                  className="w-full min-w-0 cursor-pointer"
-                  type="file"
-                  accept=".pdf,.png,.jpg,.jpeg,.webp"
-                  onChange={(e) => setNewRcptFile(e.target.files?.[0] || null)}
-                  required
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>Notes</Label>
-                <Input className="w-full min-w-0" value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
-              </div>
-              <div className="flex justify-between">
-                <Button type="button" variant="link" className="px-0" onClick={() => setShowNewReceipt(false)}>
-                  ← Back
-                </Button>
-                <div className="flex gap-2">
-                  <Button type="button" variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
-                  <Button type="submit" disabled={createReceipt.isPending}>
-                    {createReceipt.isPending ? "Creating..." : "Create & Link"}
-                  </Button>
-                </div>
-              </div>
-            </form>
+            <ReceiptForm
+              open={showNewReceipt}
+              vendors={vendors}
+              requireDocument
+              submitLabel="Create"
+              submittingLabel="Creating..."
+              isSubmitting={createReceipt.isPending}
+              onSubmit={handleCreateReceipt}
+              onCancel={() => setLinkDialogOpen(false)}
+              onBack={() => setShowNewReceipt(false)}
+              onImport={() => {
+                setLinkDialogOpen(false)
+                navigate("/receipts?import=1")
+              }}
+              importButtonLabel="Import Receipt"
+            />
           ) : (
             <div className="space-y-4 min-w-0">
               <div className="rounded-md bg-muted p-3 text-sm min-w-0">
@@ -1103,9 +1487,9 @@ export default function InvoiceDetailPage() {
                   <Label>Current Allocations</Label>
                   <div className="border rounded-md divide-y">
                     {allocations.map((a) => (
-                      <div key={a.id} className="p-3 text-sm flex items-center justify-between gap-2">
-                        <div>
-                          <div className="font-medium">{a.receipt_number} - {a.vendor_name}</div>
+                      <div key={a.id} className="p-3 text-sm flex flex-wrap items-center justify-between gap-2 sm:flex-nowrap">
+                        <div className="min-w-0">
+                          <div className="font-medium break-words">{a.receipt_number} - {a.vendor_name}</div>
                           <div className="text-muted-foreground">Qty {a.allocated_qty} × {formatCurrency(a.unit_cost)}</div>
                         </div>
                         <div className="flex gap-1">
@@ -1113,6 +1497,7 @@ export default function InvoiceDetailPage() {
                             type="button"
                             size="sm"
                             variant="ghost"
+                            disabled={isFinalized}
                             onClick={async () => {
                               setEditingAllocationId(a.id)
                               setAllocationReceiptId(a.receipt_id)
@@ -1134,6 +1519,7 @@ export default function InvoiceDetailPage() {
                             size="sm"
                             variant="ghost"
                             className="text-red-600"
+                            disabled={isFinalized}
                             onClick={() => handleDeleteAllocation(a.id)}
                           >
                             Remove
@@ -1152,39 +1538,90 @@ export default function InvoiceDetailPage() {
                 <Select
                   value={allocationReceiptId || "__none__"}
                   onValueChange={handleAllocationReceiptChange}
+                  disabled={isFinalized || loadingAllocatableReceipts || allocatableReceiptIds.length === 0}
                 >
                   <SelectTrigger className="w-full min-w-0">
-                    <SelectValue placeholder="Select receipt" />
+                    <SelectValue placeholder={loadingAllocatableReceipts ? "Finding allocatable receipts..." : "Select receipt"} />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="__none__">
                       <span className="text-muted-foreground">— No receipt</span>
                     </SelectItem>
-                    {receipts.map((r) => (
+                    {receipts
+                      .filter((r) => allocatableReceiptIds.includes(r.id))
+                      .map((r) => (
                       <SelectItem key={r.id} value={r.id}>
                         {r.receipt_number} - {r.vendor_name} ({formatCurrency(r.total)})
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
+                {loadingAllocatableReceipts ? (
+                  <p className="text-xs text-muted-foreground">Finding receipts with allocatable line items...</p>
+                ) : allocatableReceiptIds.length === 0 ? (
+                  <p className="text-xs text-amber-700">No allocatable receipts found for this product.</p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">Showing only receipts with allocatable line items for this product. Top result is auto-selected.</p>
+                )}
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={isFinalized}
+                    onClick={() => {
+                      setLinkDialogOpen(false)
+                      navigate("/receipts?import=1")
+                    }}
+                  >
+                    <Upload className="h-4 w-4 mr-2" />
+                    Import Receipt
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={isFinalized}
+                    onClick={() => setShowNewReceipt(true)}
+                  >
+                    <Plus className="h-4 w-4 mr-1" />
+                    Add Receipt
+                  </Button>
+                  {allocationReceiptId && (
+                    <Button
+                      type="button"
+                      variant="link"
+                      className="px-0"
+                      onClick={() => navigate(`/receipts/${allocationReceiptId}`)}
+                    >
+                      Edit Receipt
+                    </Button>
+                  )}
+                </div>
               </div>
               <div className="space-y-2">
-                <Label>Quantity *</Label>
+                <Label>Quantity (from receipt line) *</Label>
                 <Input
                   className="w-full min-w-0"
                   type="number"
                   min={1}
-                  max={linkingPurchase?.quantity || 1}
+                  max={allocationMaxQty || undefined}
                   value={allocationQty}
-                  onChange={(e) => setAllocationQty(e.target.value)}
+                  onChange={(e) => handleAllocationQtyChange(e.target.value)}
+                  disabled={isFinalized || !allocationReceiptLineItemId || allocationMaxQty <= 0}
                 />
+                {allocationCaps ? (
+                  <p className="text-xs text-muted-foreground">
+                    Receipt remaining: {allocationCaps.receiptCapacity} · Purchase remaining: {allocationCaps.purchaseCapacity} · Max allocatable: {allocationCaps.maxAllocatable}. You can reduce this quantity.
+                  </p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">Select a receipt line item to derive quantity.</p>
+                )}
               </div>
               <div className="space-y-2">
                 <Label>Receipt Line Item *</Label>
                 <Select
                   value={allocationReceiptLineItemId || "__none__"}
                   onValueChange={handleAllocationReceiptLineItemChange}
-                  disabled={!allocationReceiptId}
+                  disabled={isFinalized || !allocationReceiptId}
                 >
                   <SelectTrigger className="w-full min-w-0">
                     <SelectValue placeholder={allocationReceiptId ? "Select receipt line item" : "Select receipt first"} />
@@ -1216,42 +1653,20 @@ export default function InvoiceDetailPage() {
                 <Label>Notes</Label>
                 <Input className="w-full min-w-0" value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
               </div>
-              <div className="flex justify-between">
-                <div className="flex items-center gap-3">
-                  <Button
-                    variant="link"
-                    className="px-0 text-emerald-600"
-                    onClick={() => setShowNewReceipt(true)}
-                  >
-                    <Plus className="h-4 w-4 mr-1" />
-                    New Receipt
+              <div className="flex flex-wrap gap-2 sm:justify-end">
+                {editingAllocationId && (
+                  <Button variant="outline" onClick={resetAllocationForm} disabled={isFinalized}>
+                    Reset
                   </Button>
-                  {allocationReceiptId && (
-                    <Button
-                      type="button"
-                      variant="link"
-                      className="px-0"
-                      onClick={() => navigate(`/receipts/${allocationReceiptId}`)}
-                    >
-                      Edit Receipt
-                    </Button>
-                  )}
-                </div>
-                <div className="flex gap-2">
-                  {editingAllocationId && (
-                    <Button variant="outline" onClick={resetAllocationForm}>
-                      Reset
-                    </Button>
-                  )}
-                  <Button variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
-                  <Button onClick={handleSaveAllocation} disabled={updatePurchase.isPending || createReceipt.isPending}>
-                    {updatePurchase.isPending || createReceipt.isPending
-                      ? "Saving..."
-                      : editingAllocationId
-                        ? "Update Allocation"
-                        : "Add Allocation"}
-                  </Button>
-                </div>
+                )}
+                <Button variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
+                <Button onClick={handleSaveAllocation} disabled={isFinalized || updatePurchase.isPending || createReceipt.isPending}>
+                  {updatePurchase.isPending || createReceipt.isPending
+                    ? "Saving..."
+                    : editingAllocationId
+                      ? "Update Allocation"
+                      : "Add Allocation"}
+                </Button>
               </div>
             </div>
           )}

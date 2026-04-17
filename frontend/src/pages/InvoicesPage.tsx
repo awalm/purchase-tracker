@@ -48,6 +48,7 @@ interface Invoice {
   subtotal: string
   tax_rate: string
   total: string
+  reconciliation_state: string
   has_pdf: boolean | null
   notes: string | null
   purchase_count: number | null
@@ -56,6 +57,7 @@ interface Invoice {
 }
 
 function ReconciliationBadge({ invoice }: { invoice: Invoice }) {
+  const isFinalized = invoice.reconciliation_state === "locked"
   const invoiceSubtotal = parseFloat(invoice.subtotal)
   const purchasesTotal = parseFloat(invoice.purchases_total || "0")
   const difference = Math.abs(invoiceSubtotal - purchasesTotal)
@@ -63,6 +65,29 @@ function ReconciliationBadge({ invoice }: { invoice: Invoice }) {
   const receiptedCount = invoice.receipted_count || 0
   const allReceipted = count > 0 && receiptedCount === count
   const totalsMatched = difference < 0.01
+
+  if (isFinalized) {
+    if (count > 0 && totalsMatched && allReceipted) {
+      return (
+        <span className="inline-flex items-center gap-1 text-xs font-medium text-green-700 bg-green-50 px-2 py-1 rounded-full">
+          <CheckCircle2 className="h-3 w-3" />
+          Finalized
+        </span>
+      )
+    }
+
+    const finalizedIssues: string[] = []
+    if (count === 0) finalizedIssues.push("No items")
+    if (!totalsMatched) finalizedIssues.push(`${formatCurrency(difference)} off`)
+    if (count > 0 && !allReceipted) finalizedIssues.push(`${receiptedCount}/${count} receipted`)
+
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 px-2 py-1 rounded-full">
+        <AlertCircle className="h-3 w-3" />
+        Finalized · {finalizedIssues.join(" · ")}
+      </span>
+    )
+  }
 
   if (count === 0) {
     return (
@@ -75,9 +100,9 @@ function ReconciliationBadge({ invoice }: { invoice: Invoice }) {
 
   if (totalsMatched && allReceipted) {
     return (
-      <span className="inline-flex items-center gap-1 text-xs font-medium text-green-600 bg-green-50 px-2 py-1 rounded-full">
+      <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 bg-emerald-50 px-2 py-1 rounded-full">
         <CheckCircle2 className="h-3 w-3" />
-        Reconciled
+        Ready to finalize
       </span>
     )
   }
@@ -285,14 +310,7 @@ export default function InvoicesPage() {
 
   // Summary stats
   const totalInvoiceValue = invoices.reduce((sum, inv) => sum + parseFloat(inv.subtotal), 0)
-  const unreconciledCount = invoices.filter(inv => {
-    const count = inv.purchase_count || 0
-    if (count === 0) return false // "No items" is not unreconciled, just empty
-    const diff = Math.abs(parseFloat(inv.subtotal) - parseFloat(inv.purchases_total || "0"))
-    const totalsMatched = diff < 0.01
-    const allReceipted = (inv.receipted_count || 0) === count
-    return !totalsMatched || !allReceipted
-  }).length
+  const unfinalizedCount = invoices.filter((inv) => inv.reconciliation_state !== "locked").length
   const emptyCount = invoices.filter(inv => (inv.purchase_count || 0) === 0).length
 
   if (isLoading) return <div className="text-muted-foreground">Loading...</div>
@@ -716,9 +734,9 @@ export default function InvoicesPage() {
         </Card>
         <Card>
           <CardContent className="pt-6">
-            <p className="text-sm text-muted-foreground">Unreconciled</p>
-            <p className={`text-2xl font-bold ${unreconciledCount > 0 ? "text-amber-600" : "text-green-600"}`}>
-              {unreconciledCount}
+            <p className="text-sm text-muted-foreground">Not Finalized</p>
+            <p className={`text-2xl font-bold ${unfinalizedCount > 0 ? "text-amber-600" : "text-green-600"}`}>
+              {unfinalizedCount}
             </p>
           </CardContent>
         </Card>

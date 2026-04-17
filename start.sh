@@ -17,15 +17,6 @@ if [ -z "$PIDS" ]; then
 fi
 if [ -n "$PIDS" ]; then
   echo "Port 5432 appears in use — inspecting listeners..."
-  
-  
-  
-  
-  
-  
-  
-  
-  
   PIDS="$PIDS"
   for LIST_PID in $PIDS; do
     COMM=$(ps -p $LIST_PID -o comm= 2>/dev/null || true)
@@ -91,7 +82,15 @@ else
   export PG_PORT=5432
 fi
 
-docker compose up -d
+COMPOSE_ARGS="--profile ocr"
+if [ "${ENABLE_RECEIPT_OCR:-1}" = "0" ] || [ "${DISABLE_RECEIPT_OCR:-0}" = "1" ]; then
+  COMPOSE_ARGS=""
+  echo "🔎 Receipt OCR sidecar disabled"
+else
+  echo "🔎 Receipt OCR sidecar enabled on port ${RECEIPT_OCR_PORT:-8001}"
+fi
+
+docker compose $COMPOSE_ARGS up -d
 echo "⏳ Waiting for DB..."
 until docker exec bg-tracker-db pg_isready -U bg_tracker -q 2>/dev/null; do sleep 1; done
 echo "✅ DB ready"

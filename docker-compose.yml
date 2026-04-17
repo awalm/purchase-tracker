@@ -17,3 +17,33 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  receipt-ocr:
+    build:
+      context: ./ocr-service
+    container_name: bg-tracker-receipt-ocr
+    restart: unless-stopped
+    profiles: ["ocr"]
+    environment:
+      PADDLEOCR_LANG: "en"
+      OCR_CLASSIC_DEVICE: "${OCR_CLASSIC_DEVICE:-cpu}"
+      OCR_CLASSIC_USE_DOC_ORIENTATION: "${OCR_CLASSIC_USE_DOC_ORIENTATION:-0}"
+      OCR_CLASSIC_USE_DOC_UNWARPING: "${OCR_CLASSIC_USE_DOC_UNWARPING:-0}"
+      OCR_CLASSIC_USE_TEXTLINE_ORIENTATION: "${OCR_CLASSIC_USE_TEXTLINE_ORIENTATION:-0}"
+      OCR_VL_ENABLED: "${OCR_VL_ENABLED:-0}"
+      OCR_VL_DEVICE: "${OCR_VL_DEVICE:-cpu}"
+      OCR_LOW_CONFIDENCE_THRESHOLD: "${OCR_LOW_CONFIDENCE_THRESHOLD:-8.0}"
+      OCR_VL_MAX_NEW_TOKENS: "${OCR_VL_MAX_NEW_TOKENS:-64}"
+      OCR_VL_MAX_PIXELS: "${OCR_VL_MAX_PIXELS:-262144}"
+      OCR_VL_TIMEOUT_SECONDS: "${OCR_VL_TIMEOUT_SECONDS:-120}"
+      OCR_VL_STRICT: "${OCR_VL_STRICT:-0}"
+      FLAGS_use_mkldnn: "${FLAGS_use_mkldnn:-0}"
+    ports:
+      - "${RECEIPT_OCR_PORT:-8001}:8001"
+    volumes:
+      - ./data/ocr-cache:/root/.paddleocr
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10

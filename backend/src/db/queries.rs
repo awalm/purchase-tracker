@@ -1,5 +1,6 @@
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
+use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -62,6 +63,30 @@ impl From<sqlx::Error> for PurchaseAllocationError {
         Self::Sql(value)
     }
 }
+
+#[derive(Debug)]
+pub enum ReceiptReconciliationError {
+    Sql(sqlx::Error),
+    Validation(String),
+}
+
+impl From<sqlx::Error> for ReceiptReconciliationError {
+    fn from(value: sqlx::Error) -> Self {
+        Self::Sql(value)
+    }
+}
+
+const UNLINK_PURCHASES_FOR_DESTINATION_INVOICES_SQL: &str = r#"UPDATE purchases
+       SET invoice_id = NULL,
+           invoice_unit_price = NULL
+       WHERE invoice_id IN (
+         SELECT id FROM invoices WHERE destination_id = $1
+       )"#;
+
+const UNLINK_PURCHASES_FOR_INVOICE_SQL: &str = r#"UPDATE purchases
+       SET invoice_id = NULL,
+           invoice_unit_price = NULL
+       WHERE invoice_id = $1"#;
 
 // ============================================
 // Vendors
@@ -200,18 +225,169 @@ pub async fn delete_vendor(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<boo
 pub async fn get_vendor_summary(pool: &PgPool) -> Result<Vec<VendorSummary>, sqlx::Error> {
     sqlx::query_as!(
         VendorSummary,
-        r#"SELECT 
-            vendor_id as "vendor_id!",
-            vendor_name as "vendor_name!",
-            total_receipts,
-            total_purchases,
-            total_quantity,
-            total_spent
-        FROM v_vendor_summary
-        ORDER BY vendor_name"#
+        r#"WITH allocation_totals AS (
+            SELECT
+                pa.purchase_id,
+                COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty
+            FROM purchase_allocations pa
+            GROUP BY pa.purchase_id
+        ),
+        allocation_rows AS (
+            SELECT
+                p.id AS purchase_id,
+                pa.receipt_id,
+                pa.allocated_qty AS quantity,
+                pa.unit_cost AS unit_cost
+            FROM purchases p
+            JOIN invoices inv ON inv.id = p.invoice_id
+            JOIN purchase_allocations pa ON pa.purchase_id = p.id
+            WHERE p.invoice_id IS NOT NULL
+              AND p.invoice_unit_price IS NOT NULL
+              AND p.destination_id IS NOT NULL
+              AND inv.reconciliation_state = 'locked'
+        ),
+        remainder_rows AS (
+            SELECT
+                p.id AS purchase_id,
+                p.receipt_id,
+                GREATEST(p.quantity - COALESCE(at.allocated_qty, 0), 0) AS quantity,
+                p.purchase_cost AS unit_cost
+            FROM purchases p
+            JOIN invoices inv ON inv.id = p.invoice_id
+            LEFT JOIN allocation_totals at ON at.purchase_id = p.id
+            WHERE p.invoice_id IS NOT NULL
+              AND p.invoice_unit_price IS NOT NULL
+              AND p.destination_id IS NOT NULL
+              AND inv.reconciliation_state = 'locked'
+              AND p.receipt_id IS NOT NULL
+              AND GREATEST(p.quantity - COALESCE(at.allocated_qty, 0), 0) > 0
+        ),
+        finalized_vendor_rows AS (
+            SELECT * FROM allocation_rows
+            UNION ALL
+            SELECT * FROM remainder_rows
+        )
+        SELECT
+            v.id as "vendor_id!",
+            v.name as "vendor_name!",
+            (
+                SELECT COUNT(DISTINCT fvr.receipt_id)
+                FROM finalized_vendor_rows fvr
+                JOIN receipts r ON r.id = fvr.receipt_id
+                WHERE r.vendor_id = v.id
+            ) as "total_receipts?",
+            (
+                SELECT COUNT(DISTINCT fvr.purchase_id)
+                FROM finalized_vendor_rows fvr
+                JOIN receipts r ON r.id = fvr.receipt_id
+                WHERE r.vendor_id = v.id
+            ) as "total_purchases?",
+            (
+                SELECT COALESCE(SUM(fvr.quantity), 0)
+                FROM finalized_vendor_rows fvr
+                JOIN receipts r ON r.id = fvr.receipt_id
+                WHERE r.vendor_id = v.id
+            ) as "total_quantity?",
+            (
+                SELECT COALESCE(SUM(fvr.quantity * fvr.unit_cost), 0)
+                FROM finalized_vendor_rows fvr
+                JOIN receipts r ON r.id = fvr.receipt_id
+                WHERE r.vendor_id = v.id
+            ) as "total_spent?"
+        FROM vendors v
+        ORDER BY v.name"#
     )
     .fetch_all(pool)
     .await
+}
+
+pub async fn get_vendor_import_aliases(
+    pool: &PgPool,
+) -> Result<Vec<VendorImportAlias>, sqlx::Error> {
+    sqlx::query_as::<_, VendorImportAlias>(
+        r#"SELECT id, normalized_alias, raw_alias, vendor_id, created_at, updated_at
+           FROM vendor_import_aliases"#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_vendor_import_aliases_by_vendor(
+    pool: &PgPool,
+    vendor_id: Uuid,
+) -> Result<Vec<VendorImportAlias>, sqlx::Error> {
+    sqlx::query_as::<_, VendorImportAlias>(
+        r#"SELECT id, normalized_alias, raw_alias, vendor_id, created_at, updated_at
+           FROM vendor_import_aliases
+           WHERE vendor_id = $1
+           ORDER BY updated_at DESC, raw_alias ASC"#,
+    )
+    .bind(vendor_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn resolve_vendor_id_by_import_alias(
+    pool: &PgPool,
+    alias: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let normalized = normalize_import_alias(alias);
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+
+    sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT vendor_id FROM vendor_import_aliases WHERE normalized_alias = $1"#,
+    )
+    .bind(normalized)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn upsert_vendor_import_alias(
+    pool: &PgPool,
+    alias: &str,
+    vendor_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let normalized = normalize_import_alias(alias);
+    if normalized.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"INSERT INTO vendor_import_aliases (normalized_alias, raw_alias, vendor_id)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (normalized_alias)
+           DO UPDATE SET
+             vendor_id = EXCLUDED.vendor_id,
+             raw_alias = EXCLUDED.raw_alias,
+             updated_at = NOW()"#,
+    )
+    .bind(normalized)
+    .bind(alias.trim())
+    .bind(vendor_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn delete_vendor_import_alias(
+    pool: &PgPool,
+    vendor_id: Uuid,
+    alias_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"DELETE FROM vendor_import_aliases
+           WHERE id = $1
+             AND vendor_id = $2"#,
+    )
+    .bind(alias_id)
+    .bind(vendor_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 // ============================================
@@ -345,7 +521,8 @@ pub async fn delete_destination(
     .execute(pool)
     .await?;
     // Unlink purchases from invoices for this destination, then delete the invoices
-    sqlx::query!(r#"UPDATE purchases SET invoice_id = NULL WHERE invoice_id IN (SELECT id FROM invoices WHERE destination_id = $1)"#, id)
+    sqlx::query(UNLINK_PURCHASES_FOR_DESTINATION_INVOICES_SQL)
+        .bind(id)
         .execute(pool)
         .await?;
     sqlx::query!(r#"DELETE FROM invoices WHERE destination_id = $1"#, id)
@@ -379,20 +556,49 @@ pub async fn get_destination_summary(
 ) -> Result<Vec<DestinationSummary>, sqlx::Error> {
     sqlx::query_as!(
         DestinationSummary,
-        r#"SELECT 
-            destination_id as "destination_id!",
-            destination_code as "destination_code!",
-            destination_name as "destination_name!",
-            total_invoices,
-            total_purchases,
-            total_quantity,
-            total_cost,
-            total_revenue,
-            total_commission,
-            total_tax_paid,
-            total_tax_owed
-        FROM v_destination_summary
-        ORDER BY destination_code"#
+        r#"WITH allocation_totals AS (
+            SELECT
+                pa.purchase_id,
+                COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
+                COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
+            FROM purchase_allocations pa
+            GROUP BY pa.purchase_id
+        ),
+        finalized_purchases AS (
+            SELECT
+                p.id,
+                p.destination_id,
+                p.quantity,
+                p.invoice_unit_price,
+                CASE
+                    WHEN at.allocated_qty = p.quantity
+                         AND at.allocated_qty > 0
+                         AND p.quantity > 0
+                    THEN at.allocated_total_cost / p.quantity::numeric
+                    ELSE p.purchase_cost
+                END AS effective_purchase_cost
+            FROM purchases p
+            JOIN invoices inv ON inv.id = p.invoice_id
+            LEFT JOIN allocation_totals at ON at.purchase_id = p.id
+            WHERE p.invoice_id IS NOT NULL
+              AND p.invoice_unit_price IS NOT NULL
+              AND p.destination_id IS NOT NULL
+              AND inv.reconciliation_state = 'locked'
+        )
+        SELECT
+            d.id as "destination_id!",
+            d.code as "destination_code!",
+            d.name as "destination_name!",
+            (SELECT COUNT(*) FROM invoices inv WHERE inv.destination_id = d.id AND inv.reconciliation_state = 'locked') as "total_invoices?",
+            (SELECT COUNT(*) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_purchases?",
+            (SELECT COALESCE(SUM(fp.quantity), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_quantity?",
+            (SELECT COALESCE(SUM(fp.quantity * fp.effective_purchase_cost), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_cost?",
+            (SELECT COALESCE(SUM(fp.quantity * fp.invoice_unit_price), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_revenue?",
+            (SELECT COALESCE(SUM(fp.quantity * (fp.invoice_unit_price - fp.effective_purchase_cost)), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_commission?",
+            (SELECT COALESCE(SUM(fp.quantity * fp.effective_purchase_cost * 0.13), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_tax_paid?",
+            (SELECT COALESCE(SUM(fp.quantity * (fp.invoice_unit_price - fp.effective_purchase_cost) * 0.13), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_tax_owed?"
+        FROM destinations d
+        ORDER BY d.code"#
     )
     .fetch_all(pool)
     .await
@@ -547,7 +753,7 @@ pub async fn get_all_invoices(pool: &PgPool) -> Result<Vec<Invoice>, sqlx::Error
     sqlx::query_as!(
         Invoice,
         r#"SELECT id, destination_id, invoice_number, order_number, invoice_date, 
-                  subtotal, tax_rate, total, notes, created_at, updated_at
+                subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at
            FROM invoices ORDER BY invoice_date DESC"#
     )
     .fetch_all(pool)
@@ -558,7 +764,7 @@ pub async fn get_invoice_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Invoice
     sqlx::query_as!(
         Invoice,
         r#"SELECT id, destination_id, invoice_number, order_number, invoice_date, 
-                  subtotal, tax_rate, total, notes, created_at, updated_at
+                  subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at
            FROM invoices WHERE id = $1"#,
         id
     )
@@ -572,13 +778,14 @@ pub async fn create_invoice(
     user_id: Uuid,
 ) -> Result<Invoice, sqlx::Error> {
     let tax_rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00
+    let reconciliation_state = data.reconciliation_state.as_deref().unwrap_or("open");
     let total = data.subtotal * (Decimal::ONE + tax_rate / Decimal::new(100, 0));
     let invoice = sqlx::query_as!(
         Invoice,
-        r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, subtotal, tax_rate, total, notes) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
+        r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, subtotal, tax_rate, total, reconciliation_state, notes) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
            RETURNING id, destination_id, invoice_number, order_number, invoice_date, 
-                     subtotal, tax_rate, total, notes, created_at, updated_at"#,
+                     subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at"#,
         data.destination_id,
         data.invoice_number,
         data.order_number,
@@ -586,6 +793,7 @@ pub async fn create_invoice(
         data.subtotal,
         tax_rate,
         total,
+        reconciliation_state,
         data.notes
     )
     .fetch_one(pool)
@@ -616,10 +824,10 @@ pub async fn create_invoice_from_pdf_atomic(
 
     let invoice = sqlx::query_as!(
         Invoice,
-        r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, subtotal, tax_rate, total, notes, original_pdf, original_filename)
-           VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9)
+          r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, subtotal, tax_rate, total, reconciliation_state, notes, original_pdf, original_filename)
+              VALUES ($1, $2, NULL, $3, $4, $5, $6, 'open', $7, $8, $9)
            RETURNING id, destination_id, invoice_number, order_number, invoice_date,
-                     subtotal, tax_rate, total, notes, created_at, updated_at"#,
+                            subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at"#,
         data.destination_id,
         data.invoice_number,
         data.invoice_date,
@@ -710,16 +918,18 @@ pub async fn update_invoice(
                 subtotal = COALESCE($5, subtotal),
                 tax_rate = COALESCE($6, tax_rate),
                 total = COALESCE($5, subtotal) * (1 + COALESCE($6, tax_rate) / 100),
-                notes = COALESCE($7, notes)
+                reconciliation_state = COALESCE($7, reconciliation_state),
+                notes = COALESCE($8, notes)
                WHERE id = $1 
                RETURNING id, destination_id, invoice_number, order_number, invoice_date, 
-                         subtotal, tax_rate, total, notes, created_at, updated_at"#,
+                         subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at"#,
             id,
             data.invoice_number,
             data.order_number,
             data.invoice_date,
             data.subtotal,
             data.tax_rate,
+            data.reconciliation_state,
             data.notes
         )
         .fetch_optional(pool)
@@ -746,12 +956,10 @@ pub async fn delete_invoice(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bo
     let old = get_invoice_by_id(pool, id).await?;
 
     // Unlink purchases that reference this invoice (SET NULL, not delete)
-    sqlx::query!(
-        r#"UPDATE purchases SET invoice_id = NULL WHERE invoice_id = $1"#,
-        id
-    )
-    .execute(pool)
-    .await?;
+    sqlx::query(UNLINK_PURCHASES_FOR_INVOICE_SQL)
+        .bind(id)
+        .execute(pool)
+        .await?;
 
     let result = sqlx::query!(r#"DELETE FROM invoices WHERE id = $1"#, id)
         .execute(pool)
@@ -843,7 +1051,31 @@ pub async fn get_invoice_with_destination(
 ) -> Result<Option<InvoiceWithDestination>, sqlx::Error> {
     sqlx::query_as!(
         InvoiceWithDestination,
-        r#"SELECT 
+                r#"WITH allocation_totals AS (
+                             SELECT
+                                     pa.purchase_id,
+                                     COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
+                                     COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
+                             FROM purchase_allocations pa
+                             GROUP BY pa.purchase_id
+                     ),
+                     invoice_purchase_totals AS (
+                             SELECT
+                                     p.invoice_id,
+                                     p.quantity,
+                                     p.invoice_unit_price,
+                                     CASE
+                                         WHEN at.allocated_qty = p.quantity
+                                              AND at.allocated_qty > 0
+                                              AND p.quantity > 0
+                                         THEN at.allocated_total_cost / p.quantity::numeric
+                                         ELSE p.purchase_cost
+                                     END AS effective_purchase_cost
+                             FROM purchases p
+                             LEFT JOIN allocation_totals at ON at.purchase_id = p.id
+                             WHERE p.invoice_id IS NOT NULL
+                     )
+                     SELECT 
             inv.id,
             inv.destination_id,
             d.code AS destination_code,
@@ -854,21 +1086,22 @@ pub async fn get_invoice_with_destination(
             inv.subtotal,
             inv.tax_rate,
             inv.total,
+            inv.reconciliation_state,
             (inv.original_pdf IS NOT NULL) AS has_pdf,
             inv.notes,
             inv.created_at,
             inv.updated_at,
             COUNT(p.id) AS purchase_count,
-            COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, p.purchase_cost)), 0) AS purchases_total,
-            COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS total_cost,
-            COALESCE(SUM(p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
+            COALESCE((SELECT SUM(rp.quantity * COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS purchases_total,
+            COALESCE((SELECT SUM(rp.quantity * rp.effective_purchase_cost) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS total_cost,
+            COALESCE((SELECT SUM(rp.quantity * (COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost) - rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS total_commission,
             COUNT(p.id) FILTER (WHERE p.receipt_id IS NOT NULL) AS receipted_count
         FROM invoices inv
         JOIN destinations d ON d.id = inv.destination_id
         LEFT JOIN purchases p ON p.invoice_id = inv.id
         WHERE inv.id = $1
         GROUP BY inv.id, inv.destination_id, d.code, d.name, inv.invoice_number, inv.order_number,
-                 inv.invoice_date, inv.subtotal, inv.tax_rate, inv.total, inv.original_pdf, inv.notes, inv.created_at, inv.updated_at"#,
+                 inv.invoice_date, inv.subtotal, inv.tax_rate, inv.total, inv.reconciliation_state, inv.original_pdf, inv.notes, inv.created_at, inv.updated_at"#,
         id
     )
     .fetch_optional(pool)
@@ -880,7 +1113,31 @@ pub async fn get_invoices_with_destination(
 ) -> Result<Vec<InvoiceWithDestination>, sqlx::Error> {
     sqlx::query_as!(
         InvoiceWithDestination,
-        r#"SELECT 
+                r#"WITH allocation_totals AS (
+                             SELECT
+                                     pa.purchase_id,
+                                     COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
+                                     COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
+                             FROM purchase_allocations pa
+                             GROUP BY pa.purchase_id
+                     ),
+                     invoice_purchase_totals AS (
+                             SELECT
+                                     p.invoice_id,
+                                     p.quantity,
+                                     p.invoice_unit_price,
+                                     CASE
+                                         WHEN at.allocated_qty = p.quantity
+                                              AND at.allocated_qty > 0
+                                              AND p.quantity > 0
+                                         THEN at.allocated_total_cost / p.quantity::numeric
+                                         ELSE p.purchase_cost
+                                     END AS effective_purchase_cost
+                             FROM purchases p
+                             LEFT JOIN allocation_totals at ON at.purchase_id = p.id
+                             WHERE p.invoice_id IS NOT NULL
+                     )
+                     SELECT 
             inv.id,
             inv.destination_id,
             d.code AS destination_code,
@@ -891,20 +1148,21 @@ pub async fn get_invoices_with_destination(
             inv.subtotal,
             inv.tax_rate,
             inv.total,
+            inv.reconciliation_state,
             (inv.original_pdf IS NOT NULL) AS has_pdf,
             inv.notes,
             inv.created_at,
             inv.updated_at,
             COUNT(p.id) AS purchase_count,
-            COALESCE(SUM(p.quantity * COALESCE(p.invoice_unit_price, p.purchase_cost)), 0) AS purchases_total,
-            COALESCE(SUM(p.quantity * p.purchase_cost), 0) AS total_cost,
-            COALESCE(SUM(p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)), 0) AS total_commission,
+            COALESCE((SELECT SUM(rp.quantity * COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS purchases_total,
+            COALESCE((SELECT SUM(rp.quantity * rp.effective_purchase_cost) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS total_cost,
+            COALESCE((SELECT SUM(rp.quantity * (COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost) - rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS total_commission,
             COUNT(p.id) FILTER (WHERE p.receipt_id IS NOT NULL) AS receipted_count
         FROM invoices inv
         JOIN destinations d ON d.id = inv.destination_id
         LEFT JOIN purchases p ON p.invoice_id = inv.id
         GROUP BY inv.id, inv.destination_id, d.code, d.name, inv.invoice_number, inv.order_number,
-                 inv.invoice_date, inv.subtotal, inv.tax_rate, inv.total, inv.original_pdf, inv.notes, inv.created_at, inv.updated_at
+                 inv.invoice_date, inv.subtotal, inv.tax_rate, inv.total, inv.reconciliation_state, inv.original_pdf, inv.notes, inv.created_at, inv.updated_at
         ORDER BY inv.invoice_date DESC"#
     )
     .fetch_all(pool)
@@ -917,32 +1175,69 @@ pub async fn get_purchases_by_invoice(
 ) -> Result<Vec<PurchaseEconomics>, sqlx::Error> {
     sqlx::query_as!(
         PurchaseEconomics,
-        r#"SELECT 
-            pe.purchase_id as "purchase_id!",
-            pe.purchase_date as "purchase_date!",
-            pe.item_id as "item_id!",
-            pe.item_name as "item_name!",
-            pe.vendor_name,
-            pe.destination_code,
-            pe.quantity as "quantity!",
-            pe.purchase_cost as "purchase_cost!",
-            pe.total_cost,
-            pe.invoice_unit_price,
-            pe.total_selling,
-            pe.unit_commission,
-            pe.total_commission,
-            pe.tax_paid,
-            pe.tax_owed,
-            pe.status as "status!: DeliveryStatus",
-            pe.delivery_date,
-            pe.invoice_id,
-            pe.receipt_id,
-            pe.receipt_number,
-            pe.invoice_number,
-            pe.notes
-        FROM v_purchase_economics pe
-        WHERE pe.invoice_id = $1
-        ORDER BY pe.purchase_date DESC"#,
+        r#"WITH allocation_summary AS (
+               SELECT
+                   pa.purchase_id,
+                   (ARRAY_AGG(DISTINCT pa.receipt_id))[1] AS any_receipt_id,
+                   COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
+                   COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
+               FROM purchase_allocations pa
+               GROUP BY pa.purchase_id
+           ),
+           purchase_rows AS (
+               SELECT
+                   p.id AS purchase_id,
+                   p.item_id,
+                   p.quantity,
+                   p.invoice_unit_price,
+                   p.status,
+                   p.delivery_date,
+                   p.invoice_id,
+                   COALESCE(p.receipt_id, alloc.any_receipt_id) AS resolved_receipt_id,
+                   p.destination_id,
+                   p.notes,
+                   p.created_at,
+                   CASE
+                       WHEN alloc.allocated_qty = p.quantity
+                            AND alloc.allocated_qty > 0
+                            AND p.quantity > 0
+                       THEN alloc.allocated_total_cost / p.quantity::numeric
+                       ELSE p.purchase_cost
+                   END AS effective_purchase_cost
+               FROM purchases p
+               LEFT JOIN allocation_summary alloc ON alloc.purchase_id = p.id
+               WHERE p.invoice_id = $1
+           )
+           SELECT
+               pr.purchase_id AS "purchase_id!",
+               COALESCE(inv.invoice_date::timestamptz, r.receipt_date::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS "purchase_date!",
+               pr.item_id AS "item_id!",
+               COALESCE(i.name, '(deleted item)') AS "item_name!",
+               v.name AS "vendor_name?",
+               d.code AS "destination_code?",
+               pr.quantity AS "quantity!",
+               pr.effective_purchase_cost AS "purchase_cost!",
+               (pr.quantity * pr.effective_purchase_cost) AS total_cost,
+               pr.invoice_unit_price,
+               (pr.quantity * pr.invoice_unit_price) AS total_selling,
+               (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) AS unit_commission,
+               (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost)) AS total_commission,
+               (pr.quantity * pr.effective_purchase_cost * 0.13) AS tax_paid,
+               (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) * 0.13) AS tax_owed,
+               pr.status AS "status!: DeliveryStatus",
+               pr.delivery_date,
+               pr.invoice_id,
+               pr.resolved_receipt_id AS "receipt_id?",
+               r.receipt_number AS "receipt_number?",
+               inv.invoice_number AS "invoice_number?",
+               pr.notes
+           FROM purchase_rows pr
+           LEFT JOIN items i ON i.id = pr.item_id
+           LEFT JOIN receipts r ON r.id = pr.resolved_receipt_id
+           LEFT JOIN vendors v ON v.id = r.vendor_id
+           LEFT JOIN destinations d ON d.id = pr.destination_id
+           LEFT JOIN invoices inv ON inv.id = pr.invoice_id
+           ORDER BY pr.created_at DESC"#,
         invoice_id
     )
     .fetch_all(pool)
@@ -1125,9 +1420,11 @@ pub async fn create_purchase_allocation(
     tx.commit().await?;
 
     let rows = get_purchase_allocations(pool, purchase_id).await?;
-    rows.into_iter().find(|r| r.id == created.id).ok_or_else(|| {
-        PurchaseAllocationError::NotFound("Allocation created but not found".to_string())
-    })
+    rows.into_iter()
+        .find(|r| r.id == created.id)
+        .ok_or_else(|| {
+            PurchaseAllocationError::NotFound("Allocation created but not found".to_string())
+        })
 }
 
 pub async fn update_purchase_allocation(
@@ -1259,9 +1556,11 @@ pub async fn update_purchase_allocation(
     tx.commit().await?;
 
     let rows = get_purchase_allocations(pool, purchase_id).await?;
-    rows.into_iter().find(|r| r.id == updated.id).ok_or_else(|| {
-        PurchaseAllocationError::NotFound("Allocation updated but not found".to_string())
-    })
+    rows.into_iter()
+        .find(|r| r.id == updated.id)
+        .ok_or_else(|| {
+            PurchaseAllocationError::NotFound("Allocation updated but not found".to_string())
+        })
 }
 
 pub async fn get_receipt_line_items(
@@ -1278,13 +1577,16 @@ pub async fn get_receipt_line_items(
             rli.quantity,
             rli.unit_cost,
             rli.notes,
-            COALESCE(SUM(pa.allocated_qty), 0)::INT AS "allocated_qty!: i32",
-            (rli.quantity - COALESCE(SUM(pa.allocated_qty), 0))::INT AS "remaining_qty!: i32",
+            COALESCE(SUM(CASE WHEN p.id IS NOT NULL THEN pa.allocated_qty ELSE 0 END), 0)::INT AS "allocated_qty!: i32",
+            (rli.quantity - COALESCE(SUM(CASE WHEN p.id IS NOT NULL THEN pa.allocated_qty ELSE 0 END), 0))::INT AS "remaining_qty!: i32",
             rli.created_at,
             rli.updated_at
         FROM receipt_line_items rli
         JOIN items i ON i.id = rli.item_id
-        LEFT JOIN purchase_allocations pa ON pa.receipt_line_item_id = rli.id
+        LEFT JOIN purchase_allocations pa
+          ON pa.receipt_line_item_id = rli.id
+         AND pa.receipt_id = rli.receipt_id
+        LEFT JOIN purchases p ON p.id = pa.purchase_id
         WHERE rli.receipt_id = $1
         GROUP BY rli.id, rli.receipt_id, rli.item_id, i.name, rli.quantity, rli.unit_cost, rli.notes, rli.created_at, rli.updated_at
         ORDER BY i.name"#,
@@ -1331,9 +1633,11 @@ pub async fn create_receipt_line_item(
     })?;
 
     let rows = get_receipt_line_items(pool, receipt_id).await?;
-    rows.into_iter().find(|r| r.id == created.id).ok_or_else(|| {
-        PurchaseAllocationError::NotFound("Receipt line item created but not found".to_string())
-    })
+    rows.into_iter()
+        .find(|r| r.id == created.id)
+        .ok_or_else(|| {
+            PurchaseAllocationError::NotFound("Receipt line item created but not found".to_string())
+        })
 }
 
 pub async fn update_receipt_line_item(
@@ -1413,9 +1717,11 @@ pub async fn update_receipt_line_item(
     })?;
 
     let rows = get_receipt_line_items(pool, receipt_id).await?;
-    rows.into_iter().find(|r| r.id == updated.id).ok_or_else(|| {
-        PurchaseAllocationError::NotFound("Receipt line item updated but not found".to_string())
-    })
+    rows.into_iter()
+        .find(|r| r.id == updated.id)
+        .ok_or_else(|| {
+            PurchaseAllocationError::NotFound("Receipt line item updated but not found".to_string())
+        })
 }
 
 pub async fn delete_receipt_line_item(
@@ -1547,9 +1853,24 @@ pub async fn update_purchase(
         } else {
             None
         };
-        let item_id = data.item_id.unwrap_or(old_purchase.item_id);
-        let quantity = data.quantity.unwrap_or(old_purchase.quantity);
-        let purchase_cost = data.purchase_cost.unwrap_or(old_purchase.purchase_cost);
+        // Receipt-linked purchases must derive item/qty/cost from receipt lines + allocations.
+        // Keep these immutable here to prevent drift between purchase and receipt truths.
+        let receipt_link_locked = receipt_id.is_some();
+        let item_id = if receipt_link_locked {
+            old_purchase.item_id
+        } else {
+            data.item_id.unwrap_or(old_purchase.item_id)
+        };
+        let quantity = if receipt_link_locked {
+            old_purchase.quantity
+        } else {
+            data.quantity.unwrap_or(old_purchase.quantity)
+        };
+        let purchase_cost = if receipt_link_locked {
+            old_purchase.purchase_cost
+        } else {
+            data.purchase_cost.unwrap_or(old_purchase.purchase_cost)
+        };
         let destination_id = data.destination_id.or(old_purchase.destination_id);
         let status = data.status.unwrap_or(old_purchase.status.clone());
         let delivery_date = data.delivery_date.or(old_purchase.delivery_date);
@@ -1793,6 +2114,37 @@ pub async fn get_audit_logs(
     .await
 }
 
+pub async fn get_receipt_metadata_audit(
+    pool: &PgPool,
+    receipt_id: Uuid,
+    limit: Option<i32>,
+) -> Result<Vec<ReceiptMetadataAuditEntry>, sqlx::Error> {
+    sqlx::query_as!(
+        ReceiptMetadataAuditEntry,
+        r#"SELECT
+              id,
+              record_id AS "receipt_id!",
+              operation,
+              old_data -> 'ingestion_metadata' AS old_ingestion_metadata,
+              new_data -> 'ingestion_metadata' AS new_ingestion_metadata,
+              user_id,
+              created_at
+           FROM audit_log
+           WHERE table_name = 'receipts'
+             AND record_id = $1
+             AND (
+                 operation = 'create'
+                 OR old_data -> 'ingestion_metadata' IS DISTINCT FROM new_data -> 'ingestion_metadata'
+             )
+           ORDER BY created_at DESC
+           LIMIT COALESCE($2, 50)"#,
+        receipt_id,
+        limit
+    )
+    .fetch_all(pool)
+    .await
+}
+
 // ============================================
 // Receipts
 // ============================================
@@ -1800,7 +2152,9 @@ pub async fn get_audit_logs(
 pub async fn get_all_receipts(pool: &PgPool) -> Result<Vec<Receipt>, sqlx::Error> {
     sqlx::query_as!(
         Receipt,
-        r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, 
+        r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
+                payment_card_last4,
+          ingestion_metadata,
                   notes, created_at, updated_at
            FROM receipts ORDER BY receipt_date DESC"#
     )
@@ -1811,7 +2165,9 @@ pub async fn get_all_receipts(pool: &PgPool) -> Result<Vec<Receipt>, sqlx::Error
 pub async fn get_receipt_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Receipt>, sqlx::Error> {
     sqlx::query_as!(
         Receipt,
-        r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, 
+        r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
+                  payment_card_last4,
+                  ingestion_metadata,
                   notes, created_at, updated_at
            FROM receipts WHERE id = $1"#,
         id
@@ -1825,6 +2181,14 @@ pub async fn create_receipt(
     data: CreateReceipt,
     user_id: Uuid,
 ) -> Result<Receipt, sqlx::Error> {
+    let ingestion_metadata = Some(data.ingestion_metadata.unwrap_or_else(|| {
+        json!({
+            "source": "manual",
+            "auto_parsed": false,
+            "ingestion_version": "manual-v1"
+        })
+    }));
+
     let (tax_rate, total) = if let Some(tax_amount) = data.tax_amount {
         let rate = if data.subtotal == Decimal::ZERO {
             Decimal::ZERO
@@ -1852,9 +2216,11 @@ pub async fn create_receipt(
 
     let receipt = sqlx::query_as!(
         Receipt,
-        r#"INSERT INTO receipts (vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, notes) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7) 
-           RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, 
+        r#"INSERT INTO receipts (vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, payment_card_last4, ingestion_metadata, notes)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
+                     payment_card_last4,
+                     ingestion_metadata,
                      notes, created_at, updated_at"#,
         data.vendor_id,
         receipt_number,
@@ -1862,6 +2228,8 @@ pub async fn create_receipt(
         data.subtotal,
         tax_rate,
         total,
+        data.payment_card_last4,
+        ingestion_metadata,
         data.notes
     )
     .fetch_one(pool)
@@ -1925,6 +2293,14 @@ fn normalize_vendor_short_id(value: &str) -> Option<String> {
     }
 }
 
+fn normalize_import_alias(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
 fn derive_vendor_short_id(name: &str) -> Option<String> {
     let mut built = String::new();
     for part in name
@@ -1962,6 +2338,13 @@ pub async fn update_receipt(
         let receipt_date = data.receipt_date.unwrap_or(old_receipt.receipt_date);
         let subtotal = data.subtotal.unwrap_or(old_receipt.subtotal);
         let notes = data.notes.clone().or(old_receipt.notes.clone());
+        let payment_card_last4 = data
+            .payment_card_last4
+            .clone()
+            .or(old_receipt.payment_card_last4.clone());
+        let ingestion_metadata = data
+            .ingestion_metadata
+            .or_else(|| old_receipt.ingestion_metadata.clone());
 
         let (tax_rate, total) = if let Some(tax_amount) = data.tax_amount {
             let rate = if subtotal == Decimal::ZERO {
@@ -1987,9 +2370,13 @@ pub async fn update_receipt(
                 subtotal = $5,
                 tax_rate = $6,
                 total = $7,
-                notes = $8
+                payment_card_last4 = $8,
+                ingestion_metadata = $9,
+                notes = $10
                WHERE id = $1 
                RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
+                         payment_card_last4,
+                         ingestion_metadata,
                          notes, created_at, updated_at"#,
             id,
             vendor_id,
@@ -1998,6 +2385,8 @@ pub async fn update_receipt(
             subtotal,
             tax_rate,
             total,
+            payment_card_last4,
+            ingestion_metadata,
             notes
         )
         .fetch_optional(pool)
@@ -2105,6 +2494,8 @@ pub async fn get_receipt_with_vendor(
             r.subtotal,
             r.tax_rate,
             r.total,
+            r.payment_card_last4,
+            r.ingestion_metadata,
             (r.original_pdf IS NOT NULL) AS has_pdf,
             r.notes,
             r.created_at,
@@ -2122,7 +2513,8 @@ pub async fn get_receipt_with_vendor(
                 LEFT JOIN purchase_allocations pa ON pa.receipt_id = r.id
                 LEFT JOIN purchases p ON p.id = pa.purchase_id OR (pa.id IS NULL AND p.receipt_id = r.id)
         WHERE r.id = $1
-        GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_rate, r.total,
+           GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_rate, r.total,
+               r.payment_card_last4, r.ingestion_metadata,
                  r.original_pdf, r.notes, r.created_at, r.updated_at"#,
         id
     )
@@ -2144,6 +2536,8 @@ pub async fn get_receipts_with_vendor(
             r.subtotal,
             r.tax_rate,
             r.total,
+            r.payment_card_last4,
+            r.ingestion_metadata,
             (r.original_pdf IS NOT NULL) AS has_pdf,
             r.notes,
             r.created_at,
@@ -2161,6 +2555,7 @@ pub async fn get_receipts_with_vendor(
                 LEFT JOIN purchase_allocations pa ON pa.receipt_id = r.id
                 LEFT JOIN purchases p ON p.id = pa.purchase_id OR (pa.id IS NULL AND p.receipt_id = r.id)
         GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_rate, r.total,
+                 r.payment_card_last4, r.ingestion_metadata,
                  r.original_pdf, r.notes, r.created_at, r.updated_at
         ORDER BY r.receipt_date DESC"#
     )
@@ -2171,45 +2566,122 @@ pub async fn get_receipts_with_vendor(
 pub async fn get_purchases_by_receipt(
     pool: &PgPool,
     receipt_id: Uuid,
-) -> Result<Vec<PurchaseEconomics>, sqlx::Error> {
+) -> Result<Vec<PurchaseEconomics>, ReceiptReconciliationError> {
     sqlx::query_as!(
         PurchaseEconomics,
-        r#"SELECT 
-            p.id as "purchase_id!",
-            COALESCE(inv.invoice_date::timestamptz, r.receipt_date::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00') as "purchase_date!",
-            p.item_id as "item_id!",
-            i.name as "item_name!",
-            v.name as vendor_name,
-            d.code as destination_code,
-            COALESCE(pa.allocated_qty, p.quantity) as "quantity!",
-            COALESCE(pa.unit_cost, p.purchase_cost) as "purchase_cost!",
-            (COALESCE(pa.allocated_qty, p.quantity) * COALESCE(pa.unit_cost, p.purchase_cost)) as total_cost,
-            p.invoice_unit_price,
-            (COALESCE(pa.allocated_qty, p.quantity) * p.invoice_unit_price) as total_selling,
-            (COALESCE(p.invoice_unit_price, COALESCE(pa.unit_cost, p.purchase_cost)) - COALESCE(pa.unit_cost, p.purchase_cost)) as unit_commission,
-            (COALESCE(pa.allocated_qty, p.quantity) * (COALESCE(p.invoice_unit_price, COALESCE(pa.unit_cost, p.purchase_cost)) - COALESCE(pa.unit_cost, p.purchase_cost))) as total_commission,
-            (COALESCE(pa.allocated_qty, p.quantity) * COALESCE(pa.unit_cost, p.purchase_cost) * 0.13) as tax_paid,
-            (COALESCE(pa.allocated_qty, p.quantity) * (COALESCE(p.invoice_unit_price, COALESCE(pa.unit_cost, p.purchase_cost)) - COALESCE(pa.unit_cost, p.purchase_cost)) * 0.13) as tax_owed,
-            p.status as "status!: DeliveryStatus",
-            p.delivery_date,
-            p.invoice_id,
-            r.id as receipt_id,
-            r.receipt_number,
-            inv.invoice_number,
-            p.notes
-        FROM purchases p
-        JOIN items i ON i.id = p.item_id
-        JOIN receipts r ON r.id = $1
-        JOIN vendors v ON v.id = r.vendor_id
-        LEFT JOIN destinations d ON d.id = p.destination_id
-        LEFT JOIN invoices inv ON inv.id = p.invoice_id
-        LEFT JOIN purchase_allocations pa ON pa.purchase_id = p.id AND pa.receipt_id = r.id
-        WHERE pa.id IS NOT NULL OR p.receipt_id = r.id
-        ORDER BY p.created_at DESC"#,
+        r#"WITH allocation_rows AS (
+               SELECT
+                   p.id AS purchase_id,
+                   COALESCE(inv.invoice_date::timestamptz, r.receipt_date::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS purchase_date,
+                   p.item_id,
+                   i.name AS item_name,
+                   v.name AS vendor_name,
+                   d.code AS destination_code,
+                   pa.allocated_qty AS quantity,
+                   pa.unit_cost AS purchase_cost,
+                   (pa.allocated_qty * pa.unit_cost) AS total_cost,
+                   p.invoice_unit_price,
+                   (pa.allocated_qty * p.invoice_unit_price) AS total_selling,
+                   (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost) AS unit_commission,
+                   (pa.allocated_qty * (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost)) AS total_commission,
+                   (pa.allocated_qty * pa.unit_cost * 0.13) AS tax_paid,
+                   (pa.allocated_qty * (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost) * 0.13) AS tax_owed,
+                   p.status,
+                   p.delivery_date,
+                   p.invoice_id,
+                   r.id AS receipt_id,
+                   r.receipt_number,
+                   inv.invoice_number,
+                   p.notes,
+                   p.created_at AS sort_created_at
+               FROM purchase_allocations pa
+               JOIN purchases p ON p.id = pa.purchase_id
+               JOIN items i ON i.id = p.item_id
+               JOIN receipts r ON r.id = pa.receipt_id
+               JOIN vendors v ON v.id = r.vendor_id
+               LEFT JOIN destinations d ON d.id = p.destination_id
+               LEFT JOIN invoices inv ON inv.id = p.invoice_id
+               LEFT JOIN receipt_line_items rli ON rli.id = pa.receipt_line_item_id
+               WHERE pa.receipt_id = $1
+                 AND (
+                     pa.receipt_line_item_id IS NULL
+                     OR rli.id IS NULL
+                     OR rli.item_id IS DISTINCT FROM p.item_id
+                 ) IS NOT TRUE
+           ),
+           direct_rows AS (
+               SELECT
+                   p.id AS purchase_id,
+                   COALESCE(inv.invoice_date::timestamptz, r.receipt_date::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS purchase_date,
+                   p.item_id,
+                   i.name AS item_name,
+                   v.name AS vendor_name,
+                   d.code AS destination_code,
+                   p.quantity AS quantity,
+                   p.purchase_cost AS purchase_cost,
+                   (p.quantity * p.purchase_cost) AS total_cost,
+                   p.invoice_unit_price,
+                   (p.quantity * p.invoice_unit_price) AS total_selling,
+                   (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) AS unit_commission,
+                   (p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)) AS total_commission,
+                   (p.quantity * p.purchase_cost * 0.13) AS tax_paid,
+                   (p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) * 0.13) AS tax_owed,
+                   p.status,
+                   p.delivery_date,
+                   p.invoice_id,
+                   r.id AS receipt_id,
+                   r.receipt_number,
+                   inv.invoice_number,
+                   p.notes,
+                   p.created_at AS sort_created_at
+               FROM purchases p
+               JOIN receipts r ON r.id = p.receipt_id
+               JOIN items i ON i.id = p.item_id
+               JOIN vendors v ON v.id = r.vendor_id
+               LEFT JOIN destinations d ON d.id = p.destination_id
+               LEFT JOIN invoices inv ON inv.id = p.invoice_id
+               WHERE p.receipt_id = $1
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM purchase_allocations pa
+                     WHERE pa.purchase_id = p.id
+                       AND pa.receipt_id = $1
+                 )
+           )
+           SELECT
+               c.purchase_id AS "purchase_id!",
+               c.purchase_date AS "purchase_date!",
+               c.item_id AS "item_id!",
+               c.item_name AS "item_name!",
+               c.vendor_name,
+               c.destination_code,
+               c.quantity AS "quantity!",
+               c.purchase_cost AS "purchase_cost!",
+               c.total_cost,
+               c.invoice_unit_price,
+               c.total_selling,
+               c.unit_commission,
+               c.total_commission,
+               c.tax_paid,
+               c.tax_owed,
+               c.status AS "status!: DeliveryStatus",
+               c.delivery_date,
+               c.invoice_id,
+               c.receipt_id AS "receipt_id?",
+               c.receipt_number AS "receipt_number?",
+               c.invoice_number AS "invoice_number?",
+               c.notes
+           FROM (
+               SELECT * FROM allocation_rows
+               UNION ALL
+               SELECT * FROM direct_rows
+           ) c
+           ORDER BY c.sort_created_at DESC"#,
         receipt_id
     )
     .fetch_all(pool)
     .await
+    .map_err(ReceiptReconciliationError::Sql)
 }
 
 pub async fn get_purchases_by_item(
@@ -2218,7 +2690,31 @@ pub async fn get_purchases_by_item(
 ) -> Result<Vec<PurchaseEconomics>, sqlx::Error> {
     sqlx::query_as!(
         PurchaseEconomics,
-        r#"SELECT 
+        r#"WITH reconciled_purchase_ids AS (
+                        SELECT p.id
+                        FROM purchases p
+                        JOIN purchase_allocations pa
+                            ON pa.purchase_id = p.id
+                         AND pa.receipt_id = p.receipt_id
+                        JOIN receipt_line_items rli
+                            ON rli.id = pa.receipt_line_item_id
+                         AND rli.item_id = p.item_id
+                        WHERE p.item_id = $1
+                            AND p.receipt_id IS NOT NULL
+                            AND p.invoice_id IS NOT NULL
+                            AND p.invoice_unit_price IS NOT NULL
+                            AND p.destination_id IS NOT NULL
+                            AND pa.allocated_qty = p.quantity
+                            AND pa.unit_cost = p.purchase_cost
+                            AND EXISTS (
+                                        SELECT 1
+                                        FROM v_receipt_reconciliation rr
+                                        WHERE rr.receipt_id = p.receipt_id
+                                            AND rr.is_matched = TRUE
+                                            AND rr.all_invoiced = TRUE
+                            )
+                )
+                SELECT 
             pe.purchase_id as "purchase_id!",
             pe.purchase_date as "purchase_date!",
             pe.item_id as "item_id!",
@@ -2242,6 +2738,7 @@ pub async fn get_purchases_by_item(
             pe.invoice_number,
             pe.notes
         FROM v_purchase_economics pe
+        JOIN reconciled_purchase_ids rp ON rp.id = pe.purchase_id
         WHERE pe.item_id = $1
         ORDER BY pe.purchase_date DESC"#,
         item_id
@@ -2272,17 +2769,46 @@ pub async fn get_profit_report(
 ) -> Result<ProfitReport, sqlx::Error> {
     sqlx::query_as!(
         ProfitReport,
-        r#"SELECT 
-            SUM(total_cost) as total_cost,
-            SUM(total_selling) as total_revenue,
-            SUM(total_commission) as total_commission,
-            SUM(tax_paid) as total_tax_paid,
-            SUM(tax_owed) as total_tax_owed,
-            COUNT(*) as purchase_count,
-            COUNT(DISTINCT purchase_id) as item_count
-        FROM v_purchase_economics
-        WHERE ($1::date IS NULL OR purchase_date >= $1::date)
-          AND ($2::date IS NULL OR purchase_date <= $2::date)"#,
+                r#"WITH allocation_totals AS (
+                        SELECT
+                            pa.purchase_id,
+                            COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
+                            COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
+                        FROM purchase_allocations pa
+                        GROUP BY pa.purchase_id
+                ),
+                finalized_purchases AS (
+                        SELECT
+                                p.id AS purchase_id,
+                                inv.invoice_date::timestamptz AS purchase_date,
+                                p.quantity,
+                                p.invoice_unit_price,
+                                CASE
+                                    WHEN at.allocated_qty = p.quantity
+                                         AND at.allocated_qty > 0
+                                         AND p.quantity > 0
+                                    THEN at.allocated_total_cost / p.quantity::numeric
+                                    ELSE p.purchase_cost
+                                END AS effective_purchase_cost
+                        FROM purchases p
+                        JOIN invoices inv ON inv.id = p.invoice_id
+                        LEFT JOIN allocation_totals at ON at.purchase_id = p.id
+                        WHERE p.invoice_id IS NOT NULL
+                            AND p.invoice_unit_price IS NOT NULL
+                            AND p.destination_id IS NOT NULL
+                            AND inv.reconciliation_state = 'locked'
+                )
+                SELECT
+                        SUM(quantity * effective_purchase_cost) as total_cost,
+                        SUM(quantity * invoice_unit_price) as total_revenue,
+                        SUM(quantity * (invoice_unit_price - effective_purchase_cost)) as total_commission,
+                        SUM(quantity * effective_purchase_cost * 0.13) as total_tax_paid,
+                        SUM(quantity * (invoice_unit_price - effective_purchase_cost) * 0.13) as total_tax_owed,
+                        COUNT(*) as purchase_count,
+                        COUNT(DISTINCT purchase_id) as item_count
+                FROM finalized_purchases
+                WHERE ($1::date IS NULL OR purchase_date >= $1::date)
+                    AND ($2::date IS NULL OR purchase_date <= $2::date)"#,
         from,
         to
     )
@@ -2294,6 +2820,46 @@ pub async fn get_profit_report(
 mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
+
+    #[test]
+    fn invoice_unlink_sql_clears_invoice_unit_price() {
+        assert!(
+            UNLINK_PURCHASES_FOR_INVOICE_SQL.contains("invoice_id = NULL"),
+            "Invoice unlink SQL must clear invoice_id"
+        );
+        assert!(
+            UNLINK_PURCHASES_FOR_INVOICE_SQL.contains("invoice_unit_price = NULL"),
+            "Invoice unlink SQL must clear invoice_unit_price"
+        );
+    }
+
+    #[test]
+    fn destination_unlink_sql_clears_invoice_unit_price() {
+        assert!(
+            UNLINK_PURCHASES_FOR_DESTINATION_INVOICES_SQL.contains("invoice_id = NULL"),
+            "Destination unlink SQL must clear invoice_id"
+        );
+        assert!(
+            UNLINK_PURCHASES_FOR_DESTINATION_INVOICES_SQL.contains("invoice_unit_price = NULL"),
+            "Destination unlink SQL must clear invoice_unit_price"
+        );
+        assert!(
+            UNLINK_PURCHASES_FOR_DESTINATION_INVOICES_SQL
+                .contains("SELECT id FROM invoices WHERE destination_id = $1"),
+            "Destination unlink SQL must target invoices in the destination"
+        );
+    }
+
+    #[test]
+    fn upgrade_sql_backfills_stale_invoice_unit_price() {
+        let upgrade_sql = include_str!("../../../migrations/upgrade.sql");
+        assert!(
+            upgrade_sql.contains("UPDATE purchases")
+                && upgrade_sql.contains("SET invoice_unit_price = NULL")
+                && upgrade_sql.contains("WHERE invoice_id IS NULL"),
+            "Upgrade migration must backfill stale invoice_unit_price rows"
+        );
+    }
 
     async fn test_pool() -> Option<PgPool> {
         let database_url = std::env::var("DATABASE_URL").ok()?;
@@ -2314,31 +2880,25 @@ mod tests {
         let invoice_id = Uuid::new_v4();
         let purchase_id = Uuid::new_v4();
 
-        sqlx::query(
-            r#"INSERT INTO vendors (id, name) VALUES ($1, $2)"#,
-        )
-        .bind(vendor_id)
-        .bind(format!("test-vendor-{}", vendor_id))
-        .execute(pool)
-        .await?;
+        sqlx::query(r#"INSERT INTO vendors (id, name) VALUES ($1, $2)"#)
+            .bind(vendor_id)
+            .bind(format!("test-vendor-{}", vendor_id))
+            .execute(pool)
+            .await?;
 
-        sqlx::query(
-            r#"INSERT INTO destinations (id, code, name) VALUES ($1, $2, $3)"#,
-        )
-        .bind(destination_id)
-        .bind(format!("D{}", &destination_id.to_string()[..8]))
-        .bind("Test Destination")
-        .execute(pool)
-        .await?;
+        sqlx::query(r#"INSERT INTO destinations (id, code, name) VALUES ($1, $2, $3)"#)
+            .bind(destination_id)
+            .bind(format!("D{}", &destination_id.to_string()[..8]))
+            .bind("Test Destination")
+            .execute(pool)
+            .await?;
 
-        sqlx::query(
-            r#"INSERT INTO items (id, name, default_destination_id) VALUES ($1, $2, $3)"#,
-        )
-        .bind(item_id)
-        .bind(format!("test-item-{}", item_id))
-        .bind(destination_id)
-        .execute(pool)
-        .await?;
+        sqlx::query(r#"INSERT INTO items (id, name, default_destination_id) VALUES ($1, $2, $3)"#)
+            .bind(item_id)
+            .bind(format!("test-item-{}", item_id))
+            .bind(destination_id)
+            .execute(pool)
+            .await?;
 
         sqlx::query(
             r#"INSERT INTO receipts (id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total)
@@ -2472,6 +3032,8 @@ mod tests {
                 subtotal: None,
                 tax_amount: None,
                 tax_rate: None,
+                payment_card_last4: None,
+                ingestion_metadata: None,
                 notes: None,
             },
             Uuid::new_v4(),
@@ -2531,6 +3093,8 @@ mod tests {
                 subtotal: Some(Decimal::new(999999, 2)),
                 tax_amount: Some(Decimal::new(129999, 2)),
                 tax_rate: None,
+                payment_card_last4: None,
+                ingestion_metadata: None,
                 notes: Some("edited receipt totals".to_string()),
             },
             Uuid::new_v4(),
@@ -2553,6 +3117,111 @@ mod tests {
         assert_eq!(after.invoice_unit_price, before.invoice_unit_price);
         assert_eq!(after.destination_id, before.destination_id);
         assert_eq!(after.status, before.status);
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deleting_invoice_clears_linked_purchase_invoice_fields() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let before = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read before")
+            .expect("purchase exists before");
+
+        let invoice_id = before
+            .invoice_id
+            .expect("seed purchase should be linked to an invoice");
+
+        let deleted = delete_invoice(&pool, invoice_id, Uuid::new_v4())
+            .await
+            .expect("delete invoice should succeed");
+        assert!(deleted, "invoice should be deleted");
+
+        let after = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read after")
+            .expect("purchase exists after");
+
+        assert_eq!(after.invoice_id, None, "invoice link should be cleared");
+        assert_eq!(
+            after.invoice_unit_price, None,
+            "invoice unit price should be cleared when invoice is unlinked"
+        );
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deleting_destination_clears_invoice_fields_on_linked_purchases() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let before = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read before")
+            .expect("purchase exists before");
+
+        assert!(
+            before.invoice_id.is_some(),
+            "seed purchase should be linked to an invoice"
+        );
+        assert!(
+            before.destination_id.is_some(),
+            "seed purchase should be linked to a destination"
+        );
+        assert!(
+            before.invoice_unit_price.is_some(),
+            "seed purchase should have an invoice unit price"
+        );
+
+        let deleted = delete_destination(&pool, destination_id, Uuid::new_v4())
+            .await
+            .expect("delete destination should succeed");
+        assert!(deleted, "destination should be deleted");
+
+        let after = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read after")
+            .expect("purchase exists after");
+
+        assert_eq!(
+            after.destination_id, None,
+            "destination link should be cleared"
+        );
+        assert_eq!(after.invoice_id, None, "invoice link should be cleared");
+        assert_eq!(
+            after.invoice_unit_price, None,
+            "invoice unit price should be cleared when invoice is unlinked"
+        );
 
         cleanup_seeded(
             &pool,
@@ -2645,6 +3314,258 @@ mod tests {
 
         assert_eq!(allocation.receipt_line_item_id, Some(line_item_id));
         assert_eq!(allocation.unit_cost, Decimal::new(77777, 2));
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn updating_receipt_linked_purchase_cannot_override_item_qty_or_cost() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let before = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read before")
+            .expect("purchase exists before");
+
+        let updated = update_purchase(
+            &pool,
+            purchase_id,
+            UpdatePurchase {
+                item_id: Some(Uuid::new_v4()),
+                invoice_id: None,
+                clear_invoice: false,
+                receipt_id: None,
+                clear_receipt: false,
+                quantity: Some(before.quantity + 5),
+                purchase_cost: Some(before.purchase_cost + Decimal::new(1000, 2)),
+                invoice_unit_price: None,
+                clear_invoice_unit_price: false,
+                destination_id: None,
+                status: None,
+                delivery_date: None,
+                notes: Some("receipt-linked notes edit".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("update should succeed")
+        .expect("purchase exists");
+
+        assert_eq!(updated.item_id, before.item_id);
+        assert_eq!(updated.quantity, before.quantity);
+        assert_eq!(updated.purchase_cost, before.purchase_cost);
+        assert_eq!(updated.notes.as_deref(), Some("receipt-linked notes edit"));
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn receipt_purchases_include_allocation_backed_rows_when_purchase_unlinked() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let allocation = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 2,
+            },
+        )
+        .await
+        .expect("allocation should be created");
+
+        assert_eq!(allocation.allocated_qty, 2);
+
+        sqlx::query(r#"UPDATE purchases SET receipt_id = NULL WHERE id = $1"#)
+            .bind(purchase_id)
+            .execute(&pool)
+            .await
+            .expect("should detach direct receipt link");
+
+        let rows = get_purchases_by_receipt(&pool, receipt_id)
+            .await
+            .expect("allocation-backed rows should still load");
+
+        let linked_row = rows
+            .iter()
+            .find(|row| row.purchase_id == purchase_id)
+            .expect("detached purchase should still be visible via allocation");
+
+        assert_eq!(linked_row.quantity, 2);
+        assert_eq!(linked_row.purchase_cost, Decimal::new(87999, 2));
+        assert_eq!(linked_row.receipt_id, Some(receipt_id));
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn invoice_purchases_include_allocation_backed_receipt_link_when_purchase_unlinked() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let before = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read before")
+            .expect("purchase exists before");
+        let invoice_id = before
+            .invoice_id
+            .expect("seed purchase should have invoice");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let _allocation = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 2,
+            },
+        )
+        .await
+        .expect("allocation should be created");
+
+        sqlx::query(r#"UPDATE purchases SET receipt_id = NULL WHERE id = $1"#)
+            .bind(purchase_id)
+            .execute(&pool)
+            .await
+            .expect("should detach direct receipt link");
+
+        let rows = get_purchases_by_invoice(&pool, invoice_id)
+            .await
+            .expect("invoice purchases should load");
+
+        let linked_row = rows
+            .iter()
+            .find(|row| row.purchase_id == purchase_id)
+            .expect("detached purchase should still resolve receipt link via allocation");
+
+        assert_eq!(linked_row.receipt_id, Some(receipt_id));
+        assert_eq!(linked_row.receipt_number.is_some(), true);
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn invoice_purchases_use_allocation_unit_cost_when_purchase_cost_is_zero() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let before = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read before")
+            .expect("purchase exists before");
+        let invoice_id = before
+            .invoice_id
+            .expect("seed purchase should have invoice");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let _allocation = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 2,
+            },
+        )
+        .await
+        .expect("allocation should be created");
+
+        sqlx::query(r#"UPDATE purchases SET receipt_id = NULL, purchase_cost = 0 WHERE id = $1"#)
+            .bind(purchase_id)
+            .execute(&pool)
+            .await
+            .expect("should simulate stale detached purchase cost");
+
+        let rows = get_purchases_by_invoice(&pool, invoice_id)
+            .await
+            .expect("invoice purchases should load");
+
+        let row = rows
+            .iter()
+            .find(|entry| entry.purchase_id == purchase_id)
+            .expect("purchase should be present in invoice rows");
+
+        assert_eq!(row.purchase_cost, Decimal::new(87999, 2));
+        assert_eq!(row.total_cost, Some(Decimal::new(175998, 2)));
+        assert_eq!(row.total_commission, Some(Decimal::new(2002, 2)));
 
         cleanup_seeded(
             &pool,

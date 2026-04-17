@@ -41,6 +41,23 @@ SET short_id = SUBSTRING(short_id FROM 1 FOR 20)
 WHERE short_id IS NOT NULL
   AND LENGTH(short_id) > 20;
 
+CREATE TABLE IF NOT EXISTS vendor_import_aliases (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  normalized_alias VARCHAR(255) NOT NULL UNIQUE,
+  raw_alias VARCHAR(255) NOT NULL,
+  vendor_id UUID NOT NULL REFERENCES vendors(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vendor_import_aliases_vendor
+  ON vendor_import_aliases(vendor_id);
+
+DROP TRIGGER IF EXISTS update_vendor_import_aliases_updated_at ON vendor_import_aliases;
+CREATE TRIGGER update_vendor_import_aliases_updated_at
+BEFORE UPDATE ON vendor_import_aliases
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
 DROP INDEX IF EXISTS idx_items_end_date;
 
 -- 3. Drop the columns
@@ -105,6 +122,31 @@ BEGIN
   END IF;
 END $$;
 
+-- Keep invoice pricing consistent with invoice linkage.
+-- If an invoice link is removed, invoice_unit_price must be NULL.
+UPDATE purchases
+SET invoice_unit_price = NULL
+WHERE invoice_id IS NULL
+  AND invoice_unit_price IS NOT NULL;
+
+-- ============================================
+-- INVOICE RECONCILIATION STATE
+-- ============================================
+ALTER TABLE invoices
+  ADD COLUMN IF NOT EXISTS reconciliation_state VARCHAR(32) NOT NULL DEFAULT 'open';
+
+UPDATE invoices
+SET reconciliation_state = 'open'
+WHERE reconciliation_state IS NULL
+   OR reconciliation_state NOT IN ('open', 'in_review', 'reconciled', 'locked');
+
+DO $$ BEGIN
+  ALTER TABLE invoices
+    ADD CONSTRAINT invoices_reconciliation_state_chk
+    CHECK (reconciliation_state IN ('open', 'in_review', 'reconciled', 'locked'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
 -- ============================================
 -- PURCHASE ALLOCATIONS (Phase 1)
 -- Keep invoice lines intact while allocating qty/cost to one or more receipts.
@@ -133,6 +175,19 @@ FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 -- RECEIPT LINE ITEMS (Phase 2)
 -- Source-of-truth lines for qty/cost on each receipt.
 -- ============================================
+
+ALTER TABLE receipts
+  ADD COLUMN IF NOT EXISTS payment_card_last4 VARCHAR(4);
+
+ALTER TABLE receipts
+  ADD COLUMN IF NOT EXISTS ingestion_metadata JSONB;
+
+DO $$ BEGIN
+  ALTER TABLE receipts
+    ADD CONSTRAINT receipts_payment_card_last4_chk
+    CHECK (payment_card_last4 IS NULL OR payment_card_last4 ~ '^[0-9]{4}$');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 CREATE TABLE IF NOT EXISTS receipt_line_items (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -191,6 +246,52 @@ JOIN receipt_line_items rli
 WHERE pa.purchase_id = p.id
   AND rli.receipt_id = pa.receipt_id
   AND pa.receipt_line_item_id IS NULL;
+
+-- Backfill missing allocation rows for legacy direct receipt-linked purchases
+-- when mapping to receipt_line_items is unambiguous and capacity is available.
+WITH candidate_allocations AS (
+  SELECT
+    p.id AS purchase_id,
+    p.receipt_id,
+    rli.id AS receipt_line_item_id,
+    p.quantity AS allocated_qty,
+    rli.unit_cost
+  FROM purchases p
+  JOIN receipt_line_items rli
+    ON rli.receipt_id = p.receipt_id
+   AND rli.item_id = p.item_id
+  LEFT JOIN purchase_allocations existing
+    ON existing.purchase_id = p.id
+   AND existing.receipt_id = p.receipt_id
+  LEFT JOIN LATERAL (
+    SELECT COALESCE(SUM(pa_line.allocated_qty), 0)::INT AS allocated_on_line
+    FROM purchase_allocations pa_line
+    WHERE pa_line.receipt_line_item_id = rli.id
+  ) line_alloc ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT COALESCE(SUM(pa_purchase.allocated_qty), 0)::INT AS allocated_on_purchase
+    FROM purchase_allocations pa_purchase
+    WHERE pa_purchase.purchase_id = p.id
+  ) purchase_alloc ON TRUE
+  WHERE p.receipt_id IS NOT NULL
+    AND p.quantity > 0
+    AND existing.id IS NULL
+    AND purchase_alloc.allocated_on_purchase = 0
+    AND (rli.quantity - line_alloc.allocated_on_line) >= p.quantity
+)
+INSERT INTO purchase_allocations (purchase_id, receipt_id, receipt_line_item_id, allocated_qty, unit_cost)
+SELECT purchase_id, receipt_id, receipt_line_item_id, allocated_qty, unit_cost
+FROM candidate_allocations
+ON CONFLICT (purchase_id, receipt_id) DO NOTHING;
+
+-- Keep receipt-linked purchase_cost aligned with receipt-derived allocation unit_cost.
+UPDATE purchases p
+SET purchase_cost = pa.unit_cost
+FROM purchase_allocations pa
+WHERE p.id = pa.purchase_id
+  AND p.receipt_id IS NOT NULL
+  AND pa.receipt_id = p.receipt_id
+  AND p.purchase_cost IS DISTINCT FROM pa.unit_cost;
 
 -- 9. Recreate v_purchase_economics
 -- Vendor now comes from the receipt (LEFT JOIN), not the item.

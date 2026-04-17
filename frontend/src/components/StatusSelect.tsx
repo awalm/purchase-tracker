@@ -10,12 +10,13 @@ import { PURCHASE_STATUSES } from "@/lib/constants"
 interface StatusSelectProps {
   value: string
   onValueChange: (value: string) => void
+  disabled?: boolean
 }
 
-export function StatusSelect({ value, onValueChange }: StatusSelectProps) {
+export function StatusSelect({ value, onValueChange, disabled = false }: StatusSelectProps) {
   return (
-    <Select value={value} onValueChange={onValueChange}>
-      <SelectTrigger className="w-28 h-8">
+    <Select value={value} onValueChange={onValueChange} disabled={disabled}>
+      <SelectTrigger className="w-28 h-8" disabled={disabled}>
         <StatusBadge status={value} />
       </SelectTrigger>
       <SelectContent>

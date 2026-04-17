@@ -34,6 +34,8 @@ dotenvy = "0.15"
 
 # CSV import
 csv = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+zip = "0.6"
 
 [dev-dependencies]
 testcontainers = "0.23"

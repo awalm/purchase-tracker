@@ -39,8 +39,10 @@ import {
 } from "@/components/ui/select"
 import { ExportCsvButton } from "@/components/ExportCsvButton"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
-import { ArrowLeft, Package, AlertCircle, Plus, ChevronDown, ChevronRight } from "lucide-react"
+import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
+import { ArrowLeft, Package, AlertCircle, Plus, Upload, ChevronDown, ChevronRight } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
+import { assessPurchaseReconciliation } from "@/lib/purchaseReconciliation"
 import { ApiError, purchases as purchasesApi, receipts as receiptsApi, type PurchaseAllocation } from "@/api"
 
 export default function ItemDetailPage() {
@@ -65,14 +67,6 @@ export default function ItemDetailPage() {
   const [selectedLinkId, setSelectedLinkId] = useState("")
   const [showNewForm, setShowNewForm] = useState(false)
   const [linkNotes, setLinkNotes] = useState("")
-
-  // New receipt inline form
-  const [newRcptVendorId, setNewRcptVendorId] = useState("")
-  const [newRcptNumber, setNewRcptNumber] = useState("")
-  const [newRcptDate, setNewRcptDate] = useState("")
-  const [newRcptSubtotal, setNewRcptSubtotal] = useState("")
-  const [newRcptTaxAmount, setNewRcptTaxAmount] = useState("")
-  const [newRcptFile, setNewRcptFile] = useState<File | null>(null)
 
   // New invoice inline form
   const [newInvDestId, setNewInvDestId] = useState("")
@@ -150,9 +144,16 @@ export default function ItemDetailPage() {
       }
     }
 
+    const totalCost = Number.parseFloat(p.total_cost || "0")
+    const unitCost = Number.parseFloat(p.purchase_cost || "0")
+    const effectiveUnitCost =
+      unitCost === 0 && totalCost > 0 && p.quantity > 0
+        ? totalCost / p.quantity
+        : unitCost
+
     return {
-      unitCost: Number.parseFloat(p.purchase_cost || "0"),
-      totalCost: Number.parseFloat(p.total_cost || "0"),
+      unitCost: effectiveUnitCost,
+      totalCost,
     }
   }
 
@@ -161,7 +162,6 @@ export default function ItemDetailPage() {
   }
 
   const resetNewForms = () => {
-    setNewRcptVendorId(""); setNewRcptNumber(""); setNewRcptDate(""); setNewRcptSubtotal(""); setNewRcptTaxAmount(""); setNewRcptFile(null)
     setNewInvDestId(""); setNewInvNumber(""); setNewInvDate(""); setNewInvSubtotal(""); setNewInvTaxRate("13.00")
     setLinkNotes("")
   }
@@ -194,32 +194,54 @@ export default function ItemDetailPage() {
     setLinkDialogOpen(false)
   }
 
-  const handleCreateAndLink = async (e: React.FormEvent) => {
+  const handleCreateReceiptAndLink = async (data: ReceiptFormSubmitData) => {
+    if (!linkingPurchaseId) return
+
+    const createdReceipt = await createReceipt.mutateAsync({
+      vendor_id: data.vendor_id,
+      ...(data.receipt_number.trim() ? { receipt_number: data.receipt_number.trim() } : {}),
+      receipt_date: data.receipt_date,
+      subtotal: data.subtotal,
+      tax_amount: data.tax_amount,
+      payment_card_last4: data.payment_card_last4.trim() || undefined,
+      notes: data.notes || undefined,
+    })
+
+    if (data.document_file) {
+      await receiptsApi.uploadPdf(createdReceipt.id, data.document_file)
+    }
+
+    await updatePurchase.mutateAsync({
+      id: linkingPurchaseId,
+      receipt_id: createdReceipt.id,
+      ...(linkNotes ? { notes: linkNotes } : {}),
+    })
+
+    queryClient.invalidateQueries({ queryKey: ["item", id, "purchases"] })
+    queryClient.invalidateQueries({ queryKey: ["receipts"] })
+    queryClient.invalidateQueries({ queryKey: ["invoices"] })
+    setLinkDialogOpen(false)
+    resetNewForms()
+  }
+
+  const handleCreateInvoiceAndLink = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!linkingPurchaseId) return
-    let newId: string
-    if (linkType === "receipt") {
-      const r = await createReceipt.mutateAsync({
-        vendor_id: newRcptVendorId,
-        ...(newRcptNumber.trim() ? { receipt_number: newRcptNumber.trim() } : {}),
-        receipt_date: newRcptDate,
-        subtotal: newRcptSubtotal,
-        tax_amount: newRcptTaxAmount,
-      })
-      newId = r.id
-      await receiptsApi.uploadPdf(r.id, newRcptFile!)
-      await updatePurchase.mutateAsync({ id: linkingPurchaseId, receipt_id: newId, ...(linkNotes ? { notes: linkNotes } : {}) })
-    } else {
-      const inv = await createInvoice.mutateAsync({
-        destination_id: newInvDestId,
-        invoice_number: newInvNumber,
-        invoice_date: newInvDate,
-        subtotal: newInvSubtotal,
-        tax_rate: newInvTaxRate,
-      })
-      newId = inv.id
-      await updatePurchase.mutateAsync({ id: linkingPurchaseId, invoice_id: newId, ...(linkNotes ? { notes: linkNotes } : {}) })
-    }
+
+    const inv = await createInvoice.mutateAsync({
+      destination_id: newInvDestId,
+      invoice_number: newInvNumber,
+      invoice_date: newInvDate,
+      subtotal: newInvSubtotal,
+      tax_rate: newInvTaxRate,
+    })
+
+    await updatePurchase.mutateAsync({
+      id: linkingPurchaseId,
+      invoice_id: inv.id,
+      ...(linkNotes ? { notes: linkNotes } : {}),
+    })
+
     queryClient.invalidateQueries({ queryKey: ["item", id, "purchases"] })
     queryClient.invalidateQueries({ queryKey: ["receipts"] })
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
@@ -348,6 +370,7 @@ export default function ItemDetailPage() {
                   <TableHead className="text-right">Total Cost</TableHead>
                   <TableHead className="text-right">Selling</TableHead>
                   <TableHead className="text-right">Commission</TableHead>
+                  <TableHead>Reconciliation</TableHead>
                   <TableHead>Status</TableHead>
                 </TableRow>
               </TableHeader>
@@ -357,6 +380,17 @@ export default function ItemDetailPage() {
                   const totalAllocated = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
                   const isExpanded = !!expandedAllocations[p.purchase_id]
                   const displayCosts = getDisplayCosts(p)
+                  const reconciliation = assessPurchaseReconciliation({
+                    quantity: p.quantity,
+                    purchase_cost: p.purchase_cost,
+                    receipt_id: p.receipt_id,
+                    invoice_id: p.invoice_id,
+                    invoice_unit_price: p.invoice_unit_price,
+                    destination_code: p.destination_code,
+                    requireAllocations: true,
+                    allocationCount: allocs.length,
+                    allocatedQty: totalAllocated,
+                  })
 
                   return (
                   <Fragment key={p.purchase_id}>
@@ -422,6 +456,29 @@ export default function ItemDetailPage() {
                       {p.total_commission ? formatCurrency(p.total_commission) : "—"}
                     </TableCell>
                     <TableCell>
+                      {reconciliation.isReconciled ? (
+                        <span className="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">
+                          Reconciled
+                        </span>
+                      ) : (
+                        <div className="space-y-1">
+                          <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700">
+                            Needs attention
+                          </span>
+                          {reconciliation.reasons.slice(0, 2).map((reason) => (
+                            <div key={reason} className="text-[11px] text-amber-700">
+                              {reason}
+                            </div>
+                          ))}
+                          {reconciliation.reasons.length > 2 && (
+                            <div className="text-[11px] text-muted-foreground">
+                              +{reconciliation.reasons.length - 2} more
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </TableCell>
+                    <TableCell>
                       <span className={`text-xs px-2 py-0.5 rounded-full ${
                         p.status === "delivered" ? "bg-green-100 text-green-700" :
                         p.status === "in_transit" ? "bg-blue-100 text-blue-700" :
@@ -435,7 +492,7 @@ export default function ItemDetailPage() {
 
                   {isExpanded && allocs.length > 0 && (
                     <TableRow>
-                      <TableCell colSpan={11} className="bg-muted/30 py-2">
+                      <TableCell colSpan={12} className="bg-muted/30 py-2">
                         <div className="border rounded-md bg-background overflow-hidden">
                           <Table>
                             <TableHeader>
@@ -472,7 +529,7 @@ export default function ItemDetailPage() {
                   </Fragment>
                 )})}
                 {purchases.length === 0 && (
-                  <EmptyTableRow colSpan={11}>
+                  <EmptyTableRow colSpan={12}>
                     <div className="flex flex-col items-center gap-2 py-4">
                       <Package className="h-8 w-8" />
                       <p>No purchases for this item yet</p>
@@ -490,68 +547,34 @@ export default function ItemDetailPage() {
         setLinkDialogOpen(open)
         if (!open) { setShowNewForm(false); resetNewForms() }
       }}>
-        <DialogContent className="max-w-sm">
+        <DialogContent className="w-[calc(100vw-2rem)] max-w-md sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>
               {showNewForm
-                ? linkType === "receipt" ? "New Receipt" : "New Invoice"
+                ? linkType === "receipt" ? "Add Receipt" : "New Invoice"
                 : linkType === "receipt" ? "Link Receipt" : "Link Invoice"}
             </DialogTitle>
           </DialogHeader>
           {showNewForm ? (
             linkType === "receipt" ? (
-              <form onSubmit={handleCreateAndLink} className="space-y-4">
-                <div className="space-y-2">
-                  <Label>Vendor *</Label>
-                  <Select value={newRcptVendorId} onValueChange={setNewRcptVendorId} required>
-                    <SelectTrigger><SelectValue placeholder="Select vendor" /></SelectTrigger>
-                    <SelectContent>
-                      {vendors.map((v) => <SelectItem key={v.id} value={v.id}>{v.name}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-2">
-                  <Label>Receipt Number</Label>
-                  <Input value={newRcptNumber} onChange={(e) => setNewRcptNumber(e.target.value)} placeholder="Auto-generated if empty" />
-                </div>
-                <div className="space-y-2">
-                  <Label>Date *</Label>
-                  <Input type="date" value={newRcptDate} onChange={(e) => setNewRcptDate(e.target.value)} required />
-                </div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <Label>Subtotal *</Label>
-                    <Input type="number" step="0.01" value={newRcptSubtotal} onChange={(e) => setNewRcptSubtotal(e.target.value)} placeholder="0.00" required />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>Tax Amount *</Label>
-                    <Input type="number" step="0.01" value={newRcptTaxAmount} onChange={(e) => setNewRcptTaxAmount(e.target.value)} placeholder="0.00" required />
-                  </div>
-                </div>
-                <div className="space-y-2">
-                  <Label>Receipt Document *</Label>
-                  <Input
-                    type="file"
-                    accept=".pdf,.png,.jpg,.jpeg,.webp"
-                    onChange={(e) => setNewRcptFile(e.target.files?.[0] || null)}
-                    className="cursor-pointer"
-                    required
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>Notes</Label>
-                  <Input value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
-                </div>
-                <div className="flex justify-between">
-                  <Button type="button" variant="link" className="px-0" onClick={() => setShowNewForm(false)}>← Back</Button>
-                  <div className="flex gap-2">
-                    <Button type="button" variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
-                    <Button type="submit" disabled={createReceipt.isPending}>{createReceipt.isPending ? "Creating..." : "Create & Link"}</Button>
-                  </div>
-                </div>
-              </form>
+              <ReceiptForm
+                open={showNewForm && linkType === "receipt"}
+                vendors={vendors}
+                requireDocument
+                submitLabel="Create & Link"
+                submittingLabel="Creating..."
+                isSubmitting={createReceipt.isPending || updatePurchase.isPending}
+                onSubmit={handleCreateReceiptAndLink}
+                onCancel={() => setLinkDialogOpen(false)}
+                onBack={() => setShowNewForm(false)}
+                onImport={() => {
+                  setLinkDialogOpen(false)
+                  navigate("/receipts?import=1")
+                }}
+                importButtonLabel="Import Receipt"
+              />
             ) : (
-              <form onSubmit={handleCreateAndLink} className="space-y-4">
+              <form onSubmit={handleCreateInvoiceAndLink} className="space-y-4">
                 <div className="space-y-2">
                   <Label>Destination *</Label>
                   <Select value={newInvDestId} onValueChange={setNewInvDestId} required>
@@ -583,9 +606,9 @@ export default function ItemDetailPage() {
                   <Label>Notes</Label>
                   <Input value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
                 </div>
-                <div className="flex justify-between">
-                  <Button type="button" variant="link" className="px-0" onClick={() => setShowNewForm(false)}>← Back</Button>
-                  <div className="flex gap-2">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <Button type="button" variant="link" className="px-0 self-start" onClick={() => setShowNewForm(false)}>← Back</Button>
+                  <div className="flex flex-wrap gap-2 sm:justify-end">
                     <Button type="button" variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
                     <Button type="submit" disabled={createInvoice.isPending}>{createInvoice.isPending ? "Creating..." : "Create & Link"}</Button>
                   </div>
@@ -625,16 +648,42 @@ export default function ItemDetailPage() {
                 <Label>Notes</Label>
                 <Input value={linkNotes} onChange={(e) => setLinkNotes(e.target.value)} placeholder="e.g. Used gift card, price adjusted..." />
               </div>
-              <div className="flex justify-between">
-                <Button
-                  variant="link"
-                  className="px-0 text-emerald-600"
-                  onClick={() => setShowNewForm(true)}
-                >
-                  <Plus className="h-4 w-4 mr-1" />
-                  {linkType === "receipt" ? "New Receipt" : "New Invoice"}
-                </Button>
-                <div className="flex gap-2">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="flex flex-wrap items-center gap-2">
+                  {linkType === "receipt" ? (
+                    <>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => {
+                          setLinkDialogOpen(false)
+                          navigate("/receipts?import=1")
+                        }}
+                      >
+                        <Upload className="h-4 w-4 mr-2" />
+                        Import Receipt
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => setShowNewForm(true)}
+                      >
+                        <Plus className="h-4 w-4 mr-1" />
+                        Add Receipt
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      variant="link"
+                      className="px-0 text-emerald-600"
+                      onClick={() => setShowNewForm(true)}
+                    >
+                      <Plus className="h-4 w-4 mr-1" />
+                      New Invoice
+                    </Button>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-2 sm:justify-end">
                   <Button variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
                   <Button onClick={handleLink} disabled={updatePurchase.isPending}>
                     {updatePurchase.isPending ? "Saving..." : "Save"}

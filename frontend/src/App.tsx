@@ -4,6 +4,7 @@ import { Layout } from "@/components/Layout"
 import LoginPage from "@/pages/LoginPage"
 import DashboardPage from "@/pages/DashboardPage"
 import VendorsPage from "@/pages/VendorsPage"
+import VendorDetailPage from "@/pages/VendorDetailPage"
 import DestinationsPage from "@/pages/DestinationsPage"
 import ItemsPage from "@/pages/ItemsPage"
 import ItemDetailPage from "@/pages/ItemDetailPage"
@@ -61,6 +62,14 @@ export default function App() {
         element={
           <ProtectedRoute>
             <VendorsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/vendors/:id"
+        element={
+          <ProtectedRoute>
+            <VendorDetailPage />
           </ProtectedRoute>
         }
       />

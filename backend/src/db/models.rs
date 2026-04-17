@@ -34,6 +34,16 @@ pub struct Vendor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct VendorImportAlias {
+    pub id: Uuid,
+    pub normalized_alias: String,
+    pub raw_alias: String,
+    pub vendor_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Destination {
     pub id: Uuid,
     pub code: String,
@@ -63,6 +73,7 @@ pub struct Invoice {
     pub subtotal: Decimal,
     pub tax_rate: Decimal,
     pub total: Decimal,
+    pub reconciliation_state: String,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -80,6 +91,8 @@ pub struct Receipt {
     pub subtotal: Decimal,
     pub tax_rate: Decimal,
     pub total: Decimal,
+    pub payment_card_last4: Option<String>,
+    pub ingestion_metadata: Option<serde_json::Value>,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -181,6 +194,17 @@ pub struct AuditLog {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ReceiptMetadataAuditEntry {
+    pub id: Uuid,
+    pub receipt_id: Uuid,
+    pub operation: String,
+    pub old_ingestion_metadata: Option<serde_json::Value>,
+    pub new_ingestion_metadata: Option<serde_json::Value>,
+    pub user_id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
 // ============================================
 // View Models (derived data from SQL views)
 // ============================================
@@ -273,6 +297,8 @@ pub struct ReceiptWithVendor {
     pub subtotal: Decimal,
     pub tax_rate: Decimal,
     pub total: Decimal,
+    pub payment_card_last4: Option<String>,
+    pub ingestion_metadata: Option<serde_json::Value>,
     pub has_pdf: Option<bool>,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -297,6 +323,7 @@ pub struct InvoiceWithDestination {
     pub subtotal: Decimal,
     pub tax_rate: Decimal,
     pub total: Decimal,
+    pub reconciliation_state: String,
     pub has_pdf: Option<bool>,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -360,6 +387,7 @@ pub struct CreateInvoice {
     pub invoice_date: NaiveDate,
     pub subtotal: Decimal,
     pub tax_rate: Option<Decimal>, // defaults to 13.00 if not provided
+    pub reconciliation_state: Option<String>,
     pub notes: Option<String>,
 }
 
@@ -370,6 +398,7 @@ pub struct UpdateInvoice {
     pub invoice_date: Option<NaiveDate>,
     pub subtotal: Option<Decimal>,
     pub tax_rate: Option<Decimal>,
+    pub reconciliation_state: Option<String>,
     pub notes: Option<String>,
 }
 
@@ -419,11 +448,14 @@ pub struct CreateInvoiceFromPdfResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateReceipt {
     pub vendor_id: Uuid,
+    pub source_vendor_alias: Option<String>,
     pub receipt_number: Option<String>,
     pub receipt_date: NaiveDate,
     pub subtotal: Decimal,
     pub tax_amount: Option<Decimal>,
     pub tax_rate: Option<Decimal>, // backwards-compatible fallback if tax_amount is not provided
+    pub payment_card_last4: Option<String>,
+    pub ingestion_metadata: Option<serde_json::Value>,
     pub notes: Option<String>,
 }
 
@@ -435,6 +467,8 @@ pub struct UpdateReceipt {
     pub subtotal: Option<Decimal>,
     pub tax_amount: Option<Decimal>,
     pub tax_rate: Option<Decimal>,
+    pub payment_card_last4: Option<String>,
+    pub ingestion_metadata: Option<serde_json::Value>,
     pub notes: Option<String>,
 }
 
@@ -655,6 +689,7 @@ mod tests {
             assert_eq!(invoice.notes, Some("February shipment".to_string()));
             assert_eq!(invoice.subtotal, dec!(2500.50));
             assert_eq!(invoice.tax_rate, Some(dec!(13.00)));
+            assert_eq!(invoice.reconciliation_state, None);
         }
 
         #[test]
@@ -669,6 +704,7 @@ mod tests {
             assert_eq!(invoice.order_number, None);
             assert_eq!(invoice.notes, None);
             assert_eq!(invoice.tax_rate, None);
+            assert_eq!(invoice.reconciliation_state, None);
         }
 
         #[test]
@@ -680,6 +716,7 @@ mod tests {
                 invoice_date: NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
                 subtotal: dec!(999.99),
                 tax_rate: None,
+                reconciliation_state: None,
                 notes: None,
             };
             let json = serde_json::to_string(&invoice).unwrap();
@@ -698,6 +735,7 @@ mod tests {
             assert_eq!(update.invoice_date, None);
             assert_eq!(update.subtotal, None);
             assert_eq!(update.tax_rate, None);
+            assert_eq!(update.reconciliation_state, None);
             assert_eq!(update.notes, None);
         }
 
@@ -708,6 +746,7 @@ mod tests {
             assert_eq!(update.subtotal, Some(dec!(1200.00)));
             assert_eq!(update.notes, Some("Updated subtotal".to_string()));
             assert_eq!(update.invoice_number, None);
+            assert_eq!(update.reconciliation_state, None);
         }
     }
 
@@ -728,6 +767,7 @@ mod tests {
                 subtotal: dec!(4424.78),
                 tax_rate: dec!(13.00),
                 total: dec!(5000.00),
+                reconciliation_state: "open".to_string(),
                 has_pdf: Some(false),
                 notes: None,
                 created_at: Utc::now(),
