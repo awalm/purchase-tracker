@@ -203,7 +203,7 @@ export default function ItemDetailPage() {
       receipt_date: data.receipt_date,
       subtotal: data.subtotal,
       tax_amount: data.tax_amount,
-      payment_card_last4: data.payment_card_last4.trim() || undefined,
+      payment_method: data.payment_method.trim() || undefined,
       notes: data.notes || undefined,
     })
 

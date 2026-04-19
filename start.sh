@@ -88,12 +88,53 @@ if [ "${ENABLE_RECEIPT_OCR:-1}" = "0" ] || [ "${DISABLE_RECEIPT_OCR:-0}" = "1" ]
   echo "🔎 Receipt OCR sidecar disabled"
 else
   echo "🔎 Receipt OCR sidecar enabled on port ${RECEIPT_OCR_PORT:-8001}"
+  export OCR_VL_ENABLED="${OCR_VL_ENABLED:-1}"
+  export OCR_HTTP_WORKERS="${OCR_HTTP_WORKERS:-2}"
+  export OCR_PARSE_CONCURRENCY_PER_WORKER="${OCR_PARSE_CONCURRENCY_PER_WORKER:-1}"
+  echo "🔎 OCR fallback (VL) enabled: ${OCR_VL_ENABLED}"
+  echo "🔎 OCR HTTP workers: ${OCR_HTTP_WORKERS}"
+  echo "🔎 OCR parse slots per worker: ${OCR_PARSE_CONCURRENCY_PER_WORKER}"
+  # Keep backend OCR endpoint aligned with the mapped host port.
+  export OCR_SERVICE_URL="${OCR_SERVICE_URL:-http://localhost:${RECEIPT_OCR_PORT:-8001}}"
+  echo "🔎 Backend OCR endpoint: ${OCR_SERVICE_URL}"
 fi
 
 docker compose $COMPOSE_ARGS up -d
 echo "⏳ Waiting for DB..."
 until docker exec bg-tracker-db pg_isready -U bg_tracker -q 2>/dev/null; do sleep 1; done
 echo "✅ DB ready"
+
+if [ -n "$COMPOSE_ARGS" ]; then
+  OCR_CONTAINER="bg-tracker-receipt-ocr"
+  OCR_HEALTH_URL="http://localhost:${RECEIPT_OCR_PORT:-8001}/health"
+  echo "⏳ Waiting for receipt OCR service..."
+  OCR_READY=0
+  for i in $(seq 1 180); do
+    HEALTH_STATUS=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$OCR_CONTAINER" 2>/dev/null || echo "missing")
+
+    if [ "$HEALTH_STATUS" = "healthy" ] && curl -sf "$OCR_HEALTH_URL" >/dev/null 2>&1; then
+      OCR_READY=1
+      break
+    fi
+
+    if [ "$HEALTH_STATUS" = "unhealthy" ] || [ "$HEALTH_STATUS" = "exited" ] || [ "$HEALTH_STATUS" = "dead" ]; then
+      break
+    fi
+
+    sleep 1
+  done
+
+  if [ "$OCR_READY" -ne 1 ]; then
+    echo "❌ Receipt OCR service failed to become ready at $OCR_HEALTH_URL"
+    echo "📋 OCR container status:"
+    docker compose ps receipt-ocr || true
+    echo "📋 Last OCR logs:"
+    docker logs --tail 120 "$OCR_CONTAINER" 2>&1 || true
+    exit 1
+  fi
+
+  echo "✅ Receipt OCR ready"
+fi
 
 # Run schema upgrades (safe to run every time — never destroys data)
 docker exec -i bg-tracker-db psql -U bg_tracker -d bg_tracker -q -f /docker-entrypoint-initdb.d/upgrade.sql >/dev/null 2>&1 || true
@@ -130,11 +171,26 @@ done
 echo "✅ Backend ready"
 
 # Start frontend
-(cd frontend && npm run dev) &
+FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
+(cd frontend && npm run dev -- --host "$FRONTEND_HOST" --port "$FRONTEND_PORT" --strictPort) &
 FRONTEND_PID=$!
-sleep 3
+
+echo "⏳ Waiting for frontend..."
+for i in $(seq 1 90); do
+  kill -0 $FRONTEND_PID 2>/dev/null || { echo "❌ Frontend crashed"; kill $BACKEND_PID 2>/dev/null || true; exit 1; }
+  curl -sf "http://127.0.0.1:${FRONTEND_PORT}" >/dev/null 2>&1 && break
+  [ "$i" -eq 90 ] && { echo "❌ Frontend timeout"; kill $BACKEND_PID $FRONTEND_PID 2>/dev/null || true; exit 1; }
+  sleep 1
+done
+
+LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+
 echo ""
-echo "✅ Running → http://localhost:5173"
+echo "✅ Running → http://localhost:${FRONTEND_PORT}"
+if [ -n "$LAN_IP" ]; then
+  echo "✅ Network → http://${LAN_IP}:${FRONTEND_PORT}"
+fi
 echo "   Ctrl+C to stop"
 
 cleanup() {

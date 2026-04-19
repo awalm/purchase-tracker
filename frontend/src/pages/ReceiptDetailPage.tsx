@@ -385,6 +385,10 @@ export default function ReceiptDetailPage() {
     (sum, p) => sum + parseFloat(p.total_cost || "0"),
     0
   )
+  const receiptLineItemsCost = receiptLineItems.reduce(
+    (sum, line) => sum + Number(line.unit_cost) * line.quantity,
+    0
+  )
   const unlinkedCount = purchases.filter((p) => !p.invoice_id).length
   const receiptSubtotal = parseFloat(receipt.subtotal)
   const costDifference = receiptSubtotal - totalCost
@@ -431,7 +435,9 @@ export default function ReceiptDetailPage() {
                       : purchasesLoadError
                         ? "Linked purchases unavailable"
                         : purchases.length === 0
-                          ? "No linked purchases"
+                          ? receiptLineItems.length > 0
+                            ? `${receiptLineItems.length} receipt line${receiptLineItems.length === 1 ? "" : "s"} · no linked purchases`
+                            : "No linked purchases"
                           : `${formatCurrency(Math.abs(costDifference))} ${costDifference > 0 ? "unaccounted" : "over"}`}
                   </span>
                 )}
@@ -497,13 +503,19 @@ export default function ReceiptDetailPage() {
             <div className="text-2xl font-bold">
               {formatCurrency(totalCost.toFixed(2))}
             </div>
-            <p className="text-sm text-muted-foreground">Items Cost</p>
+            <p className="text-sm text-muted-foreground">Linked Purchases Cost</p>
+            <p className="text-xs text-muted-foreground mt-1">
+              Receipt lines total: {formatCurrency(receiptLineItemsCost.toFixed(2))}
+            </p>
           </CardContent>
         </Card>
         <Card>
           <CardContent className="pt-6">
             <div className="text-2xl font-bold">{purchases.length}</div>
             <p className="text-sm text-muted-foreground">Linked Purchases</p>
+            <p className="text-xs text-muted-foreground mt-1">
+              Receipt lines: {receiptLineItems.length}
+            </p>
           </CardContent>
         </Card>
       </div>

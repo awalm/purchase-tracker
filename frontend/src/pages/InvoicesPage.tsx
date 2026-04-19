@@ -1,13 +1,16 @@
-import { useState, useRef } from "react"
-import { useNavigate } from "react-router-dom"
+import { useEffect, useState, useRef } from "react"
+import { useNavigate, useSearchParams } from "react-router-dom"
+import { useQueryClient } from "@tanstack/react-query"
 import { useInvoices, useCreateInvoice, useUpdateInvoice, useDeleteInvoice, useDestinations, useItems } from "@/hooks/useApi"
 import { useMultiSelect } from "@/hooks/useMultiSelect"
-import { ApiValidationError, importApi, type InvoicePdfCommitErrorResponse, type InvoicePdfLineFailure, type ParsedInvoice } from "@/api"
+import { ApiValidationError, importApi, invoices as invoicesApi, type InvoicePdfCommitErrorResponse, type InvoicePdfLineFailure, type ParsedInvoice } from "@/api"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { DateInput } from "@/components/ui/date-input"
 import { Label } from "@/components/ui/label"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card"
+import { BulkReceiptImportDialog } from "@/components/BulkReceiptImportDialog"
+import { consumePendingBulkReceiptFiles } from "@/lib/bulkReceiptImportTransfer"
 import { ItemFormDialog } from "@/components/ItemFormDialog"
 import { ExportCsvButton } from "@/components/ExportCsvButton"
 import { RowActions } from "@/components/RowActions"
@@ -34,7 +37,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Plus, Trash2, CheckCircle2, AlertCircle, Clock, Upload, FileText } from "lucide-react"
+import { Plus, Trash2, CheckCircle2, AlertCircle, Clock, Upload, FileText, FileDown, Loader2 } from "lucide-react"
 import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
 
 interface Invoice {
@@ -58,6 +61,7 @@ interface Invoice {
 
 function ReconciliationBadge({ invoice }: { invoice: Invoice }) {
   const isFinalized = invoice.reconciliation_state === "locked"
+  const isReopened = invoice.reconciliation_state === "reopened"
   const invoiceSubtotal = parseFloat(invoice.subtotal)
   const purchasesTotal = parseFloat(invoice.purchases_total || "0")
   const difference = Math.abs(invoiceSubtotal - purchasesTotal)
@@ -85,6 +89,15 @@ function ReconciliationBadge({ invoice }: { invoice: Invoice }) {
       <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 px-2 py-1 rounded-full">
         <AlertCircle className="h-3 w-3" />
         Finalized · {finalizedIssues.join(" · ")}
+      </span>
+    )
+  }
+
+  if (isReopened) {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-medium text-orange-700 bg-orange-50 px-2 py-1 rounded-full">
+        <AlertCircle className="h-3 w-3" />
+        Reopened
       </span>
     )
   }
@@ -122,6 +135,8 @@ function ReconciliationBadge({ invoice }: { invoice: Invoice }) {
 
 export default function InvoicesPage() {
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const queryClient = useQueryClient()
   const { data: invoices = [], isLoading } = useInvoices()
   const { data: destinations = [] } = useDestinations()
   const createInvoice = useCreateInvoice()
@@ -206,6 +221,95 @@ export default function InvoicesPage() {
 
   const [pdfCreating, setPdfCreating] = useState(false)
   const [pdfCreateStatus, setPdfCreateStatus] = useState("")
+  const [bulkReceiptImportOpen, setBulkReceiptImportOpen] = useState(false)
+  const [bulkReceiptImportPrefillFiles, setBulkReceiptImportPrefillFiles] = useState<File[]>([])
+
+  // Bulk backup modal + import state
+  const bulkImportInputRef = useRef<HTMLInputElement>(null)
+  const [bulkBackupDialogOpen, setBulkBackupDialogOpen] = useState(false)
+  const [includeUnfinalizedInvoices, setIncludeUnfinalizedInvoices] = useState(false)
+  const [includeBackupDocuments, setIncludeBackupDocuments] = useState(true)
+  const [bulkBackupFromDate, setBulkBackupFromDate] = useState("")
+  const [bulkBackupToDate, setBulkBackupToDate] = useState("")
+  const [isExportingAllBackups, setIsExportingAllBackups] = useState(false)
+  const [isImportingAllBackups, setIsImportingAllBackups] = useState(false)
+  const [bulkBackupError, setBulkBackupError] = useState("")
+  const [bulkBackupNotice, setBulkBackupNotice] = useState("")
+
+  useEffect(() => {
+    const shouldOpenBulkReceiptImport = searchParams.get("bulkReceiptImport") === "1"
+    if (!shouldOpenBulkReceiptImport) return
+
+    setBulkReceiptImportPrefillFiles(consumePendingBulkReceiptFiles())
+    setBulkReceiptImportOpen(true)
+    const nextParams = new URLSearchParams(searchParams)
+    nextParams.delete("bulkReceiptImport")
+    setSearchParams(nextParams, { replace: true })
+  }, [searchParams, setSearchParams])
+
+  const handleExportAllBackups = async () => {
+    if (bulkBackupFromDate && bulkBackupToDate && bulkBackupFromDate > bulkBackupToDate) {
+      setBulkBackupError("Invalid date range: From date must be before or equal to To date.")
+      return
+    }
+
+    setIsExportingAllBackups(true)
+    setBulkBackupError("")
+    setBulkBackupNotice("")
+
+    try {
+      const blob = await invoicesApi.downloadAllBackups({
+        include_unfinalized: includeUnfinalizedInvoices,
+        include_documents: includeBackupDocuments,
+        from: bulkBackupFromDate || undefined,
+        to: bulkBackupToDate || undefined,
+      })
+
+      const downloadUrl = URL.createObjectURL(blob)
+      const link = document.createElement("a")
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-")
+      link.href = downloadUrl
+      link.download = `invoices_backup_${stamp}.zip`
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(downloadUrl)
+
+      setBulkBackupDialogOpen(false)
+      setBulkBackupNotice("Invoice backup export started.")
+    } catch (err) {
+      setBulkBackupError(err instanceof Error ? err.message : "Failed to export invoice backups")
+    } finally {
+      setIsExportingAllBackups(false)
+    }
+  }
+
+  const handleImportAllBackups = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    setIsImportingAllBackups(true)
+    setBulkBackupError("")
+    setBulkBackupNotice("")
+
+    try {
+      const restored = await invoicesApi.importAllBackups(file)
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      queryClient.invalidateQueries({ queryKey: ["receipts"] })
+      queryClient.invalidateQueries({ queryKey: ["purchases"] })
+
+      setBulkBackupNotice(
+        `Imported ${restored.restored_invoice_count} invoice backup(s): ${restored.restored_purchase_count} purchases, ${restored.restored_receipt_count} receipts, ${restored.restored_allocation_count} allocations.`
+      )
+    } catch (err) {
+      setBulkBackupError(err instanceof Error ? err.message : "Failed to import invoice backups")
+    } finally {
+      setIsImportingAllBackups(false)
+      if (bulkImportInputRef.current) {
+        bulkImportInputRef.current.value = ""
+      }
+    }
+  }
 
   const handlePdfCreate = async () => {
     if (!parsedInvoice || !pdfDestinationId || !pdfFile) return
@@ -239,6 +343,13 @@ export default function InvoicesPage() {
         notes: parsedInvoice.notes || undefined,
         line_items: lineItems,
       })
+
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["invoices"] }),
+        queryClient.invalidateQueries({ queryKey: ["purchases"] }),
+        queryClient.invalidateQueries({ queryKey: ["reports"] }),
+        queryClient.invalidateQueries({ queryKey: ["item"] }),
+      ])
 
       setPdfDialogOpen(false)
       setParsedInvoice(null)
@@ -320,6 +431,13 @@ export default function InvoicesPage() {
       <div className="flex justify-between items-center">
         <h1 className="text-2xl font-bold">Invoices</h1>
         <div className="flex gap-2">
+          <input
+            ref={bulkImportInputRef}
+            type="file"
+            accept=".zip"
+            onChange={handleImportAllBackups}
+            className="hidden"
+          />
           <ExportCsvButton
             filename="invoices"
             columns={[
@@ -336,6 +454,106 @@ export default function InvoicesPage() {
             ]}
             data={invoices}
           />
+          <Dialog open={bulkBackupDialogOpen} onOpenChange={setBulkBackupDialogOpen}>
+            <DialogTrigger asChild>
+              <Button variant="outline">
+                <FileDown className="h-4 w-4 mr-2" />
+                Export Backups
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="max-w-md">
+              <DialogHeader>
+                <DialogTitle>Export Invoice Backups</DialogTitle>
+              </DialogHeader>
+
+              <div className="space-y-4">
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={includeUnfinalizedInvoices}
+                    onChange={(e) => setIncludeUnfinalizedInvoices(e.target.checked)}
+                    className="h-4 w-4 rounded border-gray-300"
+                  />
+                  Include unfinalized invoices
+                </label>
+
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={includeBackupDocuments}
+                    onChange={(e) => setIncludeBackupDocuments(e.target.checked)}
+                    className="h-4 w-4 rounded border-gray-300"
+                  />
+                  Include attached invoice/receipt documents
+                </label>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <Label htmlFor="bulk-backup-from">From Date</Label>
+                    <DateInput
+                      id="bulk-backup-from"
+                      value={bulkBackupFromDate}
+                      onChange={setBulkBackupFromDate}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="bulk-backup-to">To Date</Label>
+                    <DateInput
+                      id="bulk-backup-to"
+                      value={bulkBackupToDate}
+                      onChange={setBulkBackupToDate}
+                    />
+                  </div>
+                </div>
+
+                <p className="text-xs text-muted-foreground">
+                  Exports a ZIP containing one backup ZIP per invoice plus a manifest file.
+                </p>
+
+                <div className="flex justify-end gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setBulkBackupDialogOpen(false)}
+                    disabled={isExportingAllBackups}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    type="button"
+                    onClick={handleExportAllBackups}
+                    disabled={isExportingAllBackups}
+                  >
+                    {isExportingAllBackups ? (
+                      <>
+                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                        Exporting...
+                      </>
+                    ) : (
+                      "Export"
+                    )}
+                  </Button>
+                </div>
+              </div>
+            </DialogContent>
+          </Dialog>
+          <Button
+            variant="outline"
+            onClick={() => bulkImportInputRef.current?.click()}
+            disabled={isImportingAllBackups}
+          >
+            {isImportingAllBackups ? (
+              <>
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                Importing Backups...
+              </>
+            ) : (
+              <>
+                <Upload className="h-4 w-4 mr-2" />
+                Import Backups
+              </>
+            )}
+          </Button>
           {selectedIds.size > 0 && (
             <Button 
               variant="destructive" 
@@ -711,6 +929,29 @@ export default function InvoicesPage() {
           </Dialog>
         </div>
       </div>
+
+      <BulkReceiptImportDialog
+        open={bulkReceiptImportOpen}
+        onOpenChange={(open) => {
+          setBulkReceiptImportOpen(open)
+          if (!open) {
+            setBulkReceiptImportPrefillFiles([])
+          }
+        }}
+        prefillFiles={bulkReceiptImportPrefillFiles}
+      />
+
+      {bulkBackupError && (
+        <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {bulkBackupError}
+        </div>
+      )}
+
+      {bulkBackupNotice && (
+        <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
+          {bulkBackupNotice}
+        </div>
+      )}
 
       {/* Summary cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">

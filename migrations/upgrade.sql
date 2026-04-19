@@ -138,12 +138,15 @@ ALTER TABLE invoices
 UPDATE invoices
 SET reconciliation_state = 'open'
 WHERE reconciliation_state IS NULL
-   OR reconciliation_state NOT IN ('open', 'in_review', 'reconciled', 'locked');
+   OR reconciliation_state NOT IN ('open', 'in_review', 'reconciled', 'locked', 'reopened');
+
+ALTER TABLE invoices
+  DROP CONSTRAINT IF EXISTS invoices_reconciliation_state_chk;
 
 DO $$ BEGIN
   ALTER TABLE invoices
     ADD CONSTRAINT invoices_reconciliation_state_chk
-    CHECK (reconciliation_state IN ('open', 'in_review', 'reconciled', 'locked'));
+    CHECK (reconciliation_state IN ('open', 'in_review', 'reconciled', 'locked', 'reopened'));
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
@@ -177,16 +180,24 @@ FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 -- ============================================
 
 ALTER TABLE receipts
-  ADD COLUMN IF NOT EXISTS payment_card_last4 VARCHAR(4);
+  ADD COLUMN IF NOT EXISTS payment_method TEXT;
 
 ALTER TABLE receipts
   ADD COLUMN IF NOT EXISTS ingestion_metadata JSONB;
 
-DO $$ BEGIN
-  ALTER TABLE receipts
-    ADD CONSTRAINT receipts_payment_card_last4_chk
-    CHECK (payment_card_last4 IS NULL OR payment_card_last4 ~ '^[0-9]{4}$');
-EXCEPTION WHEN duplicate_object THEN NULL;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'receipts'
+      AND column_name = 'payment_card_last4'
+  ) THEN
+    EXECUTE 'UPDATE receipts
+             SET payment_method = COALESCE(payment_method, payment_card_last4)
+             WHERE payment_method IS NULL';
+  END IF;
 END $$;
 
 CREATE TABLE IF NOT EXISTS receipt_line_items (

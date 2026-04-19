@@ -88,6 +88,7 @@ export interface ReceiptWithVendor {
   notes: string | null;
   created_at: string;
   updated_at: string;
+  receipt_line_item_count: number;
   purchase_count: number | null;
   purchases_total: string | null;
   total_selling: string | null;

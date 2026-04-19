@@ -15,6 +15,7 @@ import {
 import {
   importApi,
   type ParsedReceipt,
+  type ReceiptOcrMode,
   type ReceiptImageParseProgress,
   receipts as receiptsApi,
 } from "@/api"
@@ -46,6 +47,8 @@ import {
 } from "@/components/ui/select"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
 import { ExportCsvButton } from "@/components/ExportCsvButton"
+import { BulkReceiptImportDialog } from "@/components/BulkReceiptImportDialog"
+import { ItemFormDialog } from "@/components/ItemFormDialog"
 import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
 import { Plus, Trash2, Pencil, FileText, Upload, CheckCircle2, AlertCircle, Clock, Loader2 } from "lucide-react"
 import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
@@ -55,6 +58,10 @@ import {
   importSubtotalMatches,
   truncateOptionLabel,
 } from "@/lib/receiptImportValidation"
+import {
+  getReceiptItemsDisplayCount,
+  getReceiptReconciliationBadgeState,
+} from "@/lib/receiptSummary"
 
 type Receipt = ReturnType<typeof useReceipts>["data"] extends (infer T)[] | undefined ? T : never
 
@@ -77,6 +84,10 @@ type ManualImportLine = {
   unitCost: string
 }
 
+type ImportNewItemTarget =
+  | { kind: "parsed"; index: number }
+  | { kind: "manual"; lineId: string }
+
 const createManualImportLine = (): ManualImportLine => ({
   id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
   description: "",
@@ -85,41 +96,42 @@ const createManualImportLine = (): ManualImportLine => ({
   unitCost: "",
 })
 
-function ReconciliationBadge({ receipt }: { receipt: Receipt }) {
-  const subtotal = parseFloat(receipt.subtotal)
-  const purchasesTotal = parseFloat(receipt.purchases_total || "0")
-  const difference = Math.abs(subtotal - purchasesTotal)
-  const count = receipt.purchase_count || 0
-  const invoicedCount = receipt.invoiced_count || 0
-  const allInvoiced = count > 0 && invoicedCount === count
-  const totalsMatched = difference < 0.01
-
-  if (count === 0) {
-    return (
-      <span className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 bg-gray-100 px-2 py-1 rounded-full">
-        <Clock className="h-3 w-3" />
-        No items
-      </span>
-    )
+const getOcrEngineDisplayName = (engine: string | null | undefined): string => {
+  const normalized = (engine || "").trim().toLowerCase()
+  if (normalized === "paddleocr-vl") {
+    return "PaddleOCR-VL"
   }
+  if (normalized === "paddleocr") {
+    return "PaddleOCR"
+  }
+  return engine?.trim() || "Unknown"
+}
 
-  if (totalsMatched && allInvoiced) {
+function ReconciliationBadge({ receipt }: { receipt: Receipt }) {
+  const badgeState = getReceiptReconciliationBadgeState(receipt)
+
+  if (badgeState.kind === "reconciled") {
     return (
       <span className="inline-flex items-center gap-1 text-xs font-medium text-green-600 bg-green-50 px-2 py-1 rounded-full">
         <CheckCircle2 className="h-3 w-3" />
-        Reconciled
+        {badgeState.label}
       </span>
     )
   }
 
-  const issues: string[] = []
-  if (!totalsMatched) issues.push(`${formatCurrency(difference)} off`)
-  if (!allInvoiced) issues.push(`${invoicedCount}/${count} invoiced`)
+  if (badgeState.kind === "no-receipt-lines") {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 bg-gray-100 px-2 py-1 rounded-full">
+        <Clock className="h-3 w-3" />
+        {badgeState.label}
+      </span>
+    )
+  }
 
   return (
     <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-600 bg-amber-50 px-2 py-1 rounded-full">
       <AlertCircle className="h-3 w-3" />
-      {issues.join(" · ")}
+      {badgeState.label}
     </span>
   )
 }
@@ -141,6 +153,9 @@ export default function ReceiptsPage() {
   const [vendorFilter, setVendorFilter] = useState<string>("")
 
   const [isImportOpen, setIsImportOpen] = useState(false)
+  const [bulkImportOpen, setBulkImportOpen] = useState(false)
+  const [bulkImportPrefillFiles, setBulkImportPrefillFiles] = useState<File[]>([])
+  const [bulkImportAutoStart, setBulkImportAutoStart] = useState(false)
   const [importFile, setImportFile] = useState<File | null>(null)
   const [parsedReceipt, setParsedReceipt] = useState<ParsedReceipt | null>(null)
   const [importParsing, setImportParsing] = useState(false)
@@ -154,24 +169,28 @@ export default function ReceiptsPage() {
   const [importSubtotal, setImportSubtotal] = useState("")
   const [importTaxAmount, setImportTaxAmount] = useState("")
   const [importTotal, setImportTotal] = useState("")
-  const [importCardLast4, setImportCardLast4] = useState("")
+  const [importPaymentMethod, setImportPaymentMethod] = useState("")
   const [importNotes, setImportNotes] = useState("")
+  const [importLineDescriptionOverrides, setImportLineDescriptionOverrides] = useState<Record<number, string>>({})
   const [importLineItemOverrides, setImportLineItemOverrides] = useState<Record<number, string>>({})
   const [importLineQtyOverrides, setImportLineQtyOverrides] = useState<Record<number, string>>({})
   const [importLineUnitCostOverrides, setImportLineUnitCostOverrides] = useState<Record<number, string>>({})
   const [importManualLines, setImportManualLines] = useState<ManualImportLine[]>([])
+  const [importNewItemTarget, setImportNewItemTarget] = useState<ImportNewItemTarget | null>(null)
   const [importWarnings, setImportWarnings] = useState<string[]>([])
   const [importFilePreviewUrl, setImportFilePreviewUrl] = useState<string | null>(null)
   const [importParseStage, setImportParseStage] = useState<ReceiptImageParseProgress["stage"] | null>(null)
   const [importParseProgress, setImportParseProgress] = useState<number | null>(null)
+  const [importBypassCompression, setImportBypassCompression] = useState(false)
+  const [importOcrMode, setImportOcrMode] = useState<ReceiptOcrMode>("auto")
   const importFileInputRef = useRef<HTMLInputElement>(null)
   const { data: selectedVendorAliases = [] } = useVendorImportAliases(importVendorId)
   const createVendorAlias = useCreateVendorImportAlias(importVendorId)
   const deleteVendorAlias = useDeleteVendorImportAlias(importVendorId)
 
   useEffect(() => {
-    const shouldOpenImport = searchParams.get("import") === "1"
-    if (!shouldOpenImport) return
+    const shouldOpenOcrImport = searchParams.get("import") === "1"
+    if (!shouldOpenOcrImport) return
 
     setIsImportOpen(true)
     const nextParams = new URLSearchParams(searchParams)
@@ -221,16 +240,23 @@ export default function ReceiptsPage() {
     setImportSubtotal("")
     setImportTaxAmount("")
     setImportTotal("")
-    setImportCardLast4("")
+    setImportPaymentMethod("")
     setImportNotes("")
+    setImportLineDescriptionOverrides({})
     setImportLineItemOverrides({})
     setImportLineQtyOverrides({})
     setImportLineUnitCostOverrides({})
     setImportManualLines([])
+    setImportNewItemTarget(null)
     setImportWarnings([])
     setImportFilePreviewUrl(null)
     setImportParseStage(null)
     setImportParseProgress(null)
+    setImportBypassCompression(false)
+    setImportOcrMode("auto")
+    if (importFileInputRef.current) {
+      importFileInputRef.current.value = ""
+    }
   }
 
   const getAutoMatchedItemId = (description: string): string | null => {
@@ -279,10 +305,18 @@ export default function ReceiptsPage() {
     return bestId
   }
 
+  const resolveImportedDescription = (index: number, fallbackDescription: string): string => {
+    const override = importLineDescriptionOverrides[index]
+    if (typeof override === "string") {
+      return override
+    }
+    return fallbackDescription
+  }
+
   const resolveImportedItemId = (description: string, index: number): string | null => {
     const manual = importLineItemOverrides[index]
     if (manual) return manual
-    return getAutoMatchedItemId(description)
+    return getAutoMatchedItemId(resolveImportedDescription(index, description))
   }
 
   const resolveImportedQty = (index: number, fallbackQty: number): number => {
@@ -307,11 +341,12 @@ export default function ReceiptsPage() {
 
   const unresolvedParsedCount = parsedReceipt
     ? parsedReceipt.line_items.filter((li, idx) => {
+        const description = resolveImportedDescription(idx, li.description).trim()
         const itemId = resolveImportedItemId(li.description, idx)
         const qty = resolveImportedQty(idx, li.quantity)
         const unitCost = resolveImportedUnitCost(idx, li.unit_cost, qty, li.line_total)
         const unitCostNum = unitCost ? Number.parseFloat(unitCost) : NaN
-        return !itemId || qty <= 0 || !Number.isFinite(unitCostNum) || unitCostNum <= 0
+        return !description || !itemId || qty <= 0 || !Number.isFinite(unitCostNum) || unitCostNum <= 0
       }).length
     : 0
 
@@ -400,8 +435,19 @@ export default function ReceiptsPage() {
   }
 
   const handleImportFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
+    const selectedFiles = Array.from(e.target.files || [])
+    if (selectedFiles.length === 0) return
+
+    if (selectedFiles.length > 1) {
+      setIsImportOpen(false)
+      resetImportForm()
+      setBulkImportPrefillFiles(selectedFiles)
+      setBulkImportAutoStart(true)
+      setBulkImportOpen(true)
+      return
+    }
+
+    const file = selectedFiles[0]
 
     setImportFile(file)
     setImportVendorId("")
@@ -410,10 +456,12 @@ export default function ReceiptsPage() {
     setImportError("")
     setImportStatus("Uploading receipt...")
     setParsedReceipt(null)
+    setImportLineDescriptionOverrides({})
     setImportLineItemOverrides({})
     setImportLineQtyOverrides({})
     setImportLineUnitCostOverrides({})
     setImportManualLines([])
+    setImportNewItemTarget(null)
     setImportWarnings([])
     setImportParseStage("uploading")
     setImportParseProgress(0)
@@ -429,7 +477,7 @@ export default function ReceiptsPage() {
         } else {
           setImportStatus("Parsing receipt...")
         }
-      })
+      }, { bypassCompression: importBypassCompression, ocrMode: importOcrMode })
       setParsedReceipt(parsed)
       const rawVendorName = parsed.vendor_name?.trim() || ""
       const suggestedVendorId = parsed.suggested_vendor_id || ""
@@ -452,10 +500,12 @@ export default function ReceiptsPage() {
         : ""
       setImportTaxAmount(taxFromPayload || inferredTax)
       setImportTotal(parsed.total || "")
-      setImportCardLast4(parsed.card_last4 || "")
+      setImportPaymentMethod(parsed.payment_method || "")
       setImportWarnings(parsed.warnings || [])
       setImportNotes("")
-      setImportStatus("Receipt parsed. Confirm all fields before saving.")
+      setImportStatus(
+        `Receipt parsed using ${getOcrEngineDisplayName(parsed.parse_engine)}. Confirm all fields before saving.`
+      )
     } catch (err) {
       setImportError(err instanceof Error ? err.message : "Failed to parse receipt image")
       setImportStatus("")
@@ -505,7 +555,7 @@ export default function ReceiptsPage() {
         receipt_date: importReceiptDate,
         subtotal: importSubtotal,
         tax_amount: importTaxAmount || undefined,
-        payment_card_last4: importCardLast4 || undefined,
+        payment_method: importPaymentMethod || undefined,
         ingestion_metadata: {
           source: "ocr",
           auto_parsed: true,
@@ -528,10 +578,14 @@ export default function ReceiptsPage() {
       setImportStatus("Creating receipt line items...")
       for (let i = 0; i < parsedReceipt.line_items.length; i += 1) {
         const li = parsedReceipt.line_items[i]
+        const description = resolveImportedDescription(i, li.description).trim()
         const itemId = resolveImportedItemId(li.description, i)
         const qty = resolveImportedQty(i, li.quantity)
         const unitCost = resolveImportedUnitCost(i, li.unit_cost, qty, li.line_total)
 
+        if (!description) {
+          throw new Error(`Line ${i + 1} description is required`)
+        }
         if (!itemId) {
           throw new Error(`Line ${i + 1} is not mapped to an item`)
         }
@@ -546,7 +600,7 @@ export default function ReceiptsPage() {
           item_id: itemId,
           quantity: qty,
           unit_cost: unitCost,
-          notes: li.description,
+          notes: description,
         })
       }
 
@@ -581,7 +635,9 @@ export default function ReceiptsPage() {
       }
 
       setImportStatus("Uploading original receipt document...")
-      await receiptsApi.uploadPdf(createdReceiptId, importFile)
+      await receiptsApi.uploadPdf(createdReceiptId, importFile, {
+        bypassCompression: importBypassCompression,
+      })
 
       setImportStatus("Done")
       queryClient.invalidateQueries({ queryKey: ["receipts"] })
@@ -611,7 +667,7 @@ export default function ReceiptsPage() {
         receipt_date: data.receipt_date,
         subtotal: data.subtotal,
         tax_amount: data.tax_amount,
-        payment_card_last4: data.payment_card_last4.trim() || undefined,
+        payment_method: data.payment_method.trim() || undefined,
         notes: data.notes || undefined,
       })
     } else {
@@ -621,7 +677,7 @@ export default function ReceiptsPage() {
         receipt_date: data.receipt_date,
         subtotal: data.subtotal,
         tax_amount: data.tax_amount,
-        payment_card_last4: data.payment_card_last4.trim() || undefined,
+        payment_method: data.payment_method.trim() || undefined,
         notes: data.notes || undefined,
       })
       receiptId = created.id
@@ -671,12 +727,8 @@ export default function ReceiptsPage() {
     0
   )
   const unreconciledCount = filteredReceipts.filter(r => {
-    const count = r.purchase_count || 0
-    if (count === 0) return false
-    const diff = Math.abs(parseFloat(r.subtotal) - parseFloat(r.purchases_total || "0"))
-    const totalsMatched = diff < 0.01
-    const allInvoiced = (r.invoiced_count || 0) === count
-    return !totalsMatched || !allInvoiced
+    const badgeState = getReceiptReconciliationBadgeState(r)
+    return badgeState.kind === "no-linked-purchases" || badgeState.kind === "issues"
   }).length
 
   if (isLoading) return <div className="text-muted-foreground">Loading...</div>
@@ -695,6 +747,7 @@ export default function ReceiptsPage() {
               { header: "Subtotal", accessor: (r) => r.subtotal },
               { header: "Tax Rate", accessor: (r) => formatNumber(r.tax_rate) },
               { header: "Total", accessor: (r) => r.total },
+              { header: "Receipt Line Count", accessor: (r) => r.receipt_line_item_count },
               { header: "Purchase Count", accessor: (r) => r.purchase_count },
               { header: "Purchases Total", accessor: (r) => r.purchases_total },
               { header: "Has Document", accessor: (r) => r.has_pdf ? "Yes" : "No" },
@@ -832,9 +885,24 @@ export default function ReceiptsPage() {
                         )}
                       </div>
 
+                      {parsedReceipt && (
+                        <div className="text-sm text-sky-700 bg-sky-50 border border-sky-200 rounded-md px-3 py-2">
+                          <div className="font-medium mb-1">OCR result</div>
+                          <div>Final engine: {getOcrEngineDisplayName(parsedReceipt.parse_engine)}</div>
+                          {typeof parsedReceipt.confidence_score === "number" && (
+                            <div>Confidence score: {parsedReceipt.confidence_score.toFixed(2)}</div>
+                          )}
+                          {parsedReceipt.parse_version && (
+                            <div>Parse version: {parsedReceipt.parse_version}</div>
+                          )}
+                        </div>
+                      )}
+
                       {importWarnings.length > 0 && (
                         <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
-                          <div className="font-medium mb-1">OCR warnings</div>
+                          <div className="font-medium mb-1">
+                            OCR warnings (final engine: {getOcrEngineDisplayName(parsedReceipt?.parse_engine)})
+                          </div>
                           <ul className="list-disc pl-5">
                             {importWarnings.map((w, idx) => (
                               <li key={idx}>{w}</li>
@@ -870,10 +938,10 @@ export default function ReceiptsPage() {
                           <Input value={importTotal} onChange={(e) => setImportTotal(e.target.value)} />
                         </div>
                         <div className="space-y-2 md:col-span-2">
-                          <Label>Card Last 4 (extracted)</Label>
+                          <Label>Payment Method (extracted)</Label>
                           <Input
-                            value={importCardLast4}
-                            onChange={(e) => setImportCardLast4(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
+                            value={importPaymentMethod}
+                            onChange={(e) => setImportPaymentMethod(e.target.value)}
                             placeholder="Not detected"
                           />
                         </div>
@@ -907,21 +975,38 @@ export default function ReceiptsPage() {
                           <TableBody>
                             {parsedReceipt.line_items.map((li, idx) => {
                               const selectedItemId = resolveImportedItemId(li.description, idx) || "__none__"
+                              const descriptionValue = resolveImportedDescription(idx, li.description)
                               const qtyValue = importLineQtyOverrides[idx] ?? String(li.quantity)
                               const unitCostValue = importLineUnitCostOverrides[idx] ?? (li.unit_cost || "")
 
                               return (
                                 <TableRow key={`${idx}-${li.description}`}>
-                                  <TableCell
-                                    className="align-top whitespace-normal break-words leading-snug"
-                                    title={li.description}
-                                  >
-                                    {truncateOptionLabel(li.description, 120)}
+                                  <TableCell className="align-top">
+                                    <Input
+                                      value={descriptionValue}
+                                      onChange={(e) => {
+                                        const value = e.target.value
+                                        setImportLineDescriptionOverrides((prev) => {
+                                          const next = { ...prev }
+                                          if (value === li.description) {
+                                            delete next[idx]
+                                          } else {
+                                            next[idx] = value
+                                          }
+                                          return next
+                                        })
+                                      }}
+                                      placeholder="Line description"
+                                    />
                                   </TableCell>
                                   <TableCell className="align-top">
                                     <Select
                                       value={selectedItemId}
                                       onValueChange={(v) => {
+                                        if (v === "__create__") {
+                                          setImportNewItemTarget({ kind: "parsed", index: idx })
+                                          return
+                                        }
                                         setImportLineItemOverrides((prev) => {
                                           const next = { ...prev }
                                           if (v === "__none__") delete next[idx]
@@ -935,6 +1020,9 @@ export default function ReceiptsPage() {
                                       </SelectTrigger>
                                       <SelectContent className="max-w-[min(90vw,32rem)]">
                                         <SelectItem value="__none__">Unmapped</SelectItem>
+                                        <SelectItem value="__create__">
+                                          <span className="text-blue-600">+ Create New Item</span>
+                                        </SelectItem>
                                         {items.map((it) => (
                                           <SelectItem key={it.id} value={it.id}>
                                             <span className="block whitespace-normal break-all leading-snug line-clamp-2">
@@ -995,17 +1083,24 @@ export default function ReceiptsPage() {
                                 <TableCell className="align-top">
                                   <Select
                                     value={line.itemId || "__none__"}
-                                    onValueChange={(value) =>
+                                    onValueChange={(value) => {
+                                      if (value === "__create__") {
+                                        setImportNewItemTarget({ kind: "manual", lineId: line.id })
+                                        return
+                                      }
                                       updateManualImportLine(line.id, {
                                         itemId: value === "__none__" ? "" : value,
                                       })
-                                    }
+                                    }}
                                   >
                                     <SelectTrigger className="w-full min-w-0 h-auto min-h-9 whitespace-normal py-2 [&>span]:line-clamp-2 [&>span]:whitespace-normal [&>span]:break-all">
                                       <SelectValue placeholder="Map item" />
                                     </SelectTrigger>
                                     <SelectContent className="max-w-[min(90vw,32rem)]">
                                       <SelectItem value="__none__">Unmapped</SelectItem>
+                                      <SelectItem value="__create__">
+                                        <span className="text-blue-600">+ Create New Item</span>
+                                      </SelectItem>
                                       {items.map((it) => (
                                         <SelectItem key={it.id} value={it.id}>
                                           <span className="block whitespace-normal break-all leading-snug line-clamp-2">
@@ -1139,6 +1234,7 @@ export default function ReceiptsPage() {
                       id="receipt-import-file"
                       ref={importFileInputRef}
                       type="file"
+                      multiple
                       accept=".pdf,.png,.jpg,.jpeg,.webp"
                       className="hidden"
                       onChange={handleImportFileChange}
@@ -1155,6 +1251,34 @@ export default function ReceiptsPage() {
                         <span className="text-sm text-muted-foreground truncate min-w-0">
                           {importFile ? importFile.name : "No file chosen"}
                         </span>
+                      </div>
+
+                      <label className="mt-3 inline-flex items-center gap-2 text-xs text-muted-foreground">
+                        <input
+                          type="checkbox"
+                          checked={importBypassCompression}
+                          onChange={(e) => setImportBypassCompression(e.target.checked)}
+                          disabled={importParsing || importCreating}
+                        />
+                        Bypass compression (upload original file)
+                      </label>
+
+                      <div className="mt-3 space-y-1">
+                        <Label className="text-xs">OCR mode</Label>
+                        <Select
+                          value={importOcrMode}
+                          onValueChange={(value) => setImportOcrMode(value as ReceiptOcrMode)}
+                          disabled={importParsing || importCreating}
+                        >
+                          <SelectTrigger>
+                            <SelectValue placeholder="Select OCR mode" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="auto">Auto (PaddleOCR + PaddleOCR-VL fallback)</SelectItem>
+                            <SelectItem value="classic">PaddleOCR</SelectItem>
+                            <SelectItem value="vl">PaddleOCR-VL</SelectItem>
+                          </SelectContent>
+                        </Select>
                       </div>
                     </div>
                   </div>
@@ -1189,6 +1313,64 @@ export default function ReceiptsPage() {
               </div>
             </DialogContent>
           </Dialog>
+          <Button
+            variant="outline"
+            onClick={() => {
+              setBulkImportPrefillFiles([])
+              setBulkImportAutoStart(false)
+              setBulkImportOpen(true)
+            }}
+          >
+            <Upload className="h-4 w-4 mr-2" />
+            Bulk Import Receipts
+          </Button>
+          <BulkReceiptImportDialog
+            open={bulkImportOpen}
+            onOpenChange={(open) => {
+              setBulkImportOpen(open)
+              if (!open) {
+                setBulkImportPrefillFiles([])
+                setBulkImportAutoStart(false)
+              }
+            }}
+            prefillFiles={bulkImportPrefillFiles}
+            autoStartParse={bulkImportAutoStart}
+          />
+          <ItemFormDialog
+            open={importNewItemTarget !== null}
+            onOpenChange={(open) => {
+              if (!open) {
+                setImportNewItemTarget(null)
+              }
+            }}
+            defaults={(() => {
+              if (!importNewItemTarget) return undefined
+              if (importNewItemTarget.kind === "parsed") {
+                const line = parsedReceipt?.line_items[importNewItemTarget.index]
+                if (!line) return undefined
+                return {
+                  name: resolveImportedDescription(importNewItemTarget.index, line.description),
+                }
+              }
+              const line = importManualLines.find((entry) => entry.id === importNewItemTarget.lineId)
+              if (!line) return undefined
+              return { name: line.description }
+            })()}
+            onCreated={(newItemId) => {
+              if (!importNewItemTarget) return
+
+              if (importNewItemTarget.kind === "parsed") {
+                setImportLineItemOverrides((prev) => ({
+                  ...prev,
+                  [importNewItemTarget.index]: newItemId,
+                }))
+              } else {
+                updateManualImportLine(importNewItemTarget.lineId, { itemId: newItemId })
+              }
+
+              setImportNewItemTarget(null)
+            }}
+          />
           <Dialog
             open={isOpen}
             onOpenChange={(open) => {
@@ -1218,7 +1400,7 @@ export default function ReceiptsPage() {
                       receipt_date: editingReceipt.receipt_date,
                       subtotal: editingReceipt.subtotal,
                       tax_amount: (parseFloat(editingReceipt.total) - parseFloat(editingReceipt.subtotal)).toFixed(2),
-                      payment_card_last4: editingReceipt.payment_card_last4 || "",
+                      payment_method: editingReceipt.payment_method || "",
                       notes: editingReceipt.notes || "",
                     }
                   : undefined}
@@ -1352,7 +1534,7 @@ export default function ReceiptsPage() {
                       {formatCurrency(r.total)}
                     </TableCell>
                     <TableCell className="text-right">
-                      {r.purchase_count || 0}
+                      {getReceiptItemsDisplayCount(r)}
                     </TableCell>
                     <TableCell>
                       <ReconciliationBadge receipt={r} />

@@ -252,7 +252,7 @@ export function useCreateReceipt() {
       receipt_date: string
       subtotal: string
       tax_amount?: string
-      payment_card_last4?: string
+      payment_method?: string
       ingestion_metadata?: ReceiptIngestionMetadata
       notes?: string
     }) => receipts.create(data),
@@ -308,8 +308,13 @@ export function useCreatePurchase() {
       notes?: string
     }) => purchases.create(data),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["purchases"] })
-      queryClient.invalidateQueries({ queryKey: ["reports"] })
+      return Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["purchases"] }),
+        queryClient.invalidateQueries({ queryKey: ["reports"] }),
+        queryClient.invalidateQueries({ queryKey: ["invoices"] }),
+        queryClient.invalidateQueries({ queryKey: ["receipts"] }),
+        queryClient.invalidateQueries({ queryKey: ["item"] }),
+      ])
     },
   })
 }
@@ -319,8 +324,13 @@ export function useUpdatePurchase() {
   return useMutation({
     mutationFn: ({ id, ...data }: { id: string } & Record<string, unknown>) => purchases.update(id, data),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["purchases"] })
-      queryClient.invalidateQueries({ queryKey: ["reports"] })
+      return Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["purchases"] }),
+        queryClient.invalidateQueries({ queryKey: ["reports"] }),
+        queryClient.invalidateQueries({ queryKey: ["invoices"] }),
+        queryClient.invalidateQueries({ queryKey: ["receipts"] }),
+        queryClient.invalidateQueries({ queryKey: ["item"] }),
+      ])
     },
   })
 }
@@ -330,8 +340,13 @@ export function useDeletePurchase() {
   return useMutation({
     mutationFn: (id: string) => purchases.delete(id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["purchases"] })
-      queryClient.invalidateQueries({ queryKey: ["reports"] })
+      return Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["purchases"] }),
+        queryClient.invalidateQueries({ queryKey: ["reports"] }),
+        queryClient.invalidateQueries({ queryKey: ["invoices"] }),
+        queryClient.invalidateQueries({ queryKey: ["receipts"] }),
+        queryClient.invalidateQueries({ queryKey: ["item"] }),
+      ])
     },
   })
 }

@@ -1,4 +1,13 @@
+import { compressUploadFile } from './lib/uploadCompression';
+
 const API_BASE = '/api';
+
+type UploadBehaviorOptions = {
+  bypassCompression?: boolean;
+  ocrMode?: ReceiptOcrMode;
+};
+
+export type ReceiptOcrMode = 'auto' | 'classic' | 'vl';
 
 export interface VendorImportAlias {
   id: string;
@@ -41,6 +50,69 @@ export class ApiValidationError<T = unknown> extends ApiError {
   constructor(status: number, message: string, public details: T) {
     super(status, message);
   }
+}
+
+async function compressUploadOrThrow(
+  file: File,
+  options: UploadBehaviorOptions = {},
+): Promise<File> {
+  if (options.bypassCompression) {
+    return file;
+  }
+
+  try {
+    return await compressUploadFile(file);
+  } catch (error) {
+    throw new ApiError(
+      400,
+      error instanceof Error ? error.message : 'Failed to compress the uploaded file.',
+    );
+  }
+}
+
+function formatReceiptParseError(status: number, raw: string): string {
+  const message = raw.trim();
+
+  if (status === 0) {
+    return 'Network error while parsing receipt. Please verify the app is running and try again.';
+  }
+
+  if (status === 413) {
+    return 'Uploaded file is too large. Maximum allowed size is 25 MB.';
+  }
+
+  if (status === 502) {
+    return 'Receipt OCR service is unavailable right now. Please try again in a moment.';
+  }
+
+  if (status === 422 && !message) {
+    return 'OCR could not extract receipt data from this file. Please try another image or PDF.';
+  }
+
+  if (status === 400 && !message) {
+    return 'Invalid upload payload. Please upload one PDF or image file.';
+  }
+
+  if (message) {
+    return message;
+  }
+
+  if (status >= 500) {
+    return 'Receipt parsing failed due to a server error. Please retry.';
+  }
+
+  return `Receipt parsing failed (${status}).`;
+}
+
+function buildReceiptImageParseUrl(options: UploadBehaviorOptions): string {
+  const params = new URLSearchParams();
+
+  if (options.ocrMode) {
+    params.set('ocr_mode', options.ocrMode);
+  }
+
+  const query = params.toString();
+  return `${API_BASE}/import/receipt-image${query ? `?${query}` : ''}`;
 }
 
 async function request<T>(
@@ -294,10 +366,15 @@ export const invoices = {
     }),
   delete: (id: string) =>
     request<void>(`/invoices/${id}`, { method: 'DELETE' }),
-  uploadPdf: async (id: string, file: File): Promise<void> => {
+  uploadPdf: async (
+    id: string,
+    file: File,
+    options: UploadBehaviorOptions = {},
+  ): Promise<void> => {
     const token = localStorage.getItem('token');
+    const compressedFile = await compressUploadOrThrow(file, options);
     const formData = new FormData();
-    formData.append('file', file);
+    formData.append('file', compressedFile);
     const response = await fetch(`${API_BASE}/invoices/${id}/document`, {
       method: 'POST',
       headers: {
@@ -352,6 +429,75 @@ export const invoices = {
 
     return response.json();
   },
+  downloadAllBackups: async (options?: {
+    include_unfinalized?: boolean;
+    from?: string;
+    to?: string;
+    include_documents?: boolean;
+  }): Promise<Blob> => {
+    const token = localStorage.getItem('token');
+    const params = new URLSearchParams();
+
+    if (options?.include_unfinalized !== undefined) {
+      params.set('include_unfinalized', String(options.include_unfinalized));
+    }
+    if (options?.include_documents !== undefined) {
+      params.set('include_documents', String(options.include_documents));
+    }
+    if (options?.from) {
+      params.set('from', options.from);
+    }
+    if (options?.to) {
+      params.set('to', options.to);
+    }
+
+    const query = params.toString();
+    const response = await fetch(`${API_BASE}/invoices/backup/export${query ? `?${query}` : ''}`, {
+      method: 'GET',
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new ApiError(response.status, text || response.statusText);
+    }
+
+    return response.blob();
+  },
+  importAllBackups: async (file: File): Promise<{
+    restored_invoice_count: number;
+    restored_purchase_count: number;
+    restored_receipt_count: number;
+    restored_allocation_count: number;
+    restored_invoices: Array<{
+      invoice_id: string;
+      invoice_number: string;
+      restored_purchase_count: number;
+      restored_receipt_count: number;
+      restored_allocation_count: number;
+    }>;
+  }> => {
+    const token = localStorage.getItem('token');
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const response = await fetch(`${API_BASE}/invoices/backup/import-all`, {
+      method: 'POST',
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new ApiError(response.status, text || response.statusText);
+    }
+
+    return response.json();
+  },
   downloadPdfUrl: (id: string) => `${API_BASE}/invoices/${id}/document`,
 };
 
@@ -367,12 +513,13 @@ export const receipts = {
       subtotal: string;
       tax_rate: string;
       total: string;
-      payment_card_last4: string | null;
+      payment_method: string | null;
       ingestion_metadata: ReceiptIngestionMetadata | null;
       has_pdf: boolean | null;
       notes: string | null;
       created_at: string;
       updated_at: string;
+      receipt_line_item_count: number;
       purchase_count: number | null;
       purchases_total: string | null;
       total_selling: string | null;
@@ -389,12 +536,13 @@ export const receipts = {
       subtotal: string;
       tax_rate: string;
       total: string;
-      payment_card_last4: string | null;
+      payment_method: string | null;
       ingestion_metadata: ReceiptIngestionMetadata | null;
       has_pdf: boolean | null;
       notes: string | null;
       created_at: string;
       updated_at: string;
+      receipt_line_item_count: number;
       purchase_count: number | null;
       purchases_total: string | null;
       total_selling: string | null;
@@ -451,7 +599,7 @@ export const receipts = {
     receipt_date: string;
     subtotal: string;
     tax_amount?: string;
-    payment_card_last4?: string;
+    payment_method?: string;
     ingestion_metadata?: ReceiptIngestionMetadata;
     notes?: string;
   }) =>
@@ -468,10 +616,15 @@ export const receipts = {
     request<ReceiptMetadataAuditEntry[]>(`/receipts/${id}/metadata-audit`),
   delete: (id: string) =>
     request<void>(`/receipts/${id}`, { method: 'DELETE' }),
-  uploadPdf: async (id: string, file: File): Promise<void> => {
+  uploadPdf: async (
+    id: string,
+    file: File,
+    options: UploadBehaviorOptions = {},
+  ): Promise<void> => {
     const token = localStorage.getItem('token');
+    const compressedFile = await compressUploadOrThrow(file, options);
     const formData = new FormData();
-    formData.append('file', file);
+    formData.append('file', compressedFile);
     const response = await fetch(`${API_BASE}/receipts/${id}/document`, {
       method: 'POST',
       headers: {
@@ -571,6 +724,10 @@ export const purchases = {
       request<void>(`/purchases/${purchaseId}/allocations/${allocationId}`, {
         method: 'DELETE',
       }),
+    auto: (purchaseId: string) =>
+      request<AutoAllocatePurchaseResult>(`/purchases/${purchaseId}/allocations/auto`, {
+        method: 'POST',
+      }),
   },
 };
 
@@ -648,7 +805,7 @@ export type ReceiptImportPreview = {
   receipt_date: string;
   subtotal: string;
   tax_amount: string | null;
-  payment_card_last4: string | null;
+  payment_method: string | null;
   notes: string | null;
 };
 
@@ -705,10 +862,14 @@ export const importApi = {
       method: 'POST',
       body: JSON.stringify({ csv_data: csvData }),
     }),
-  invoicePdf: async (file: File): Promise<ParsedInvoice> => {
+  invoicePdf: async (
+    file: File,
+    options: UploadBehaviorOptions = {},
+  ): Promise<ParsedInvoice> => {
     const token = localStorage.getItem('token');
+    const compressedFile = await compressUploadOrThrow(file, options);
     const formData = new FormData();
-    formData.append('file', file);
+    formData.append('file', compressedFile);
     const response = await fetch(`${API_BASE}/import/invoice-pdf`, {
       method: 'POST',
       headers: {
@@ -725,13 +886,16 @@ export const importApi = {
   receiptImage: async (
     file: File,
     onProgress?: (update: ReceiptImageParseProgress) => void,
+    options: UploadBehaviorOptions = {},
   ): Promise<ParsedReceipt> => {
     const token = localStorage.getItem('token');
+    const compressedFile = await compressUploadOrThrow(file, options);
+    const parseUrl = buildReceiptImageParseUrl(options);
 
     if (onProgress) {
       return new Promise<ParsedReceipt>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
-        xhr.open('POST', `${API_BASE}/import/receipt-image`);
+        xhr.open('POST', parseUrl);
 
         if (token) {
           xhr.setRequestHeader('Authorization', `Bearer ${token}`);
@@ -758,7 +922,7 @@ export const importApi = {
         };
 
         xhr.onerror = () => {
-          reject(new ApiError(0, 'Network error while parsing receipt'));
+          reject(new ApiError(0, formatReceiptParseError(0, '')));
         };
 
         xhr.onload = () => {
@@ -768,7 +932,7 @@ export const importApi = {
 
           const raw = xhr.responseText || '';
           if (xhr.status < 200 || xhr.status >= 300) {
-            reject(new ApiError(xhr.status, raw || xhr.statusText));
+            reject(new ApiError(xhr.status, formatReceiptParseError(xhr.status, raw || xhr.statusText)));
             return;
           }
 
@@ -780,14 +944,14 @@ export const importApi = {
         };
 
         const formData = new FormData();
-        formData.append('file', file);
+        formData.append('file', compressedFile);
         xhr.send(formData);
       });
     }
 
     const formData = new FormData();
-    formData.append('file', file);
-    const response = await fetch(`${API_BASE}/import/receipt-image`, {
+    formData.append('file', compressedFile);
+    const response = await fetch(parseUrl, {
       method: 'POST',
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -796,14 +960,22 @@ export const importApi = {
     });
     if (!response.ok) {
       const text = await response.text();
-      throw new ApiError(response.status, text || response.statusText);
+      throw new ApiError(
+        response.status,
+        formatReceiptParseError(response.status, text || response.statusText),
+      );
     }
     return response.json();
   },
-  invoicePdfCommit: async (file: File, payload: InvoicePdfCommitPayload): Promise<InvoicePdfCommitResponse> => {
+  invoicePdfCommit: async (
+    file: File,
+    payload: InvoicePdfCommitPayload,
+    options: UploadBehaviorOptions = {},
+  ): Promise<InvoicePdfCommitResponse> => {
     const token = localStorage.getItem('token');
+    const compressedFile = await compressUploadOrThrow(file, options);
     const formData = new FormData();
-    formData.append('file', file);
+    formData.append('file', compressedFile);
     formData.append('payload', JSON.stringify(payload));
 
     const response = await fetch(`${API_BASE}/import/invoice-pdf/commit`, {
@@ -870,7 +1042,7 @@ export interface ParsedReceipt {
   subtotal: string | null;
   tax: string | null;
   total: string | null;
-  card_last4: string | null;
+  payment_method: string | null;
   confidence_score?: number | null;
   parse_engine?: string | null;
   parse_version?: string | null;
@@ -943,6 +1115,18 @@ export interface PurchaseAllocation {
   receipt_date: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface AutoAllocatePurchaseResult {
+  purchase_id: string;
+  purchase_qty: number;
+  previously_allocated_qty: number;
+  auto_allocated_qty: number;
+  total_allocated_qty: number;
+  remaining_qty: number;
+  allocations_created: number;
+  allocations_updated: number;
+  receipts_touched: number;
 }
 
 export interface ReceiptLineItem {

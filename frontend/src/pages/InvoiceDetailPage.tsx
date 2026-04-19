@@ -45,9 +45,15 @@ import { EmptyTableRow } from "@/components/EmptyTableRow"
 import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
 import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, FileDown, Upload, Loader2, ChevronDown, ChevronRight } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
-import { ApiError, invoices as invoicesApi, receipts as receiptsApi, purchases as purchasesApi, type PurchaseAllocation, type ReceiptLineItem } from "@/api"
+import { assessPurchaseReconciliation } from "@/lib/purchaseReconciliation"
+import { getOrLoadReceiptLineItems, invalidateReceiptLineItemsCache } from "@/lib/receiptLineItemsCache"
+import { ApiError, invoices as invoicesApi, receipts as receiptsApi, purchases as purchasesApi, type AutoAllocatePurchaseResult, type PurchaseAllocation, type ReceiptLineItem } from "@/api"
 
 type InvoicePurchase = ReturnType<typeof useInvoicePurchases>["data"] extends (infer T)[] | undefined ? T : never
+type AutoAllocateLineSummary = {
+  message: string
+  tone: "success" | "warning" | "neutral"
+}
 
 export default function InvoiceDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -61,6 +67,7 @@ export default function InvoiceDetailPage() {
   const { data: receipts = [] } = useReceipts()
   const { data: vendors = [] } = useVendors()
   const invoiceLocked = invoice?.reconciliation_state === "locked"
+  const invoiceReopened = invoice?.reconciliation_state === "reopened"
 
   const createPurchase = useCreatePurchase()
   const updatePurchase = useUpdatePurchase()
@@ -74,6 +81,11 @@ export default function InvoiceDetailPage() {
   const [isExportingBackup, setIsExportingBackup] = useState(false)
   const [isImportingBackup, setIsImportingBackup] = useState(false)
   const [isSavingReconciliationState, setIsSavingReconciliationState] = useState(false)
+  const [finalizeDialogOpen, setFinalizeDialogOpen] = useState(false)
+  const [reconciliationActionError, setReconciliationActionError] = useState("")
+  const [reconciliationActionNotice, setReconciliationActionNotice] = useState("")
+  const [deletePurchaseDialogOpen, setDeletePurchaseDialogOpen] = useState(false)
+  const [purchasePendingDeleteId, setPurchasePendingDeleteId] = useState<string | null>(null)
 
   const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -84,7 +96,9 @@ export default function InvoiceDetailPage() {
       await invoicesApi.uploadPdf(id, file)
       queryClient.invalidateQueries({ queryKey: ["invoices", id] })
     } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to upload PDF")
+      setReconciliationActionError(
+        err instanceof Error ? err.message : "Failed to upload PDF"
+      )
     } finally {
       setIsUploadingPdf(false)
       if (fileInputRef.current) {
@@ -93,50 +107,47 @@ export default function InvoiceDetailPage() {
     }
   }
 
-  const handleFinalizeInvoice = async () => {
-    if (!id || !invoice || invoiceLocked) return
+  const handleFinalizeInvoice = () => {
+    if (!id || !invoice || invoiceLocked || !canFinalize) return
 
-    const invoiceSubtotal = Number.parseFloat(invoice.subtotal || "0")
-    const invoicePurchasesTotal = purchases.reduce((sum, purchase) => {
-      const invoicePrice = purchase.invoice_unit_price
-        ? Number.parseFloat(purchase.invoice_unit_price)
-        : Number.NaN
-      const unitPrice = Number.isFinite(invoicePrice)
-        ? invoicePrice
-        : Number.parseFloat(purchase.purchase_cost || "0")
-      return sum + purchase.quantity * unitPrice
-    }, 0)
+    setReconciliationActionError("")
+    setFinalizeDialogOpen(true)
+  }
 
-    const lineCount = purchases.length
-    const receiptedCount = purchases.filter((purchase) => {
-      const allocs = getEffectiveAllocations(purchase)
-      return Boolean(purchase.receipt_id) || allocs.length > 0
-    }).length
-
-    const difference = invoiceSubtotal - invoicePurchasesTotal
-    const issues: string[] = []
-    if (lineCount === 0) issues.push("No line items are linked to this invoice.")
-    if (Math.abs(difference) >= 0.01) {
-      issues.push(`Invoice subtotal and line totals differ by ${formatCurrency(Math.abs(difference))}.`)
-    }
-    if (lineCount > 0 && receiptedCount < lineCount) {
-      issues.push(`${receiptedCount}/${lineCount} line items are receipted.`)
-    }
-
-    const confirmMessage = issues.length > 0
-      ? `Finalize invoice with unresolved checks?\n\n- ${issues.join("\n- ")}\n\nFinalizing will lock this invoice and include it in dashboard reporting.`
-      : "Finalize this invoice? This will lock it and include it in dashboard reporting."
-
-    if (!confirm(confirmMessage)) return
+  const confirmFinalizeInvoice = async () => {
+    if (!id || !invoice || invoiceLocked || !canFinalize) return
 
     setIsSavingReconciliationState(true)
     try {
       await invoicesApi.update(id, { reconciliation_state: "locked" })
+      setFinalizeDialogOpen(false)
       queryClient.invalidateQueries({ queryKey: ["invoices", id] })
       queryClient.invalidateQueries({ queryKey: ["invoices"] })
       queryClient.invalidateQueries({ queryKey: ["reports"] })
     } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to finalize invoice")
+      setReconciliationActionError(
+        err instanceof Error ? err.message : "Failed to finalize invoice"
+      )
+    } finally {
+      setIsSavingReconciliationState(false)
+    }
+  }
+
+  const handleReopenInvoice = async () => {
+    if (!id || !invoice || !invoiceLocked) return
+
+    setReconciliationActionError("")
+
+    setIsSavingReconciliationState(true)
+    try {
+      await invoicesApi.update(id, { reconciliation_state: "reopened" })
+      queryClient.invalidateQueries({ queryKey: ["invoices", id] })
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      queryClient.invalidateQueries({ queryKey: ["reports"] })
+    } catch (err) {
+      setReconciliationActionError(
+        err instanceof Error ? err.message : "Failed to reopen invoice"
+      )
     } finally {
       setIsSavingReconciliationState(false)
     }
@@ -158,7 +169,9 @@ export default function InvoiceDetailPage() {
       link.remove()
       URL.revokeObjectURL(downloadUrl)
     } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to export invoice backup")
+      setReconciliationActionError(
+        err instanceof Error ? err.message : "Failed to export invoice backup"
+      )
     } finally {
       setIsExportingBackup(false)
     }
@@ -176,7 +189,9 @@ export default function InvoiceDetailPage() {
       queryClient.invalidateQueries({ queryKey: ["purchases"] })
       navigate(`/invoices/${restored.invoice_id}`)
     } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to restore invoice backup")
+      setReconciliationActionError(
+        err instanceof Error ? err.message : "Failed to restore invoice backup"
+      )
     } finally {
       setIsImportingBackup(false)
       if (backupInputRef.current) {
@@ -215,6 +230,8 @@ export default function InvoiceDetailPage() {
   const [allocationApiUnavailable, setAllocationApiUnavailable] = useState(false)
   const [allocatableReceiptIds, setAllocatableReceiptIds] = useState<string[]>([])
   const [loadingAllocatableReceipts, setLoadingAllocatableReceipts] = useState(false)
+  const [autoAllocatingPurchaseId, setAutoAllocatingPurchaseId] = useState<string | null>(null)
+  const [autoAllocateLineSummaryByPurchase, setAutoAllocateLineSummaryByPurchase] = useState<Record<string, AutoAllocateLineSummary>>({})
   const receiptLineItemsCacheRef = useRef<Record<string, ReceiptLineItem[]>>({})
 
   const buildLegacyAllocations = (purchase: InvoicePurchase): PurchaseAllocation[] => {
@@ -288,7 +305,9 @@ export default function InvoiceDetailPage() {
         )
         setAllocationsByPurchase(Object.fromEntries(entries))
       } catch (err) {
-        alert(err instanceof Error ? err.message : "Failed to load receipt allocations")
+        setReconciliationActionError(
+          err instanceof Error ? err.message : "Failed to load receipt allocations"
+        )
       }
     }
 
@@ -308,6 +327,7 @@ export default function InvoiceDetailPage() {
 
   const openLinkDialog = (purchase: InvoicePurchase) => {
     if (invoiceLocked) return
+    clearReceiptLineItemsCache()
     setLinkingPurchaseId(purchase.purchase_id)
     setLinkingPurchase(purchase)
     setLinkNotes(purchase.notes || "")
@@ -376,14 +396,15 @@ export default function InvoiceDetailPage() {
   }
 
   const getReceiptLineItemsCached = async (receiptId: string): Promise<ReceiptLineItem[]> => {
-    const cached = receiptLineItemsCacheRef.current[receiptId]
-    if (cached) {
-      return cached
-    }
+    return getOrLoadReceiptLineItems(
+      receiptLineItemsCacheRef.current,
+      receiptId,
+      (id) => receiptsApi.lineItems.list(id)
+    )
+  }
 
-    const rows = await receiptsApi.lineItems.list(receiptId)
-    receiptLineItemsCacheRef.current[receiptId] = rows
-    return rows
+  const clearReceiptLineItemsCache = (receiptId?: string) => {
+    invalidateReceiptLineItemsCache(receiptLineItemsCacheRef.current, receiptId)
   }
 
   const loadReceiptLineItemsForAllocation = async (receiptId: string, purchase: InvoicePurchase) => {
@@ -529,7 +550,7 @@ export default function InvoiceDetailPage() {
 
   const handleSaveAllocation = async () => {
     if (invoiceLocked) {
-      alert("Finalized invoices are locked.")
+      setReconciliationActionError("Finalized invoices are locked.")
       return
     }
     if (!linkingPurchaseId || !linkingPurchase) return
@@ -603,6 +624,7 @@ export default function InvoiceDetailPage() {
         notes: linkNotes || undefined,
       })
 
+      clearReceiptLineItemsCache()
       const refreshedAllocations = await reloadAllocations(linkingPurchaseId)
       const allocatedQty = refreshedAllocations.reduce((sum, row) => sum + row.allocated_qty, 0)
       const remainingQty = Math.max(0, linkingPurchase.quantity - allocatedQty)
@@ -633,19 +655,114 @@ export default function InvoiceDetailPage() {
 
   const handleDeleteAllocation = async (allocationId: string) => {
     if (invoiceLocked) {
-      alert("Finalized invoices are locked.")
+      setReconciliationActionError("Finalized invoices are locked.")
       return
     }
     if (!linkingPurchaseId) return
     await purchasesApi.allocations.delete(linkingPurchaseId, allocationId)
+    clearReceiptLineItemsCache()
     await reloadAllocations(linkingPurchaseId)
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
     queryClient.invalidateQueries({ queryKey: ["receipts"] })
   }
 
+  const buildAutoAllocateNotice = (
+    purchase: InvoicePurchase,
+    result: AutoAllocatePurchaseResult
+  ) => {
+    const formatUnits = (qty: number) => `${qty} unit${qty === 1 ? "" : "s"}`
+    const touchedReceiptLabel =
+      result.receipts_touched > 0
+        ? ` across ${result.receipts_touched} receipt${result.receipts_touched === 1 ? "" : "s"}`
+        : ""
+
+    if (result.auto_allocated_qty <= 0) {
+      return `No additional quantity could be auto-allocated for ${purchase.item_name}. ${formatUnits(result.remaining_qty)} remain unallocated.`
+    }
+
+    if (result.remaining_qty > 0) {
+      return `Auto-allocated ${formatUnits(result.auto_allocated_qty)}${touchedReceiptLabel} for ${purchase.item_name}. ${formatUnits(result.remaining_qty)} still need manual allocation.`
+    }
+
+    return `Auto-allocation complete for ${purchase.item_name}: ${formatUnits(result.auto_allocated_qty)}${touchedReceiptLabel}.`
+  }
+
+  const buildAutoAllocateLineSummary = (
+    result: AutoAllocatePurchaseResult
+  ): AutoAllocateLineSummary => {
+    if (result.auto_allocated_qty <= 0) {
+      return {
+        message: `Auto: no qty allocated (${result.remaining_qty} remaining)`,
+        tone: "neutral",
+      }
+    }
+
+    if (result.remaining_qty > 0) {
+      return {
+        message: `Auto: +${result.auto_allocated_qty}, ${result.remaining_qty} remaining`,
+        tone: "warning",
+      }
+    }
+
+    return {
+      message: `Auto: complete (+${result.auto_allocated_qty})`,
+      tone: "success",
+    }
+  }
+
+  const handleAutoAllocatePurchase = async (purchase: InvoicePurchase) => {
+    if (invoiceLocked) {
+      setReconciliationActionError("Finalized invoices are locked.")
+      return
+    }
+
+    setReconciliationActionError("")
+    setReconciliationActionNotice("")
+    if (linkingPurchaseId === purchase.purchase_id) {
+      setAllocationError("")
+      setAllocationWarning("")
+    }
+
+    setAutoAllocatingPurchaseId(purchase.purchase_id)
+
+    try {
+      const result = await purchasesApi.allocations.auto(purchase.purchase_id)
+      clearReceiptLineItemsCache()
+      await reloadAllocations(purchase.purchase_id)
+
+      queryClient.invalidateQueries({ queryKey: ["invoices", id] })
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      queryClient.invalidateQueries({ queryKey: ["receipts"] })
+      queryClient.invalidateQueries({ queryKey: ["reports"] })
+
+      const notice = buildAutoAllocateNotice(purchase, result)
+      setReconciliationActionNotice(notice)
+      setAutoAllocateLineSummaryByPurchase((previous) => ({
+        ...previous,
+        [purchase.purchase_id]: buildAutoAllocateLineSummary(result),
+      }))
+
+      if (linkingPurchaseId === purchase.purchase_id && result.remaining_qty > 0) {
+        setAllocationWarning(notice)
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) {
+        setAllocationApiUnavailable(true)
+      }
+
+      const message = err instanceof Error ? err.message : "Failed to auto-allocate this line item"
+      setReconciliationActionError(message)
+      if (linkingPurchaseId === purchase.purchase_id) {
+        setAllocationError(message)
+      }
+    } finally {
+      setAutoAllocatingPurchaseId(null)
+    }
+  }
+
   const handleCreateReceipt = async (data: ReceiptFormSubmitData) => {
     if (invoiceLocked) {
-      alert("Finalized invoices are locked.")
+      setReconciliationActionError("Finalized invoices are locked.")
       return
     }
     if (!linkingPurchaseId) return
@@ -656,7 +773,7 @@ export default function InvoiceDetailPage() {
       receipt_date: data.receipt_date,
       subtotal: data.subtotal,
       tax_amount: data.tax_amount,
-      payment_card_last4: data.payment_card_last4.trim() || undefined,
+      payment_method: data.payment_method.trim() || undefined,
       notes: data.notes || undefined,
     })
 
@@ -686,6 +803,8 @@ export default function InvoiceDetailPage() {
   }
 
   const totalAllocatedQty = allocations.reduce((sum, a) => sum + a.allocated_qty, 0)
+  const isAutoAllocatingCurrentPurchase =
+    linkingPurchaseId !== null && autoAllocatingPurchaseId === linkingPurchaseId
   const selectedAllocationLineItem = allocationReceiptLineItems.find((row) => row.id === allocationReceiptLineItemId)
   const allocationCaps = selectedAllocationLineItem
     ? getAllocationCapsForLine(selectedAllocationLineItem)
@@ -730,7 +849,7 @@ export default function InvoiceDetailPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (invoiceLocked) {
-      alert("Finalized invoices are locked.")
+      setReconciliationActionError("Finalized invoices are locked.")
       return
     }
     if (editingPurchaseId) {
@@ -785,7 +904,7 @@ export default function InvoiceDetailPage() {
 
   const handleEditPurchase = (p: typeof purchases[0]) => {
     if (invoiceLocked) {
-      alert("Finalized invoices are locked.")
+      setReconciliationActionError("Finalized invoices are locked.")
       return
     }
     setEditingPurchaseId(p.purchase_id)
@@ -803,21 +922,35 @@ export default function InvoiceDetailPage() {
 
   const handleStatusChange = async (purchaseId: string, newStatus: string) => {
     if (invoiceLocked) {
-      alert("Finalized invoices are locked.")
+      setReconciliationActionError("Finalized invoices are locked.")
       return
     }
     await updatePurchase.mutateAsync({ id: purchaseId, status: newStatus })
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
   }
 
-  const handleDeletePurchase = async (purchaseId: string) => {
+  const handleDeletePurchase = (purchaseId: string) => {
     if (invoiceLocked) {
-      alert("Finalized invoices are locked.")
+      setReconciliationActionError("Finalized invoices are locked.")
       return
     }
-    if (confirm("Remove this purchase from the invoice?")) {
-      await deletePurchase.mutateAsync(purchaseId)
+    setReconciliationActionError("")
+    setPurchasePendingDeleteId(purchaseId)
+    setDeletePurchaseDialogOpen(true)
+  }
+
+  const confirmDeletePurchase = async () => {
+    if (!purchasePendingDeleteId) return
+
+    try {
+      await deletePurchase.mutateAsync(purchasePendingDeleteId)
       queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      setDeletePurchaseDialogOpen(false)
+      setPurchasePendingDeleteId(null)
+    } catch (err) {
+      setReconciliationActionError(
+        err instanceof Error ? err.message : "Failed to remove purchase from invoice"
+      )
     }
   }
 
@@ -845,13 +978,145 @@ export default function InvoiceDetailPage() {
     const allocs = getEffectiveAllocations(p)
     return Boolean(p.receipt_id) || allocs.length > 0
   }).length
+
+  const lineItemAssessments = purchases.map((purchase) => {
+    const allocs = getEffectiveAllocations(purchase)
+    const allocatedQty = allocs.reduce((sum, allocation) => sum + allocation.allocated_qty, 0)
+
+    return {
+      purchase,
+      assessment: assessPurchaseReconciliation({
+        quantity: purchase.quantity,
+        purchase_cost: purchase.purchase_cost,
+        receipt_id: purchase.receipt_id,
+        invoice_id: purchase.invoice_id,
+        invoice_unit_price: purchase.invoice_unit_price,
+        destination_code: purchase.destination_code,
+        requireAllocations: true,
+        allocationCount: allocs.length,
+        allocatedQty,
+      }),
+    }
+  })
+
+  const unreconciledLineItems = lineItemAssessments.filter(
+    ({ assessment }) => !assessment.isReconciled
+  )
+  const unreconciledLineItemCount = unreconciledLineItems.length
+
   const totalPurchases = purchases.length
   const isFinalized = invoice.reconciliation_state === "locked"
   const hasReceiptGap = totalPurchases > 0 && receiptedCount < totalPurchases
-  const canFinalize = isReconciled && totalPurchases > 0 && !hasReceiptGap
+  const canFinalize =
+    isReconciled && totalPurchases > 0 && !hasReceiptGap && unreconciledLineItemCount === 0
+
+  const finalizeBlockReasons: string[] = []
+  if (totalPurchases === 0) {
+    finalizeBlockReasons.push("Add at least one line item.")
+  }
+  if (!isReconciled) {
+    finalizeBlockReasons.push(
+      `Invoice totals are ${formatCurrency(Math.abs(difference))} ${difference > 0 ? "under" : "over"}.`
+    )
+  }
+  if (hasReceiptGap) {
+    finalizeBlockReasons.push(`${receiptedCount}/${totalPurchases} line items are receipted.`)
+  }
+  if (unreconciledLineItemCount > 0) {
+    finalizeBlockReasons.push(
+      `${unreconciledLineItemCount}/${totalPurchases} line items are unreconciled.`
+    )
+  }
 
   return (
     <div className="space-y-6">
+      <Dialog open={finalizeDialogOpen} onOpenChange={setFinalizeDialogOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Finalize Invoice</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 text-sm">
+            <p>
+              Finalizing locks this invoice and includes it in dashboard reporting.
+            </p>
+            <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-emerald-800">
+              All {totalPurchases} line items are reconciled and ready to finalize.
+            </div>
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setFinalizeDialogOpen(false)}
+              disabled={isSavingReconciliationState}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={confirmFinalizeInvoice}
+              disabled={isSavingReconciliationState}
+            >
+              {isSavingReconciliationState ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Finalizing...
+                </>
+              ) : (
+                "Confirm Finalize"
+              )}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={deletePurchaseDialogOpen}
+        onOpenChange={(open) => {
+          setDeletePurchaseDialogOpen(open)
+          if (!open) {
+            setPurchasePendingDeleteId(null)
+          }
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Remove Line Item</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2 text-sm">
+            <p>Remove this purchase from the invoice?</p>
+            <p className="text-muted-foreground">
+              This action removes the line item link and cannot be undone from this screen.
+            </p>
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setDeletePurchaseDialogOpen(false)}
+              disabled={deletePurchase.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={confirmDeletePurchase}
+              disabled={deletePurchase.isPending}
+            >
+              {deletePurchase.isPending ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Removing...
+                </>
+              ) : (
+                "Remove"
+              )}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Header */}
       <div className="flex items-center gap-4">
         <Button variant="ghost" size="icon" onClick={() => navigate("/invoices")}>
@@ -975,15 +1240,32 @@ export default function InvoiceDetailPage() {
             )}
           </Button>
           {isFinalized ? (
-            <span className="flex items-center gap-1 text-green-700 bg-green-50 px-3 py-1.5 rounded-full text-sm font-medium">
-              <CheckCircle2 className="h-4 w-4" />
-              Finalized
-            </span>
+            <>
+              <span className="flex items-center gap-1 text-green-700 bg-green-50 px-3 py-1.5 rounded-full text-sm font-medium">
+                <CheckCircle2 className="h-4 w-4" />
+                Finalized
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleReopenInvoice}
+                disabled={isSavingReconciliationState}
+              >
+                {isSavingReconciliationState ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Reopening...
+                  </>
+                ) : (
+                  "Reopen Invoice"
+                )}
+              </Button>
+            </>
           ) : (
             <Button
               size="sm"
               onClick={handleFinalizeInvoice}
-              disabled={isSavingReconciliationState}
+              disabled={isSavingReconciliationState || !canFinalize}
             >
               {isSavingReconciliationState ? (
                 <>
@@ -994,6 +1276,12 @@ export default function InvoiceDetailPage() {
                 "Finalize Invoice"
               )}
             </Button>
+          )}
+          {invoiceReopened && !isFinalized && (
+            <span className="flex items-center gap-1 text-orange-700 bg-orange-50 px-3 py-1.5 rounded-full text-sm font-medium">
+              <AlertCircle className="h-4 w-4" />
+              Reopened
+            </span>
           )}
           {!isFinalized && canFinalize && (
             <span className="flex items-center gap-1 text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-full text-sm font-medium">
@@ -1013,6 +1301,12 @@ export default function InvoiceDetailPage() {
               {receiptedCount}/{totalPurchases} receipted
             </span>
           )}
+          {!isFinalized && unreconciledLineItemCount > 0 && (
+            <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
+              <AlertCircle className="h-4 w-4" />
+              {unreconciledLineItemCount}/{totalPurchases} unreconciled lines
+            </span>
+          )}
           {isFinalized && (!isReconciled || hasReceiptGap) && (
             <span className="flex items-center gap-1 text-amber-700 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
               <AlertCircle className="h-4 w-4" />
@@ -1022,9 +1316,38 @@ export default function InvoiceDetailPage() {
         </div>
       </div>
 
+      {reconciliationActionError && (
+        <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {reconciliationActionError}
+        </div>
+      )}
+
+      {reconciliationActionNotice && (
+        <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+          {reconciliationActionNotice}
+        </div>
+      )}
+
+      {!isFinalized && !canFinalize && (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+          <p className="font-medium">Finalize is blocked until all line items are reconciled.</p>
+          <ul className="mt-1 list-disc pl-5 space-y-0.5">
+            {finalizeBlockReasons.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {isFinalized && (
         <div className="rounded-md border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-800">
           This invoice is finalized and locked. Line items and receipt allocations are read-only.
+        </div>
+      )}
+
+      {!isFinalized && invoiceReopened && (
+        <div className="rounded-md border border-orange-200 bg-orange-50 px-3 py-2 text-sm text-orange-800">
+          This invoice has been reopened. You can edit line items and receipt allocations, then finalize again.
         </div>
       )}
 
@@ -1220,6 +1543,7 @@ export default function InvoiceDetailPage() {
                 {purchases.map((p) => {
                   const allocs = getEffectiveAllocations(p)
                   const allocated = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
+                  const autoAllocateLineSummary = autoAllocateLineSummaryByPurchase[p.purchase_id]
                   const isPartiallyAllocated = allocated > 0 && allocated < p.quantity
                   const hasUserExpansionState = Object.prototype.hasOwnProperty.call(expandedAllocations, p.purchase_id)
                   const isExpanded = hasUserExpansionState
@@ -1292,15 +1616,50 @@ export default function InvoiceDetailPage() {
                                 unallocated
                               </span>
                             ) : (
-                              <button
-                                onClick={() => openLinkDialog(p)}
-                                className="text-red-500 text-xs flex items-center gap-1 hover:underline cursor-pointer"
-                                title="Click to allocate to receipts"
-                              >
-                                <AlertCircle className="h-3 w-3" />
-                                unallocated
-                              </button>
+                              <div className="flex items-center gap-3">
+                                <button
+                                  onClick={() => openLinkDialog(p)}
+                                  className="text-red-500 text-xs flex items-center gap-1 hover:underline cursor-pointer"
+                                  title="Click to allocate to receipts"
+                                >
+                                  <AlertCircle className="h-3 w-3" />
+                                  unallocated
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleAutoAllocatePurchase(p)}
+                                  disabled={
+                                    allocationApiUnavailable ||
+                                    autoAllocatingPurchaseId === p.purchase_id
+                                  }
+                                  className="text-[11px] text-muted-foreground hover:underline disabled:opacity-50 disabled:no-underline"
+                                  title="Automatically allocate from matching receipt line items"
+                                >
+                                  {autoAllocatingPurchaseId === p.purchase_id ? (
+                                    <span className="inline-flex items-center gap-1">
+                                      <Loader2 className="h-3 w-3 animate-spin" />
+                                      allocating...
+                                    </span>
+                                  ) : (
+                                    "auto allocate"
+                                  )}
+                                </button>
+                              </div>
                             )
+                          )}
+                          {autoAllocateLineSummary && (
+                            <div
+                              className={`mt-2 inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                                autoAllocateLineSummary.tone === "success"
+                                  ? "bg-emerald-50 text-emerald-700"
+                                  : autoAllocateLineSummary.tone === "warning"
+                                    ? "bg-amber-50 text-amber-700"
+                                    : "bg-muted text-muted-foreground"
+                              }`}
+                              title="Last auto-allocation result"
+                            >
+                              {autoAllocateLineSummary.message}
+                            </div>
                           )}
                         </TableCell>
                         <TableCell className="text-right">{p.quantity}</TableCell>
@@ -1489,7 +1848,16 @@ export default function InvoiceDetailPage() {
                     {allocations.map((a) => (
                       <div key={a.id} className="p-3 text-sm flex flex-wrap items-center justify-between gap-2 sm:flex-nowrap">
                         <div className="min-w-0">
-                          <div className="font-medium break-words">{a.receipt_number} - {a.vendor_name}</div>
+                          <div className="font-medium break-words">
+                            <Link
+                              to={`/receipts/${a.receipt_id}`}
+                              className="text-primary hover:underline"
+                              title="Open receipt details"
+                            >
+                              {a.receipt_number}
+                            </Link>
+                            <span> - {a.vendor_name}</span>
+                          </div>
                           <div className="text-muted-foreground">Qty {a.allocated_qty} × {formatCurrency(a.unit_cost)}</div>
                         </div>
                         <div className="flex gap-1">
@@ -1659,8 +2027,35 @@ export default function InvoiceDetailPage() {
                     Reset
                   </Button>
                 )}
+                <Button
+                  variant="outline"
+                  onClick={() => linkingPurchase && void handleAutoAllocatePurchase(linkingPurchase)}
+                  disabled={
+                    isFinalized ||
+                    allocationApiUnavailable ||
+                    !linkingPurchase ||
+                    isAutoAllocatingCurrentPurchase
+                  }
+                >
+                  {isAutoAllocatingCurrentPurchase ? (
+                    <>
+                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                      Auto-allocating...
+                    </>
+                  ) : (
+                    "Auto Allocate"
+                  )}
+                </Button>
                 <Button variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
-                <Button onClick={handleSaveAllocation} disabled={isFinalized || updatePurchase.isPending || createReceipt.isPending}>
+                <Button
+                  onClick={handleSaveAllocation}
+                  disabled={
+                    isFinalized ||
+                    updatePurchase.isPending ||
+                    createReceipt.isPending ||
+                    isAutoAllocatingCurrentPurchase
+                  }
+                >
                   {updatePurchase.isPending || createReceipt.isPending
                     ? "Saving..."
                     : editingAllocationId

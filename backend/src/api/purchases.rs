@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, patch},
+    routing::{get, patch, post},
     Json, Router,
 };
 use uuid::Uuid;
@@ -27,6 +27,7 @@ pub fn router() -> Router<AppState> {
             "/{id}/allocations",
             get(list_allocations).post(create_allocation),
         )
+        .route("/{id}/allocations/auto", post(auto_allocate))
         .route(
             "/{id}/allocations/{allocation_id}",
             axum::routing::put(update_allocation).delete(delete_allocation),
@@ -72,7 +73,7 @@ async fn create_purchase(
 ) -> Result<(StatusCode, Json<Purchase>), (StatusCode, String)> {
     let purchase = queries::create_purchase(&state.pool, data, user.user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(map_purchase_write_error)?;
     Ok((StatusCode::CREATED, Json(purchase)))
 }
 
@@ -84,7 +85,7 @@ async fn update_purchase(
 ) -> Result<Json<Purchase>, (StatusCode, String)> {
     let purchase = queries::update_purchase(&state.pool, id, data, user.user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(map_purchase_write_error)?
         .ok_or((StatusCode::NOT_FOUND, "Purchase not found".to_string()))?;
     Ok(Json(purchase))
 }
@@ -97,7 +98,7 @@ async fn update_status(
 ) -> Result<Json<Purchase>, (StatusCode, String)> {
     let purchase = queries::update_purchase_status(&state.pool, id, data.status, user.user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(map_purchase_write_error)?
         .ok_or((StatusCode::NOT_FOUND, "Purchase not found".to_string()))?;
     Ok(Json(purchase))
 }
@@ -109,7 +110,7 @@ async fn delete_purchase(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let deleted = queries::delete_purchase(&state.pool, id, user.user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(map_purchase_write_error)?;
 
     if deleted {
         Ok(StatusCode::NO_CONTENT)
@@ -159,13 +160,24 @@ async fn delete_allocation(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let deleted = queries::delete_purchase_allocation(&state.pool, id, allocation_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(map_purchase_write_error)?;
 
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((StatusCode::NOT_FOUND, "Allocation not found".to_string()))
     }
+}
+
+async fn auto_allocate(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<AutoAllocatePurchaseResult>, (StatusCode, String)> {
+    let result = queries::auto_allocate_purchase(&state.pool, id)
+        .await
+        .map_err(map_allocation_error)?;
+    Ok(Json(result))
 }
 
 fn map_allocation_error(err: queries::PurchaseAllocationError) -> (StatusCode, String) {
@@ -178,4 +190,16 @@ fn map_allocation_error(err: queries::PurchaseAllocationError) -> (StatusCode, S
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
     }
+}
+
+fn map_purchase_write_error(err: sqlx::Error) -> (StatusCode, String) {
+    if let Some(msg) = queries::locked_invoice_error_message(&err) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, msg);
+    }
+
+    if let Some(msg) = queries::purchase_link_required_error_message(&err) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, msg);
+    }
+
+    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }

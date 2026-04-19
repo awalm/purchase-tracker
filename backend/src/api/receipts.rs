@@ -175,6 +175,10 @@ fn map_receipt_reconciliation_error(
 }
 
 fn map_receipt_write_error(err: sqlx::Error) -> (StatusCode, String) {
+    if let Some(msg) = queries::locked_invoice_error_message(&err) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, msg);
+    }
+
     if let sqlx::Error::Database(db_err) = &err {
         if db_err.constraint() == Some("receipts_receipt_number_key") {
             return (
@@ -231,7 +235,7 @@ async fn delete_receipt(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let deleted = queries::delete_receipt(&state.pool, id, user.user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(map_receipt_write_error)?;
 
     if deleted {
         Ok(StatusCode::NO_CONTENT)
@@ -267,7 +271,7 @@ async fn upload_document(
 
             queries::save_receipt_pdf(&state.pool, id, &data, &filename)
                 .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                .map_err(map_receipt_write_error)?;
 
             return Ok(StatusCode::OK);
         }

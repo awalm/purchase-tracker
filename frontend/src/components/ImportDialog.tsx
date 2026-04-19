@@ -36,6 +36,9 @@ interface ImportDialogProps<T> {
   renderPreviewTable: (rows: PreviewRow<T>[]) => ReactNode
   isPending: boolean
   onSuccess?: () => void
+  triggerLabel?: string
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
 }
 
 type Step = "upload" | "preview" | "result"
@@ -49,8 +52,12 @@ export function ImportDialog<T>({
   renderPreviewTable,
   isPending,
   onSuccess,
+  triggerLabel = "Import",
+  open,
+  onOpenChange,
 }: ImportDialogProps<T>) {
-  const [isOpen, setIsOpen] = useState(false)
+  const [internalOpen, setInternalOpen] = useState(false)
+  const isOpen = open ?? internalOpen
   const [step, setStep] = useState<Step>("upload")
   const [csvContent, setCsvContent] = useState("")
   const [fileName, setFileName] = useState("")
@@ -155,15 +162,22 @@ export function ImportDialog<T>({
     setError(null)
   }
 
+  const setDialogOpen = (nextOpen: boolean) => {
+    if (open === undefined) {
+      setInternalOpen(nextOpen)
+    }
+    onOpenChange?.(nextOpen)
+  }
+
   return (
     <Dialog open={isOpen} onOpenChange={(open) => {
-      setIsOpen(open)
+      setDialogOpen(open)
       if (!open) resetState()
     }}>
       <DialogTrigger asChild>
         <Button variant="outline">
           <Upload className="h-4 w-4 mr-2" />
-          Import
+          {triggerLabel}
         </Button>
       </DialogTrigger>
       <DialogContent className="max-w-4xl">
@@ -348,7 +362,7 @@ export function ImportDialog<T>({
                   ← Back
                 </Button>
                 <div className="flex gap-2">
-                  <Button variant="outline" onClick={() => setIsOpen(false)}>
+                  <Button variant="outline" onClick={() => setDialogOpen(false)}>
                     Cancel
                   </Button>
                   <Button 
@@ -441,7 +455,7 @@ export function ImportDialog<T>({
                 <Button variant="outline" onClick={resetState}>
                   Import Another
                 </Button>
-                <Button onClick={() => setIsOpen(false)}>
+                <Button onClick={() => setDialogOpen(false)}>
                   Done
                 </Button>
               </div>

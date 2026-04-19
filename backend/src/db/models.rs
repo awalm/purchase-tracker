@@ -91,7 +91,7 @@ pub struct Receipt {
     pub subtotal: Decimal,
     pub tax_rate: Decimal,
     pub total: Decimal,
-    pub payment_card_last4: Option<String>,
+    pub payment_method: Option<String>,
     pub ingestion_metadata: Option<serde_json::Value>,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -297,12 +297,13 @@ pub struct ReceiptWithVendor {
     pub subtotal: Decimal,
     pub tax_rate: Decimal,
     pub total: Decimal,
-    pub payment_card_last4: Option<String>,
+    pub payment_method: Option<String>,
     pub ingestion_metadata: Option<serde_json::Value>,
     pub has_pdf: Option<bool>,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub receipt_line_item_count: i64,
     pub purchase_count: Option<i64>,
     pub purchases_total: Option<Decimal>,
     pub total_selling: Option<Decimal>,
@@ -454,7 +455,7 @@ pub struct CreateReceipt {
     pub subtotal: Decimal,
     pub tax_amount: Option<Decimal>,
     pub tax_rate: Option<Decimal>, // backwards-compatible fallback if tax_amount is not provided
-    pub payment_card_last4: Option<String>,
+    pub payment_method: Option<String>,
     pub ingestion_metadata: Option<serde_json::Value>,
     pub notes: Option<String>,
 }
@@ -467,7 +468,7 @@ pub struct UpdateReceipt {
     pub subtotal: Option<Decimal>,
     pub tax_amount: Option<Decimal>,
     pub tax_rate: Option<Decimal>,
-    pub payment_card_last4: Option<String>,
+    pub payment_method: Option<String>,
     pub ingestion_metadata: Option<serde_json::Value>,
     pub notes: Option<String>,
 }
@@ -537,6 +538,19 @@ pub struct CreatePurchaseAllocation {
 pub struct UpdatePurchaseAllocation {
     pub receipt_line_item_id: Option<Uuid>,
     pub allocated_qty: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoAllocatePurchaseResult {
+    pub purchase_id: Uuid,
+    pub purchase_qty: i32,
+    pub previously_allocated_qty: i32,
+    pub auto_allocated_qty: i32,
+    pub total_allocated_qty: i32,
+    pub remaining_qty: i32,
+    pub allocations_created: i32,
+    pub allocations_updated: i32,
+    pub receipts_touched: i32,
 }
 
 // ============================================

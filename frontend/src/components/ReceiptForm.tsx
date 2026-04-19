@@ -22,7 +22,7 @@ export type ReceiptFormSubmitData = {
   receipt_date: string
   subtotal: string
   tax_amount: string
-  payment_card_last4: string
+  payment_method: string
   notes: string
   document_file: File | null
 }
@@ -65,7 +65,7 @@ export function ReceiptForm({
   const [receiptDate, setReceiptDate] = useState("")
   const [subtotal, setSubtotal] = useState("")
   const [taxAmount, setTaxAmount] = useState("")
-  const [paymentCardLast4, setPaymentCardLast4] = useState("")
+  const [paymentMethod, setPaymentMethod] = useState("")
   const [notes, setNotes] = useState("")
   const [documentFile, setDocumentFile] = useState<File | null>(null)
   const [validationError, setValidationError] = useState("")
@@ -78,7 +78,7 @@ export function ReceiptForm({
     setReceiptDate(initialValues?.receipt_date || "")
     setSubtotal(initialValues?.subtotal || "")
     setTaxAmount(initialValues?.tax_amount || "")
-    setPaymentCardLast4(initialValues?.payment_card_last4 || "")
+    setPaymentMethod(initialValues?.payment_method || "")
     setNotes(initialValues?.notes || "")
     setDocumentFile(null)
     setValidationError("")
@@ -89,7 +89,7 @@ export function ReceiptForm({
     initialValues?.receipt_date,
     initialValues?.subtotal,
     initialValues?.tax_amount,
-    initialValues?.payment_card_last4,
+    initialValues?.payment_method,
     initialValues?.notes,
   ])
 
@@ -108,7 +108,7 @@ export function ReceiptForm({
       receipt_date: receiptDate,
       subtotal,
       tax_amount: taxAmount,
-      payment_card_last4: paymentCardLast4,
+      payment_method: paymentMethod,
       notes,
       document_file: documentFile,
     })
@@ -181,12 +181,12 @@ export function ReceiptForm({
       </div>
 
       <div className="space-y-2">
-        <Label htmlFor="payment-card-last4">Payment Card Last 4</Label>
+        <Label htmlFor="payment-method">Payment Method</Label>
         <Input
-          id="payment-card-last4"
-          value={paymentCardLast4}
-          onChange={(e) => setPaymentCardLast4(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))}
-          placeholder="Optional"
+          id="payment-method"
+          value={paymentMethod}
+          onChange={(e) => setPaymentMethod(e.target.value)}
+          placeholder="Optional (e.g. Gift Card, Visa 1234)"
         />
       </div>
 

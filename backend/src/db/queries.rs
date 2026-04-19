@@ -2,6 +2,7 @@ use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde_json::json;
 use sqlx::PgPool;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::models::*;
@@ -87,6 +88,187 @@ const UNLINK_PURCHASES_FOR_INVOICE_SQL: &str = r#"UPDATE purchases
        SET invoice_id = NULL,
            invoice_unit_price = NULL
        WHERE invoice_id = $1"#;
+
+const DELETE_ORPHAN_PURCHASES_SQL: &str = r#"DELETE FROM purchases p
+       WHERE p.invoice_id IS NULL
+         AND p.receipt_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM purchase_allocations pa WHERE pa.purchase_id = p.id
+         )"#;
+
+const LOCKED_INVOICE_ERROR_PREFIX: &str = "LOCKED_INVOICE:";
+const PURCHASE_LINK_REQUIRED_ERROR_PREFIX: &str = "PURCHASE_LINK_REQUIRED:";
+
+fn locked_invoice_error(message: &str) -> sqlx::Error {
+    sqlx::Error::Protocol(format!("{}{}", LOCKED_INVOICE_ERROR_PREFIX, message))
+}
+
+fn purchase_link_required_error(message: &str) -> sqlx::Error {
+    sqlx::Error::Protocol(format!(
+        "{}{}",
+        PURCHASE_LINK_REQUIRED_ERROR_PREFIX, message
+    ))
+}
+
+pub fn locked_invoice_error_message(err: &sqlx::Error) -> Option<String> {
+    match err {
+        sqlx::Error::Protocol(msg) => msg
+            .strip_prefix(LOCKED_INVOICE_ERROR_PREFIX)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+pub fn purchase_link_required_error_message(err: &sqlx::Error) -> Option<String> {
+    match err {
+        sqlx::Error::Protocol(msg) => msg
+            .strip_prefix(PURCHASE_LINK_REQUIRED_ERROR_PREFIX)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+async fn delete_orphan_purchases(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(DELETE_ORPHAN_PURCHASES_SQL)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+async fn purchase_has_allocation_links(
+    pool: &PgPool,
+    purchase_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM purchase_allocations
+               WHERE purchase_id = $1
+           ) AS "exists!""#,
+        purchase_id
+    )
+    .fetch_one(pool)
+    .await
+}
+
+async fn invoice_is_locked(pool: &PgPool, invoice_id: Uuid) -> Result<bool, sqlx::Error> {
+    let is_locked = sqlx::query_scalar!(
+        r#"SELECT (reconciliation_state = 'locked') AS "is_locked!"
+           FROM invoices
+           WHERE id = $1"#,
+        invoice_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(false);
+
+    Ok(is_locked)
+}
+
+async fn purchase_is_linked_to_locked_invoice(
+    pool: &PgPool,
+    purchase_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM purchases p
+               JOIN invoices inv ON inv.id = p.invoice_id
+               WHERE p.id = $1
+                 AND inv.reconciliation_state = 'locked'
+           ) AS "exists!""#,
+        purchase_id
+    )
+    .fetch_one(pool)
+    .await
+}
+
+async fn receipt_has_locked_invoice_dependencies(
+    pool: &PgPool,
+    receipt_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM purchases p
+               JOIN invoices inv ON inv.id = p.invoice_id
+               WHERE inv.reconciliation_state = 'locked'
+                 AND (
+                     p.receipt_id = $1
+                     OR EXISTS (
+                         SELECT 1
+                         FROM purchase_allocations pa
+                         WHERE pa.purchase_id = p.id
+                           AND pa.receipt_id = $1
+                     )
+                 )
+           ) AS "exists!""#,
+        receipt_id
+    )
+    .fetch_one(pool)
+    .await
+}
+
+async fn ensure_invoice_not_locked(
+    pool: &PgPool,
+    invoice_id: Uuid,
+    message: &str,
+) -> Result<(), sqlx::Error> {
+    if invoice_is_locked(pool, invoice_id).await? {
+        return Err(locked_invoice_error(message));
+    }
+    Ok(())
+}
+
+async fn ensure_purchase_not_linked_to_locked_invoice(
+    pool: &PgPool,
+    purchase_id: Uuid,
+    message: &str,
+) -> Result<(), sqlx::Error> {
+    if purchase_is_linked_to_locked_invoice(pool, purchase_id).await? {
+        return Err(locked_invoice_error(message));
+    }
+    Ok(())
+}
+
+async fn ensure_receipt_not_linked_to_locked_invoice(
+    pool: &PgPool,
+    receipt_id: Uuid,
+    message: &str,
+) -> Result<(), sqlx::Error> {
+    if receipt_has_locked_invoice_dependencies(pool, receipt_id).await? {
+        return Err(locked_invoice_error(message));
+    }
+    Ok(())
+}
+
+async fn ensure_purchase_not_linked_to_locked_invoice_for_allocation(
+    pool: &PgPool,
+    purchase_id: Uuid,
+    message: &str,
+) -> Result<(), PurchaseAllocationError> {
+    if purchase_is_linked_to_locked_invoice(pool, purchase_id)
+        .await
+        .map_err(PurchaseAllocationError::Sql)?
+    {
+        return Err(PurchaseAllocationError::Validation(message.to_string()));
+    }
+    Ok(())
+}
+
+async fn ensure_receipt_not_linked_to_locked_invoice_for_line_item(
+    pool: &PgPool,
+    receipt_id: Uuid,
+    message: &str,
+) -> Result<(), PurchaseAllocationError> {
+    if receipt_has_locked_invoice_dependencies(pool, receipt_id)
+        .await
+        .map_err(PurchaseAllocationError::Sql)?
+    {
+        return Err(PurchaseAllocationError::Validation(message.to_string()));
+    }
+    Ok(())
+}
 
 // ============================================
 // Vendors
@@ -199,6 +381,9 @@ pub async fn delete_vendor(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<boo
     sqlx::query!(r#"DELETE FROM receipts WHERE vendor_id = $1"#, id)
         .execute(pool)
         .await?;
+
+    // Keep purchase invariant: invoice OR receipt/allocations must exist.
+    let _ = delete_orphan_purchases(pool).await?;
 
     let result = sqlx::query!(r#"DELETE FROM vendors WHERE id = $1"#, id)
         .execute(pool)
@@ -528,6 +713,9 @@ pub async fn delete_destination(
     sqlx::query!(r#"DELETE FROM invoices WHERE destination_id = $1"#, id)
         .execute(pool)
         .await?;
+
+    // Keep purchase invariant: invoice OR receipt/allocations must exist.
+    let _ = delete_orphan_purchases(pool).await?;
 
     let result = sqlx::query!(r#"DELETE FROM destinations WHERE id = $1"#, id)
         .execute(pool)
@@ -909,6 +1097,26 @@ pub async fn update_invoice(
     let old = get_invoice_by_id(pool, id).await?;
 
     if let Some(ref old_inv) = old {
+        let has_non_state_changes = data.invoice_number.is_some()
+            || data.order_number.is_some()
+            || data.invoice_date.is_some()
+            || data.subtotal.is_some()
+            || data.tax_rate.is_some()
+            || data.notes.is_some();
+        let requested_state = data.reconciliation_state.as_deref();
+
+        if old_inv.reconciliation_state == "locked" {
+            if has_non_state_changes || requested_state != Some("reopened") {
+                return Err(locked_invoice_error(
+                    "Locked invoices are immutable. Set reconciliation_state to 'reopened' first.",
+                ));
+            }
+        } else if requested_state == Some("reopened") {
+            return Err(locked_invoice_error(
+                "Only locked invoices can transition to 'reopened'.",
+            ));
+        }
+
         let invoice = sqlx::query_as!(
             Invoice,
             r#"UPDATE invoices SET 
@@ -955,11 +1163,22 @@ pub async fn update_invoice(
 pub async fn delete_invoice(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bool, sqlx::Error> {
     let old = get_invoice_by_id(pool, id).await?;
 
+    if let Some(ref inv) = old {
+        if inv.reconciliation_state == "locked" {
+            return Err(locked_invoice_error(
+                "Cannot delete a locked invoice. Reopen it first.",
+            ));
+        }
+    }
+
     // Unlink purchases that reference this invoice (SET NULL, not delete)
     sqlx::query(UNLINK_PURCHASES_FOR_INVOICE_SQL)
         .bind(id)
         .execute(pool)
         .await?;
+
+    // Keep purchase invariant: invoice OR receipt/allocations must exist.
+    let _ = delete_orphan_purchases(pool).await?;
 
     let result = sqlx::query!(r#"DELETE FROM invoices WHERE id = $1"#, id)
         .execute(pool)
@@ -1095,7 +1314,14 @@ pub async fn get_invoice_with_destination(
             COALESCE((SELECT SUM(rp.quantity * COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS purchases_total,
             COALESCE((SELECT SUM(rp.quantity * rp.effective_purchase_cost) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS total_cost,
             COALESCE((SELECT SUM(rp.quantity * (COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost) - rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS total_commission,
-            COUNT(p.id) FILTER (WHERE p.receipt_id IS NOT NULL) AS receipted_count
+            COUNT(p.id) FILTER (
+                WHERE p.receipt_id IS NOT NULL
+                   OR EXISTS (
+                       SELECT 1
+                       FROM purchase_allocations pa
+                       WHERE pa.purchase_id = p.id
+                   )
+            ) AS receipted_count
         FROM invoices inv
         JOIN destinations d ON d.id = inv.destination_id
         LEFT JOIN purchases p ON p.invoice_id = inv.id
@@ -1157,7 +1383,14 @@ pub async fn get_invoices_with_destination(
             COALESCE((SELECT SUM(rp.quantity * COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS purchases_total,
             COALESCE((SELECT SUM(rp.quantity * rp.effective_purchase_cost) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS total_cost,
             COALESCE((SELECT SUM(rp.quantity * (COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost) - rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS total_commission,
-            COUNT(p.id) FILTER (WHERE p.receipt_id IS NOT NULL) AS receipted_count
+            COUNT(p.id) FILTER (
+                WHERE p.receipt_id IS NOT NULL
+                   OR EXISTS (
+                       SELECT 1
+                       FROM purchase_allocations pa
+                       WHERE pa.purchase_id = p.id
+                   )
+            ) AS receipted_count
         FROM invoices inv
         JOIN destinations d ON d.id = inv.destination_id
         LEFT JOIN purchases p ON p.invoice_id = inv.id
@@ -1220,10 +1453,19 @@ pub async fn get_purchases_by_invoice(
                (pr.quantity * pr.effective_purchase_cost) AS total_cost,
                pr.invoice_unit_price,
                (pr.quantity * pr.invoice_unit_price) AS total_selling,
-               (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) AS unit_commission,
-               (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost)) AS total_commission,
+               CASE
+                   WHEN pr.effective_purchase_cost = 0 THEN NULL
+                   ELSE (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost)
+               END AS unit_commission,
+               CASE
+                   WHEN pr.effective_purchase_cost = 0 THEN NULL
+                   ELSE (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
+               END AS total_commission,
                (pr.quantity * pr.effective_purchase_cost * 0.13) AS tax_paid,
-               (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) * 0.13) AS tax_owed,
+               CASE
+                   WHEN pr.effective_purchase_cost = 0 THEN NULL
+                   ELSE (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) * 0.13)
+               END AS tax_owed,
                pr.status AS "status!: DeliveryStatus",
                pr.delivery_date,
                pr.invoice_id,
@@ -1336,6 +1578,13 @@ pub async fn create_purchase_allocation(
         ));
     }
 
+    ensure_purchase_not_linked_to_locked_invoice_for_allocation(
+        pool,
+        purchase_id,
+        "Cannot modify allocations for purchases on a locked invoice. Reopen the invoice first.",
+    )
+    .await?;
+
     let mut tx = pool.begin().await?;
 
     let purchase = sqlx::query!(
@@ -1433,6 +1682,13 @@ pub async fn update_purchase_allocation(
     allocation_id: Uuid,
     data: UpdatePurchaseAllocation,
 ) -> Result<PurchaseAllocationWithReceipt, PurchaseAllocationError> {
+    ensure_purchase_not_linked_to_locked_invoice_for_allocation(
+        pool,
+        purchase_id,
+        "Cannot modify allocations for purchases on a locked invoice. Reopen the invoice first.",
+    )
+    .await?;
+
     let mut tx = pool.begin().await?;
 
     let purchase = sqlx::query!(
@@ -1607,6 +1863,13 @@ pub async fn create_receipt_line_item(
         ));
     }
 
+    ensure_receipt_not_linked_to_locked_invoice_for_line_item(
+        pool,
+        receipt_id,
+        "Cannot modify receipt line items linked to a locked invoice. Reopen linked invoice(s) first.",
+    )
+    .await?;
+
     let created = sqlx::query_as!(
         ReceiptLineItem,
         r#"INSERT INTO receipt_line_items (receipt_id, item_id, quantity, unit_cost, notes)
@@ -1646,6 +1909,13 @@ pub async fn update_receipt_line_item(
     line_item_id: Uuid,
     data: UpdateReceiptLineItem,
 ) -> Result<ReceiptLineItemWithItem, PurchaseAllocationError> {
+    ensure_receipt_not_linked_to_locked_invoice_for_line_item(
+        pool,
+        receipt_id,
+        "Cannot modify receipt line items linked to a locked invoice. Reopen linked invoice(s) first.",
+    )
+    .await?;
+
     let current = sqlx::query_as!(
         ReceiptLineItem,
         r#"SELECT id, receipt_id, item_id, quantity, unit_cost, notes, created_at, updated_at
@@ -1729,6 +1999,13 @@ pub async fn delete_receipt_line_item(
     receipt_id: Uuid,
     line_item_id: Uuid,
 ) -> Result<bool, PurchaseAllocationError> {
+    ensure_receipt_not_linked_to_locked_invoice_for_line_item(
+        pool,
+        receipt_id,
+        "Cannot modify receipt line items linked to a locked invoice. Reopen linked invoice(s) first.",
+    )
+    .await?;
+
     let allocated = sqlx::query_scalar!(
         r#"SELECT COALESCE(SUM(allocated_qty), 0)::INT
            FROM purchase_allocations
@@ -1761,6 +2038,13 @@ pub async fn delete_purchase_allocation(
     purchase_id: Uuid,
     allocation_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
+    ensure_purchase_not_linked_to_locked_invoice(
+        pool,
+        purchase_id,
+        "Cannot modify allocations for purchases on a locked invoice. Reopen the invoice first.",
+    )
+    .await?;
+
     let result = sqlx::query!(
         r#"DELETE FROM purchase_allocations WHERE id = $1 AND purchase_id = $2"#,
         allocation_id,
@@ -1769,7 +2053,160 @@ pub async fn delete_purchase_allocation(
     .execute(pool)
     .await?;
 
+    // Removing a final allocation can orphan a purchase if both direct links are null.
+    let _ = delete_orphan_purchases(pool).await?;
+
     Ok(result.rows_affected() > 0)
+}
+
+pub async fn auto_allocate_purchase(
+    pool: &PgPool,
+    purchase_id: Uuid,
+) -> Result<AutoAllocatePurchaseResult, PurchaseAllocationError> {
+    ensure_purchase_not_linked_to_locked_invoice_for_allocation(
+        pool,
+        purchase_id,
+        "Cannot modify allocations for purchases on a locked invoice. Reopen the invoice first.",
+    )
+    .await?;
+
+    let mut tx = pool.begin().await?;
+
+    let purchase = sqlx::query!(
+        r#"SELECT id, item_id, quantity FROM purchases WHERE id = $1"#,
+        purchase_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| PurchaseAllocationError::NotFound("Purchase not found".to_string()))?;
+
+    let existing_allocations = sqlx::query!(
+        r#"SELECT id, receipt_id, allocated_qty
+           FROM purchase_allocations
+           WHERE purchase_id = $1"#,
+        purchase_id
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut existing_by_receipt: HashMap<Uuid, (Uuid, i32)> = existing_allocations
+        .iter()
+        .map(|row| (row.receipt_id, (row.id, row.allocated_qty)))
+        .collect();
+
+    let previously_allocated_qty = existing_allocations
+        .iter()
+        .map(|row| row.allocated_qty)
+        .sum::<i32>();
+    let mut remaining_qty = (purchase.quantity - previously_allocated_qty).max(0);
+    let mut auto_allocated_qty = 0;
+    let mut allocations_created = 0;
+    let mut allocations_updated = 0;
+    let mut touched_receipts: HashSet<Uuid> = HashSet::new();
+
+    if remaining_qty > 0 {
+        let candidates = sqlx::query!(
+            r#"SELECT
+                rli.id AS line_item_id,
+                rli.receipt_id,
+                rli.quantity AS "line_qty!: i32",
+                rli.unit_cost,
+                COALESCE(SUM(CASE WHEN pa.purchase_id <> $1 THEN pa.allocated_qty ELSE 0 END), 0)::INT
+                    AS "allocated_by_others!: i32"
+            FROM receipt_line_items rli
+            JOIN receipts r ON r.id = rli.receipt_id
+            LEFT JOIN purchase_allocations pa ON pa.receipt_line_item_id = rli.id
+            WHERE rli.item_id = $2
+            GROUP BY rli.id, rli.receipt_id, rli.quantity, rli.unit_cost, r.receipt_date
+            ORDER BY r.receipt_date ASC, rli.receipt_id ASC"#,
+            purchase_id,
+            purchase.item_id
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for candidate in candidates {
+            if remaining_qty <= 0 {
+                break;
+            }
+
+            let max_for_purchase_on_line =
+                (candidate.line_qty - candidate.allocated_by_others).max(0);
+
+            let (existing_allocation_id, existing_qty_on_receipt) = existing_by_receipt
+                .get(&candidate.receipt_id)
+                .map(|(allocation_id, qty)| (Some(*allocation_id), *qty))
+                .unwrap_or((None, 0));
+
+            let additional_capacity = (max_for_purchase_on_line - existing_qty_on_receipt).max(0);
+            if additional_capacity <= 0 {
+                continue;
+            }
+
+            let delta = remaining_qty.min(additional_capacity);
+            if delta <= 0 {
+                continue;
+            }
+
+            if let Some(allocation_id) = existing_allocation_id {
+                let new_qty = existing_qty_on_receipt + delta;
+
+                sqlx::query!(
+                    r#"UPDATE purchase_allocations
+                       SET receipt_line_item_id = $2,
+                           allocated_qty = $3,
+                           unit_cost = $4
+                       WHERE id = $1"#,
+                    allocation_id,
+                    Some(candidate.line_item_id),
+                    new_qty,
+                    candidate.unit_cost
+                )
+                .execute(&mut *tx)
+                .await?;
+
+                existing_by_receipt.insert(candidate.receipt_id, (allocation_id, new_qty));
+                allocations_updated += 1;
+            } else {
+                let created = sqlx::query!(
+                    r#"INSERT INTO purchase_allocations (purchase_id, receipt_id, receipt_line_item_id, allocated_qty, unit_cost)
+                       VALUES ($1, $2, $3, $4, $5)
+                       RETURNING id"#,
+                    purchase_id,
+                    candidate.receipt_id,
+                    Some(candidate.line_item_id),
+                    delta,
+                    candidate.unit_cost
+                )
+                .fetch_one(&mut *tx)
+                .await?;
+
+                existing_by_receipt.insert(candidate.receipt_id, (created.id, delta));
+                allocations_created += 1;
+            }
+
+            auto_allocated_qty += delta;
+            remaining_qty -= delta;
+            touched_receipts.insert(candidate.receipt_id);
+        }
+    }
+
+    tx.commit().await?;
+
+    let total_allocated_qty = previously_allocated_qty + auto_allocated_qty;
+    let remaining_qty = (purchase.quantity - total_allocated_qty).max(0);
+
+    Ok(AutoAllocatePurchaseResult {
+        purchase_id,
+        purchase_qty: purchase.quantity,
+        previously_allocated_qty,
+        auto_allocated_qty,
+        total_allocated_qty,
+        remaining_qty,
+        allocations_created,
+        allocations_updated,
+        receipts_touched: touched_receipts.len() as i32,
+    })
 }
 
 pub async fn create_purchase(
@@ -1777,6 +2214,21 @@ pub async fn create_purchase(
     data: CreatePurchase,
     user_id: Uuid,
 ) -> Result<Purchase, sqlx::Error> {
+    if data.invoice_id.is_none() && data.receipt_id.is_none() {
+        return Err(purchase_link_required_error(
+            "Purchase must be linked to at least one side (invoice or receipt).",
+        ));
+    }
+
+    if let Some(invoice_id) = data.invoice_id {
+        ensure_invoice_not_locked(
+            pool,
+            invoice_id,
+            "Cannot create a purchase on a locked invoice. Reopen the invoice first.",
+        )
+        .await?;
+    }
+
     let status = data.status.unwrap_or(DeliveryStatus::Pending);
     let invoice_unit_price = if data.invoice_id.is_some() {
         data.invoice_unit_price
@@ -1833,17 +2285,46 @@ pub async fn update_purchase(
     let old = get_purchase_by_id(pool, id).await?;
 
     if let Some(ref old_purchase) = old {
+        if let Some(old_invoice_id) = old_purchase.invoice_id {
+            ensure_invoice_not_locked(
+                pool,
+                old_invoice_id,
+                "Cannot modify a purchase linked to a locked invoice. Reopen the invoice first.",
+            )
+            .await?;
+        }
+
         // Resolve nullable fields: explicit clear wins, then new value, then keep existing
         let invoice_id = if data.clear_invoice {
             None
         } else {
             data.invoice_id.or(old_purchase.invoice_id)
         };
+
+        if let Some(next_invoice_id) = invoice_id {
+            if Some(next_invoice_id) != old_purchase.invoice_id {
+                ensure_invoice_not_locked(
+                    pool,
+                    next_invoice_id,
+                    "Cannot link a purchase to a locked invoice. Reopen the invoice first.",
+                )
+                .await?;
+            }
+        }
+
         let receipt_id = if data.clear_receipt {
             None
         } else {
             data.receipt_id.or(old_purchase.receipt_id)
         };
+
+        let has_allocation_link = purchase_has_allocation_links(pool, id).await?;
+        if invoice_id.is_none() && receipt_id.is_none() && !has_allocation_link {
+            return Err(purchase_link_required_error(
+                "Purchase must remain linked to at least one side (invoice or receipt).",
+            ));
+        }
+
         let invoice_unit_price = if invoice_id.is_some() {
             if data.clear_invoice_unit_price {
                 None
@@ -1934,6 +2415,15 @@ pub async fn update_purchase_status(
     let old = get_purchase_by_id(pool, id).await?;
 
     if let Some(ref old_purchase) = old {
+        if let Some(old_invoice_id) = old_purchase.invoice_id {
+            ensure_invoice_not_locked(
+                pool,
+                old_invoice_id,
+                "Cannot modify a purchase linked to a locked invoice. Reopen the invoice first.",
+            )
+            .await?;
+        }
+
         let purchase = sqlx::query_as!(
             Purchase,
             r#"UPDATE purchases SET status = $2
@@ -1966,6 +2456,17 @@ pub async fn update_purchase_status(
 
 pub async fn delete_purchase(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bool, sqlx::Error> {
     let old = get_purchase_by_id(pool, id).await?;
+
+    if let Some(ref old_purchase) = old {
+        if let Some(old_invoice_id) = old_purchase.invoice_id {
+            ensure_invoice_not_locked(
+                pool,
+                old_invoice_id,
+                "Cannot delete a purchase linked to a locked invoice. Reopen the invoice first.",
+            )
+            .await?;
+        }
+    }
 
     let result = sqlx::query!(r#"DELETE FROM purchases WHERE id = $1"#, id)
         .execute(pool)
@@ -2153,7 +2654,7 @@ pub async fn get_all_receipts(pool: &PgPool) -> Result<Vec<Receipt>, sqlx::Error
     sqlx::query_as!(
         Receipt,
         r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
-                payment_card_last4,
+                payment_method,
           ingestion_metadata,
                   notes, created_at, updated_at
            FROM receipts ORDER BY receipt_date DESC"#
@@ -2166,7 +2667,7 @@ pub async fn get_receipt_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Receipt
     sqlx::query_as!(
         Receipt,
         r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
-                  payment_card_last4,
+                  payment_method,
                   ingestion_metadata,
                   notes, created_at, updated_at
            FROM receipts WHERE id = $1"#,
@@ -2216,10 +2717,10 @@ pub async fn create_receipt(
 
     let receipt = sqlx::query_as!(
         Receipt,
-        r#"INSERT INTO receipts (vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, payment_card_last4, ingestion_metadata, notes)
+        r#"INSERT INTO receipts (vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, payment_method, ingestion_metadata, notes)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
            RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
-                     payment_card_last4,
+                     payment_method,
                      ingestion_metadata,
                      notes, created_at, updated_at"#,
         data.vendor_id,
@@ -2228,7 +2729,7 @@ pub async fn create_receipt(
         data.subtotal,
         tax_rate,
         total,
-        data.payment_card_last4,
+        data.payment_method,
         ingestion_metadata,
         data.notes
     )
@@ -2330,6 +2831,13 @@ pub async fn update_receipt(
     let old = get_receipt_by_id(pool, id).await?;
 
     if let Some(ref old_receipt) = old {
+        ensure_receipt_not_linked_to_locked_invoice(
+            pool,
+            id,
+            "Cannot modify a receipt linked to a locked invoice. Reopen linked invoice(s) first.",
+        )
+        .await?;
+
         let vendor_id = data.vendor_id.unwrap_or(old_receipt.vendor_id);
         let receipt_number = data
             .receipt_number
@@ -2338,10 +2846,10 @@ pub async fn update_receipt(
         let receipt_date = data.receipt_date.unwrap_or(old_receipt.receipt_date);
         let subtotal = data.subtotal.unwrap_or(old_receipt.subtotal);
         let notes = data.notes.clone().or(old_receipt.notes.clone());
-        let payment_card_last4 = data
-            .payment_card_last4
+        let payment_method = data
+            .payment_method
             .clone()
-            .or(old_receipt.payment_card_last4.clone());
+            .or(old_receipt.payment_method.clone());
         let ingestion_metadata = data
             .ingestion_metadata
             .or_else(|| old_receipt.ingestion_metadata.clone());
@@ -2370,12 +2878,12 @@ pub async fn update_receipt(
                 subtotal = $5,
                 tax_rate = $6,
                 total = $7,
-                payment_card_last4 = $8,
+                payment_method = $8,
                 ingestion_metadata = $9,
                 notes = $10
                WHERE id = $1 
                RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
-                         payment_card_last4,
+                         payment_method,
                          ingestion_metadata,
                          notes, created_at, updated_at"#,
             id,
@@ -2385,7 +2893,7 @@ pub async fn update_receipt(
             subtotal,
             tax_rate,
             total,
-            payment_card_last4,
+            payment_method,
             ingestion_metadata,
             notes
         )
@@ -2412,6 +2920,15 @@ pub async fn update_receipt(
 pub async fn delete_receipt(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bool, sqlx::Error> {
     let old = get_receipt_by_id(pool, id).await?;
 
+    if old.is_some() {
+        ensure_receipt_not_linked_to_locked_invoice(
+            pool,
+            id,
+            "Cannot delete a receipt linked to a locked invoice. Reopen linked invoice(s) first.",
+        )
+        .await?;
+    }
+
     // Unlink purchases that reference this receipt (SET NULL, not delete)
     sqlx::query!(
         r#"UPDATE purchases SET receipt_id = NULL WHERE receipt_id = $1"#,
@@ -2423,6 +2940,9 @@ pub async fn delete_receipt(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bo
     let result = sqlx::query!(r#"DELETE FROM receipts WHERE id = $1"#, id)
         .execute(pool)
         .await?;
+
+    // Keep purchase invariant: invoice OR receipt/allocations must exist.
+    let _ = delete_orphan_purchases(pool).await?;
 
     if result.rows_affected() > 0 {
         if let Some(ref r) = old {
@@ -2448,6 +2968,13 @@ pub async fn save_receipt_pdf(
     pdf_data: &[u8],
     filename: &str,
 ) -> Result<bool, sqlx::Error> {
+    ensure_receipt_not_linked_to_locked_invoice(
+        pool,
+        id,
+        "Cannot update documents for a receipt linked to a locked invoice. Reopen linked invoice(s) first.",
+    )
+    .await?;
+
     let result = sqlx::query!(
         r#"UPDATE receipts SET original_pdf = $2, original_filename = $3 WHERE id = $1"#,
         id,
@@ -2494,12 +3021,13 @@ pub async fn get_receipt_with_vendor(
             r.subtotal,
             r.tax_rate,
             r.total,
-            r.payment_card_last4,
+            r.payment_method,
             r.ingestion_metadata,
             (r.original_pdf IS NOT NULL) AS has_pdf,
             r.notes,
             r.created_at,
             r.updated_at,
+            (SELECT COUNT(*)::BIGINT FROM receipt_line_items rli WHERE rli.receipt_id = r.id) AS "receipt_line_item_count!",
                         COUNT(DISTINCT p.id) AS purchase_count,
                         COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0)
                             + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * p.purchase_cost ELSE 0 END), 0) AS purchases_total,
@@ -2514,7 +3042,7 @@ pub async fn get_receipt_with_vendor(
                 LEFT JOIN purchases p ON p.id = pa.purchase_id OR (pa.id IS NULL AND p.receipt_id = r.id)
         WHERE r.id = $1
            GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_rate, r.total,
-               r.payment_card_last4, r.ingestion_metadata,
+                             r.payment_method, r.ingestion_metadata,
                  r.original_pdf, r.notes, r.created_at, r.updated_at"#,
         id
     )
@@ -2536,12 +3064,13 @@ pub async fn get_receipts_with_vendor(
             r.subtotal,
             r.tax_rate,
             r.total,
-            r.payment_card_last4,
+            r.payment_method,
             r.ingestion_metadata,
             (r.original_pdf IS NOT NULL) AS has_pdf,
             r.notes,
             r.created_at,
             r.updated_at,
+            (SELECT COUNT(*)::BIGINT FROM receipt_line_items rli WHERE rli.receipt_id = r.id) AS "receipt_line_item_count!",
                         COUNT(DISTINCT p.id) AS purchase_count,
                         COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0)
                             + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * p.purchase_cost ELSE 0 END), 0) AS purchases_total,
@@ -2555,7 +3084,7 @@ pub async fn get_receipts_with_vendor(
                 LEFT JOIN purchase_allocations pa ON pa.receipt_id = r.id
                 LEFT JOIN purchases p ON p.id = pa.purchase_id OR (pa.id IS NULL AND p.receipt_id = r.id)
         GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_rate, r.total,
-                 r.payment_card_last4, r.ingestion_metadata,
+             r.payment_method, r.ingestion_metadata,
                  r.original_pdf, r.notes, r.created_at, r.updated_at
         ORDER BY r.receipt_date DESC"#
     )
@@ -2690,57 +3219,83 @@ pub async fn get_purchases_by_item(
 ) -> Result<Vec<PurchaseEconomics>, sqlx::Error> {
     sqlx::query_as!(
         PurchaseEconomics,
-        r#"WITH reconciled_purchase_ids AS (
-                        SELECT p.id
-                        FROM purchases p
-                        JOIN purchase_allocations pa
-                            ON pa.purchase_id = p.id
-                         AND pa.receipt_id = p.receipt_id
-                        JOIN receipt_line_items rli
-                            ON rli.id = pa.receipt_line_item_id
-                         AND rli.item_id = p.item_id
-                        WHERE p.item_id = $1
-                            AND p.receipt_id IS NOT NULL
-                            AND p.invoice_id IS NOT NULL
-                            AND p.invoice_unit_price IS NOT NULL
-                            AND p.destination_id IS NOT NULL
-                            AND pa.allocated_qty = p.quantity
-                            AND pa.unit_cost = p.purchase_cost
-                            AND EXISTS (
-                                        SELECT 1
-                                        FROM v_receipt_reconciliation rr
-                                        WHERE rr.receipt_id = p.receipt_id
-                                            AND rr.is_matched = TRUE
-                                            AND rr.all_invoiced = TRUE
-                            )
-                )
-                SELECT 
-            pe.purchase_id as "purchase_id!",
-            pe.purchase_date as "purchase_date!",
-            pe.item_id as "item_id!",
-            pe.item_name as "item_name!",
-            pe.vendor_name,
-            pe.destination_code,
-            pe.quantity as "quantity!",
-            pe.purchase_cost as "purchase_cost!",
-            pe.total_cost,
-            pe.invoice_unit_price,
-            pe.total_selling,
-            pe.unit_commission,
-            pe.total_commission,
-            pe.tax_paid,
-            pe.tax_owed,
-            pe.status as "status!: DeliveryStatus",
-            pe.delivery_date,
-            pe.invoice_id,
-            pe.receipt_id,
-            pe.receipt_number,
-            pe.invoice_number,
-            pe.notes
-        FROM v_purchase_economics pe
-        JOIN reconciled_purchase_ids rp ON rp.id = pe.purchase_id
-        WHERE pe.item_id = $1
-        ORDER BY pe.purchase_date DESC"#,
+        r#"WITH allocation_summary AS (
+               SELECT
+                   pa.purchase_id,
+                   (ARRAY_AGG(DISTINCT pa.receipt_id))[1] AS any_receipt_id,
+                   COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
+                   COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
+               FROM purchase_allocations pa
+               GROUP BY pa.purchase_id
+           ),
+           purchase_rows AS (
+               SELECT
+                   p.id AS purchase_id,
+                   p.item_id,
+                   p.quantity,
+                   p.invoice_unit_price,
+                   p.status,
+                   p.delivery_date,
+                   p.invoice_id,
+                   COALESCE(p.receipt_id, alloc.any_receipt_id) AS resolved_receipt_id,
+                   p.destination_id,
+                   p.notes,
+                   p.created_at,
+                   CASE
+                       WHEN alloc.allocated_qty = p.quantity
+                            AND alloc.allocated_qty > 0
+                            AND p.quantity > 0
+                       THEN alloc.allocated_total_cost / p.quantity::numeric
+                       ELSE p.purchase_cost
+                   END AS effective_purchase_cost
+               FROM purchases p
+               LEFT JOIN allocation_summary alloc ON alloc.purchase_id = p.id
+                             WHERE p.item_id = $1
+                                 AND (
+                                         p.invoice_id IS NOT NULL
+                                         OR p.receipt_id IS NOT NULL
+                                         OR alloc.any_receipt_id IS NOT NULL
+                                 )
+           )
+           SELECT
+               pr.purchase_id AS "purchase_id!",
+               COALESCE(inv.invoice_date::timestamptz, r.receipt_date::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS "purchase_date!",
+               pr.item_id AS "item_id!",
+               COALESCE(i.name, '(deleted item)') AS "item_name!",
+               v.name AS "vendor_name?",
+               d.code AS "destination_code?",
+               pr.quantity AS "quantity!",
+               pr.effective_purchase_cost AS "purchase_cost!",
+               (pr.quantity * pr.effective_purchase_cost) AS total_cost,
+               pr.invoice_unit_price,
+               (pr.quantity * pr.invoice_unit_price) AS total_selling,
+               CASE
+                   WHEN pr.effective_purchase_cost = 0 THEN NULL
+                   ELSE (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost)
+               END AS unit_commission,
+               CASE
+                   WHEN pr.effective_purchase_cost = 0 THEN NULL
+                   ELSE (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
+               END AS total_commission,
+               (pr.quantity * pr.effective_purchase_cost * 0.13) AS tax_paid,
+               CASE
+                   WHEN pr.effective_purchase_cost = 0 THEN NULL
+                   ELSE (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) * 0.13)
+               END AS tax_owed,
+               pr.status AS "status!: DeliveryStatus",
+               pr.delivery_date,
+               pr.invoice_id,
+               pr.resolved_receipt_id AS "receipt_id?",
+               r.receipt_number AS "receipt_number?",
+               inv.invoice_number AS "invoice_number?",
+               pr.notes
+           FROM purchase_rows pr
+           LEFT JOIN items i ON i.id = pr.item_id
+           LEFT JOIN receipts r ON r.id = pr.resolved_receipt_id
+           LEFT JOIN vendors v ON v.id = r.vendor_id
+           LEFT JOIN destinations d ON d.id = pr.destination_id
+           LEFT JOIN invoices inv ON inv.id = pr.invoice_id
+           ORDER BY pr.created_at DESC"#,
         item_id
     )
     .fetch_all(pool)
@@ -2861,6 +3416,111 @@ mod tests {
         );
     }
 
+    #[test]
+    fn invoice_reconciliation_state_includes_reopened_in_migrations() {
+        let initial_schema = include_str!("../../../migrations/001_initial_schema.sql");
+        let upgrade_sql = include_str!("../../../migrations/upgrade.sql");
+
+        assert!(
+            initial_schema.contains("'reopened'"),
+            "Initial schema must allow reopened reconciliation_state"
+        );
+        assert!(
+            upgrade_sql.contains("'reopened'"),
+            "Upgrade migration must allow reopened reconciliation_state"
+        );
+    }
+
+    #[test]
+    fn orphan_purchase_cleanup_sql_targets_only_unlinked_rows_without_allocations() {
+        assert!(
+            DELETE_ORPHAN_PURCHASES_SQL.contains("invoice_id IS NULL"),
+            "Orphan cleanup SQL must target invoice-unlinked purchases"
+        );
+        assert!(
+            DELETE_ORPHAN_PURCHASES_SQL.contains("receipt_id IS NULL"),
+            "Orphan cleanup SQL must target receipt-unlinked purchases"
+        );
+        assert!(
+            DELETE_ORPHAN_PURCHASES_SQL
+                .contains("NOT EXISTS (\n           SELECT 1 FROM purchase_allocations pa WHERE pa.purchase_id = p.id\n         )"),
+            "Orphan cleanup SQL must preserve allocation-backed purchases"
+        );
+    }
+
+    #[test]
+    fn item_purchases_query_is_allocation_aware_and_not_reconciled_gated() {
+        let source = include_str!("queries.rs");
+        let start = source
+            .find("pub async fn get_purchases_by_item(")
+            .expect("get_purchases_by_item function must exist");
+        let tail = &source[start..];
+        let end = tail
+            .find("// ============================================\n// Reports")
+            .expect("reports section marker must exist after get_purchases_by_item");
+        let item_query_fn = &tail[..end];
+
+        assert!(
+            item_query_fn.contains("WITH allocation_summary AS ("),
+            "Item purchases query must aggregate allocation rows"
+        );
+        assert!(
+            item_query_fn
+                .contains("LEFT JOIN allocation_summary alloc ON alloc.purchase_id = p.id"),
+            "Item purchases query must left join allocation summary"
+        );
+        assert!(
+            item_query_fn
+                .contains("COALESCE(p.receipt_id, alloc.any_receipt_id) AS resolved_receipt_id"),
+            "Item purchases query must resolve receipt via allocations when direct link is null"
+        );
+        assert!(
+            item_query_fn.contains("WHERE p.item_id = $1"),
+            "Item purchases query must filter by item_id in purchase_rows"
+        );
+        assert!(
+            item_query_fn.contains("p.invoice_id IS NOT NULL")
+                && item_query_fn.contains("p.receipt_id IS NOT NULL")
+                && item_query_fn.contains("alloc.any_receipt_id IS NOT NULL"),
+            "Item purchases query must exclude standalone orphan purchases"
+        );
+        assert!(
+            item_query_fn.contains("WHEN pr.effective_purchase_cost = 0 THEN NULL")
+                && item_query_fn.contains("END AS total_commission"),
+            "Item purchases query must suppress commission when cost is unknown/unset"
+        );
+
+        assert!(
+            !item_query_fn.contains("reconciled_purchase_ids"),
+            "Item purchases query must not reintroduce reconciled_purchase_ids gating"
+        );
+        assert!(
+            !item_query_fn.contains("v_receipt_reconciliation"),
+            "Item purchases query must not require receipt reconciliation gate"
+        );
+    }
+
+    fn assert_locked_invoice_sql_error(err: &sqlx::Error) {
+        let msg = locked_invoice_error_message(err)
+            .expect("expected sqlx protocol error with locked invoice message");
+        assert!(
+            msg.to_lowercase().contains("locked"),
+            "expected locked-invoice message, got: {msg}"
+        );
+    }
+
+    fn assert_locked_invoice_validation_error(err: PurchaseAllocationError) {
+        match err {
+            PurchaseAllocationError::Validation(msg) => {
+                assert!(
+                    msg.to_lowercase().contains("locked"),
+                    "expected locked-invoice validation message, got: {msg}"
+                );
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
     async fn test_pool() -> Option<PgPool> {
         let database_url = std::env::var("DATABASE_URL").ok()?;
         PgPoolOptions::new()
@@ -2873,6 +3533,16 @@ mod tests {
     async fn seed_purchase_with_receipt(
         pool: &PgPool,
     ) -> Result<(Uuid, Uuid, Uuid, Uuid, Uuid), sqlx::Error> {
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id, _invoice_id) =
+            seed_purchase_with_receipt_and_state(pool, "open").await?;
+
+        Ok((vendor_id, destination_id, item_id, receipt_id, purchase_id))
+    }
+
+    async fn seed_purchase_with_receipt_and_state(
+        pool: &PgPool,
+        reconciliation_state: &str,
+    ) -> Result<(Uuid, Uuid, Uuid, Uuid, Uuid, Uuid), sqlx::Error> {
         let vendor_id = Uuid::new_v4();
         let destination_id = Uuid::new_v4();
         let item_id = Uuid::new_v4();
@@ -2915,8 +3585,8 @@ mod tests {
         .await?;
 
         sqlx::query(
-            r#"INSERT INTO invoices (id, destination_id, invoice_number, invoice_date, subtotal, tax_rate, total)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+                r#"INSERT INTO invoices (id, destination_id, invoice_number, invoice_date, subtotal, tax_rate, total, reconciliation_state)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
         )
         .bind(invoice_id)
         .bind(destination_id)
@@ -2925,6 +3595,7 @@ mod tests {
         .bind(Decimal::new(12000, 2))
         .bind(Decimal::new(1300, 2))
         .bind(Decimal::new(13560, 2))
+          .bind(reconciliation_state)
         .execute(pool)
         .await?;
 
@@ -2943,7 +3614,39 @@ mod tests {
         .execute(pool)
         .await?;
 
-        Ok((vendor_id, destination_id, item_id, receipt_id, purchase_id))
+        Ok((
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+            invoice_id,
+        ))
+    }
+
+    async fn create_receipt_for_seed(
+        pool: &PgPool,
+        vendor_id: Uuid,
+        receipt_date: NaiveDate,
+        subtotal: Decimal,
+    ) -> Uuid {
+        let receipt_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO receipts (id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind(receipt_id)
+        .bind(vendor_id)
+        .bind(format!("R{}", &receipt_id.to_string()[..10]))
+        .bind(receipt_date)
+        .bind(subtotal)
+        .bind(Decimal::new(1300, 2))
+        .bind(subtotal * Decimal::new(113, 2))
+        .execute(pool)
+        .await
+        .expect("create receipt");
+
+        receipt_id
     }
 
     async fn create_receipt_line_item_for_seed(
@@ -3032,7 +3735,7 @@ mod tests {
                 subtotal: None,
                 tax_amount: None,
                 tax_rate: None,
-                payment_card_last4: None,
+                payment_method: None,
                 ingestion_metadata: None,
                 notes: None,
             },
@@ -3093,7 +3796,7 @@ mod tests {
                 subtotal: Some(Decimal::new(999999, 2)),
                 tax_amount: Some(Decimal::new(129999, 2)),
                 tax_rate: None,
-                payment_card_last4: None,
+                payment_method: None,
                 ingestion_metadata: None,
                 notes: Some("edited receipt totals".to_string()),
             },
@@ -3327,6 +4030,301 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receipt_summary_counts_receipt_lines_even_when_no_purchases_linked() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let _line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            3,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        sqlx::query(r#"DELETE FROM purchase_allocations WHERE purchase_id = $1"#)
+            .bind(purchase_id)
+            .execute(&pool)
+            .await
+            .expect("delete allocations");
+
+        sqlx::query(r#"DELETE FROM purchases WHERE id = $1"#)
+            .bind(purchase_id)
+            .execute(&pool)
+            .await
+            .expect("delete purchase");
+
+        let summary = get_receipt_with_vendor(&pool, receipt_id)
+            .await
+            .expect("receipt summary should load")
+            .expect("receipt should exist");
+
+        assert_eq!(summary.receipt_line_item_count, 1);
+        assert_eq!(summary.purchase_count, Some(0));
+
+        let summaries = get_receipts_with_vendor(&pool)
+            .await
+            .expect("receipt summaries should load");
+
+        let listed = summaries
+            .iter()
+            .find(|receipt| receipt.id == receipt_id)
+            .expect("receipt should be present in list");
+
+        assert_eq!(listed.receipt_line_item_count, 1);
+        assert_eq!(listed.purchase_count, Some(0));
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_allocate_purchase_fully_allocates_with_multiple_receipts() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let _line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            1,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let second_receipt_id = create_receipt_for_seed(
+            &pool,
+            vendor_id,
+            NaiveDate::from_ymd_opt(2026, 4, 15).unwrap(),
+            Decimal::new(10000, 2),
+        )
+        .await;
+
+        let _second_line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            second_receipt_id,
+            item_id,
+            2,
+            Decimal::new(91000, 2),
+        )
+        .await;
+
+        let result = auto_allocate_purchase(&pool, purchase_id)
+            .await
+            .expect("auto allocation should succeed");
+
+        assert_eq!(result.previously_allocated_qty, 0);
+        assert_eq!(result.auto_allocated_qty, 2);
+        assert_eq!(result.total_allocated_qty, 2);
+        assert_eq!(result.remaining_qty, 0);
+        assert_eq!(result.allocations_created, 2);
+        assert_eq!(result.allocations_updated, 0);
+        assert_eq!(result.receipts_touched, 2);
+
+        let rows = get_purchase_allocations(&pool, purchase_id)
+            .await
+            .expect("allocations should load");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().map(|row| row.allocated_qty).sum::<i32>(), 2);
+
+        let _ = sqlx::query(r#"DELETE FROM receipts WHERE id = $1"#)
+            .bind(second_receipt_id)
+            .execute(&pool)
+            .await;
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_allocate_purchase_returns_partial_when_capacity_is_insufficient() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let _line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            1,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let result = auto_allocate_purchase(&pool, purchase_id)
+            .await
+            .expect("auto allocation should succeed");
+
+        assert_eq!(result.previously_allocated_qty, 0);
+        assert_eq!(result.auto_allocated_qty, 1);
+        assert_eq!(result.total_allocated_qty, 1);
+        assert_eq!(result.remaining_qty, 1);
+        assert_eq!(result.allocations_created, 1);
+        assert_eq!(result.allocations_updated, 0);
+        assert_eq!(result.receipts_touched, 1);
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_allocate_purchase_updates_existing_allocation_before_creating_more() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let existing = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 1,
+            },
+        )
+        .await
+        .expect("seed allocation should succeed");
+
+        let second_receipt_id = create_receipt_for_seed(
+            &pool,
+            vendor_id,
+            NaiveDate::from_ymd_opt(2026, 4, 16).unwrap(),
+            Decimal::new(5000, 2),
+        )
+        .await;
+
+        let _second_line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            second_receipt_id,
+            item_id,
+            5,
+            Decimal::new(92000, 2),
+        )
+        .await;
+
+        let result = auto_allocate_purchase(&pool, purchase_id)
+            .await
+            .expect("auto allocation should succeed");
+
+        assert_eq!(result.previously_allocated_qty, 1);
+        assert_eq!(result.auto_allocated_qty, 1);
+        assert_eq!(result.total_allocated_qty, 2);
+        assert_eq!(result.remaining_qty, 0);
+        assert_eq!(result.allocations_created, 0);
+        assert_eq!(result.allocations_updated, 1);
+        assert_eq!(result.receipts_touched, 1);
+
+        let rows = get_purchase_allocations(&pool, purchase_id)
+            .await
+            .expect("allocations should load");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, existing.id);
+        assert_eq!(rows[0].allocated_qty, 2);
+
+        let _ = sqlx::query(r#"DELETE FROM receipts WHERE id = $1"#)
+            .bind(second_receipt_id)
+            .execute(&pool)
+            .await;
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn locked_invoice_blocks_auto_allocation() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id, _invoice_id) =
+            seed_purchase_with_receipt_and_state(&pool, "locked")
+                .await
+                .expect("seed locked data");
+
+        let _line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let err = auto_allocate_purchase(&pool, purchase_id)
+            .await
+            .expect_err("auto allocation should fail on locked invoice");
+
+        assert_locked_invoice_validation_error(err);
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn updating_receipt_linked_purchase_cannot_override_item_qty_or_cost() {
         let Some(pool) = test_pool().await else {
             eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
@@ -3511,6 +4509,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invoice_summary_counts_allocation_backed_receipted_purchases_when_unlinked() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id, invoice_id) =
+            seed_purchase_with_receipt_and_state(&pool, "open")
+                .await
+                .expect("seed data");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let _allocation = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 2,
+            },
+        )
+        .await
+        .expect("allocation should be created");
+
+        sqlx::query(r#"UPDATE purchases SET receipt_id = NULL WHERE id = $1"#)
+            .bind(purchase_id)
+            .execute(&pool)
+            .await
+            .expect("should detach direct receipt link");
+
+        let summary = get_invoice_with_destination(&pool, invoice_id)
+            .await
+            .expect("invoice summary should load")
+            .expect("invoice should exist");
+
+        assert_eq!(summary.purchase_count, Some(1));
+        assert_eq!(summary.receipted_count, Some(1));
+
+        let summaries = get_invoices_with_destination(&pool)
+            .await
+            .expect("invoice summaries should load");
+
+        let listed = summaries
+            .iter()
+            .find(|inv| inv.id == invoice_id)
+            .expect("invoice should be present in list");
+
+        assert_eq!(listed.purchase_count, Some(1));
+        assert_eq!(listed.receipted_count, Some(1));
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn invoice_purchases_use_allocation_unit_cost_when_purchase_cost_is_zero() {
         let Some(pool) = test_pool().await else {
             eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
@@ -3566,6 +4633,615 @@ mod tests {
         assert_eq!(row.purchase_cost, Decimal::new(87999, 2));
         assert_eq!(row.total_cost, Some(Decimal::new(175998, 2)));
         assert_eq!(row.total_commission, Some(Decimal::new(2002, 2)));
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deleting_invoice_cleans_orphaned_invoice_only_purchase() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let before = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read before")
+            .expect("purchase exists before");
+        let invoice_id = before
+            .invoice_id
+            .expect("seed purchase should have invoice");
+
+        sqlx::query(r#"UPDATE purchases SET receipt_id = NULL WHERE id = $1"#)
+            .bind(purchase_id)
+            .execute(&pool)
+            .await
+            .expect("should detach receipt link");
+
+        let deleted = delete_invoice(&pool, invoice_id, Uuid::new_v4())
+            .await
+            .expect("delete invoice should succeed");
+        assert!(deleted, "invoice should be deleted");
+
+        let after = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read after delete");
+        assert!(
+            after.is_none(),
+            "Invoice-only purchase should be removed instead of becoming orphaned"
+        );
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_purchase_requires_invoice_or_receipt_link() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let err = create_purchase(
+            &pool,
+            CreatePurchase {
+                item_id,
+                invoice_id: None,
+                receipt_id: None,
+                quantity: 1,
+                purchase_cost: Decimal::new(5000, 2),
+                invoice_unit_price: None,
+                destination_id: Some(destination_id),
+                status: Some(DeliveryStatus::Pending),
+                delivery_date: None,
+                notes: Some("invalid standalone purchase".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect_err("purchase create should reject missing invoice+receipt links");
+
+        let msg = purchase_link_required_error_message(&err)
+            .expect("expected purchase-link-required protocol error");
+        assert!(
+            msg.to_lowercase().contains("at least one side"),
+            "expected purchase-link-required message, got: {msg}"
+        );
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn update_purchase_rejects_clearing_last_link() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let err = update_purchase(
+            &pool,
+            purchase_id,
+            UpdatePurchase {
+                item_id: None,
+                invoice_id: None,
+                clear_invoice: true,
+                receipt_id: None,
+                clear_receipt: true,
+                quantity: None,
+                purchase_cost: None,
+                invoice_unit_price: None,
+                clear_invoice_unit_price: false,
+                destination_id: None,
+                status: None,
+                delivery_date: None,
+                notes: Some("attempt to orphan purchase".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect_err("update should reject clearing both invoice and receipt links");
+
+        let msg = purchase_link_required_error_message(&err)
+            .expect("expected purchase-link-required protocol error");
+        assert!(
+            msg.to_lowercase().contains("at least one side"),
+            "expected purchase-link-required message, got: {msg}"
+        );
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn locked_invoice_requires_reopen_before_invoice_edits() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id, invoice_id) =
+            seed_purchase_with_receipt_and_state(&pool, "locked")
+                .await
+                .expect("seed locked data");
+
+        let err = update_invoice(
+            &pool,
+            invoice_id,
+            UpdateInvoice {
+                invoice_number: None,
+                order_number: None,
+                invoice_date: None,
+                subtotal: Some(Decimal::new(13000, 2)),
+                tax_rate: None,
+                reconciliation_state: None,
+                notes: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect_err("locked invoice should reject direct edits");
+        assert_locked_invoice_sql_error(&err);
+
+        let reopened = update_invoice(
+            &pool,
+            invoice_id,
+            UpdateInvoice {
+                invoice_number: None,
+                order_number: None,
+                invoice_date: None,
+                subtotal: None,
+                tax_rate: None,
+                reconciliation_state: Some("reopened".to_string()),
+                notes: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("locked invoice should reopen")
+        .expect("invoice should exist");
+
+        assert_eq!(reopened.reconciliation_state, "reopened");
+
+        let edited = update_invoice(
+            &pool,
+            invoice_id,
+            UpdateInvoice {
+                invoice_number: None,
+                order_number: None,
+                invoice_date: None,
+                subtotal: None,
+                tax_rate: None,
+                reconciliation_state: None,
+                notes: Some("edited after reopen".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("reopened invoice should allow edits")
+        .expect("invoice should exist");
+
+        assert_eq!(edited.notes.as_deref(), Some("edited after reopen"));
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn locked_invoice_blocks_purchase_create_update_status_and_delete() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id, invoice_id) =
+            seed_purchase_with_receipt_and_state(&pool, "locked")
+                .await
+                .expect("seed locked data");
+
+        let create_err = create_purchase(
+            &pool,
+            CreatePurchase {
+                item_id,
+                invoice_id: Some(invoice_id),
+                receipt_id: Some(receipt_id),
+                quantity: 1,
+                purchase_cost: Decimal::new(5000, 2),
+                invoice_unit_price: Some(Decimal::new(6000, 2)),
+                destination_id: Some(destination_id),
+                status: Some(DeliveryStatus::Pending),
+                delivery_date: None,
+                notes: Some("should fail".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect_err("create purchase on locked invoice should fail");
+        assert_locked_invoice_sql_error(&create_err);
+
+        let update_err = update_purchase(
+            &pool,
+            purchase_id,
+            UpdatePurchase {
+                item_id: None,
+                invoice_id: None,
+                clear_invoice: false,
+                receipt_id: None,
+                clear_receipt: false,
+                quantity: None,
+                purchase_cost: None,
+                invoice_unit_price: None,
+                clear_invoice_unit_price: false,
+                destination_id: None,
+                status: None,
+                delivery_date: None,
+                notes: Some("edit should fail".to_string()),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect_err("update purchase on locked invoice should fail");
+        assert_locked_invoice_sql_error(&update_err);
+
+        let status_err =
+            update_purchase_status(&pool, purchase_id, DeliveryStatus::Pending, Uuid::new_v4())
+                .await
+                .expect_err("status update on locked invoice should fail");
+        assert_locked_invoice_sql_error(&status_err);
+
+        let delete_err = delete_purchase(&pool, purchase_id, Uuid::new_v4())
+            .await
+            .expect_err("delete purchase on locked invoice should fail");
+        assert_locked_invoice_sql_error(&delete_err);
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reopened_invoice_allows_purchase_mutation_again() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id, invoice_id) =
+            seed_purchase_with_receipt_and_state(&pool, "locked")
+                .await
+                .expect("seed locked data");
+
+        let _ = update_invoice(
+            &pool,
+            invoice_id,
+            UpdateInvoice {
+                invoice_number: None,
+                order_number: None,
+                invoice_date: None,
+                subtotal: None,
+                tax_rate: None,
+                reconciliation_state: Some("reopened".to_string()),
+                notes: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("invoice should reopen")
+        .expect("invoice exists");
+
+        let updated =
+            update_purchase_status(&pool, purchase_id, DeliveryStatus::Pending, Uuid::new_v4())
+                .await
+                .expect("status update should succeed after reopen")
+                .expect("purchase exists");
+
+        assert_eq!(updated.status, DeliveryStatus::Pending);
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn locked_invoice_blocks_allocation_creation() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id, _invoice_id) =
+            seed_purchase_with_receipt_and_state(&pool, "locked")
+                .await
+                .expect("seed locked data");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let err = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 1,
+            },
+        )
+        .await
+        .expect_err("allocation create should fail on locked invoice");
+
+        assert_locked_invoice_validation_error(err);
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn locked_invoice_blocks_allocation_update_and_delete() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id, invoice_id) =
+            seed_purchase_with_receipt_and_state(&pool, "open")
+                .await
+                .expect("seed open data");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let allocation = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 1,
+            },
+        )
+        .await
+        .expect("allocation should be created");
+
+        let _ = update_invoice(
+            &pool,
+            invoice_id,
+            UpdateInvoice {
+                invoice_number: None,
+                order_number: None,
+                invoice_date: None,
+                subtotal: None,
+                tax_rate: None,
+                reconciliation_state: Some("locked".to_string()),
+                notes: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("invoice should lock")
+        .expect("invoice exists");
+
+        let update_err = update_purchase_allocation(
+            &pool,
+            purchase_id,
+            allocation.id,
+            UpdatePurchaseAllocation {
+                receipt_line_item_id: Some(line_item_id),
+                allocated_qty: Some(1),
+            },
+        )
+        .await
+        .expect_err("allocation update should fail on locked invoice");
+        assert_locked_invoice_validation_error(update_err);
+
+        let delete_err = delete_purchase_allocation(&pool, purchase_id, allocation.id)
+            .await
+            .expect_err("allocation delete should fail on locked invoice");
+        assert_locked_invoice_sql_error(&delete_err);
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn locked_invoice_blocks_receipt_and_line_item_mutations_via_allocation_link() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id, invoice_id) =
+            seed_purchase_with_receipt_and_state(&pool, "open")
+                .await
+                .expect("seed open data");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let _allocation = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 2,
+            },
+        )
+        .await
+        .expect("allocation should be created");
+
+        sqlx::query(r#"UPDATE purchases SET receipt_id = NULL WHERE id = $1"#)
+            .bind(purchase_id)
+            .execute(&pool)
+            .await
+            .expect("should detach direct receipt link");
+
+        let _ = update_invoice(
+            &pool,
+            invoice_id,
+            UpdateInvoice {
+                invoice_number: None,
+                order_number: None,
+                invoice_date: None,
+                subtotal: None,
+                tax_rate: None,
+                reconciliation_state: Some("locked".to_string()),
+                notes: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("invoice should lock")
+        .expect("invoice exists");
+
+        let receipt_update_err = update_receipt(
+            &pool,
+            receipt_id,
+            UpdateReceipt {
+                vendor_id: None,
+                receipt_number: Some(format!("LOCKED-{}", &receipt_id.to_string()[..8])),
+                receipt_date: None,
+                subtotal: None,
+                tax_amount: None,
+                tax_rate: None,
+                payment_method: None,
+                ingestion_metadata: None,
+                notes: None,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect_err("receipt update should fail when linked via allocation to locked invoice");
+        assert_locked_invoice_sql_error(&receipt_update_err);
+
+        let save_pdf_err = save_receipt_pdf(&pool, receipt_id, b"pdf", "receipt.pdf")
+            .await
+            .expect_err("receipt document update should fail on locked link");
+        assert_locked_invoice_sql_error(&save_pdf_err);
+
+        let receipt_delete_err = delete_receipt(&pool, receipt_id, Uuid::new_v4())
+            .await
+            .expect_err("receipt delete should fail when linked via allocation to locked invoice");
+        assert_locked_invoice_sql_error(&receipt_delete_err);
+
+        let line_create_err = create_receipt_line_item(
+            &pool,
+            receipt_id,
+            CreateReceiptLineItem {
+                item_id: Uuid::new_v4(),
+                quantity: 1,
+                unit_cost: Decimal::new(12345, 2),
+                notes: Some("should fail".to_string()),
+            },
+        )
+        .await
+        .expect_err("line item create should fail on locked-linked receipt");
+        assert_locked_invoice_validation_error(line_create_err);
+
+        let line_update_err = update_receipt_line_item(
+            &pool,
+            receipt_id,
+            line_item_id,
+            UpdateReceiptLineItem {
+                item_id: None,
+                quantity: None,
+                unit_cost: None,
+                notes: Some("should fail".to_string()),
+            },
+        )
+        .await
+        .expect_err("line item update should fail on locked-linked receipt");
+        assert_locked_invoice_validation_error(line_update_err);
+
+        let line_delete_err = delete_receipt_line_item(&pool, receipt_id, line_item_id)
+            .await
+            .expect_err("line item delete should fail on locked-linked receipt");
+        assert_locked_invoice_validation_error(line_delete_err);
 
         cleanup_seeded(
             &pool,

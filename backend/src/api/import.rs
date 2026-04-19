@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Multipart, State},
+    extract::{DefaultBodyLimit, Multipart, Query, State},
     http::StatusCode,
     routing::post,
     Json, Router,
@@ -20,6 +20,8 @@ use crate::{
 
 use super::AppState;
 
+const IMPORT_MULTIPART_MAX_BYTES: usize = 25 * 1024 * 1024;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/vendors", post(import_vendors))
@@ -31,6 +33,7 @@ pub fn router() -> Router<AppState> {
         .route("/invoice-pdf", post(parse_invoice_pdf))
         .route("/receipt-image", post(parse_receipt_image))
         .route("/invoice-pdf/commit", post(commit_invoice_pdf))
+        .layer(DefaultBodyLimit::max(IMPORT_MULTIPART_MAX_BYTES))
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,14 +189,8 @@ struct CsvReceiptRow {
     )]
     tax_amount: Option<String>,
 
-    #[serde(
-        alias = "payment_card_last4",
-        alias = "Payment Card Last 4",
-        alias = "card_last4",
-        alias = "last4",
-        default
-    )]
-    payment_card_last4: Option<String>,
+    #[serde(alias = "payment_method", alias = "Payment Method", default)]
+    payment_method: Option<String>,
 
     #[serde(alias = "notes", alias = "Notes", alias = "note", default)]
     notes: Option<String>,
@@ -230,7 +227,7 @@ struct ReceiptPreview {
     receipt_date: String,
     subtotal: String,
     tax_amount: Option<String>,
-    payment_card_last4: Option<String>,
+    payment_method: Option<String>,
     notes: Option<String>,
 }
 
@@ -264,23 +261,14 @@ fn parse_optional_decimal(
     }
 }
 
-fn normalize_optional_last4(value: Option<&str>) -> Result<Option<String>, String> {
-    let Some(raw) = value else {
-        return Ok(None);
-    };
+fn normalize_optional_payment_method(value: Option<&str>) -> Option<String> {
+    let raw = value?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(None);
+        None
+    } else {
+        Some(trimmed.to_string())
     }
-
-    if trimmed.len() != 4 || !trimmed.chars().all(|c| c.is_ascii_digit()) {
-        return Err(format!(
-            "Invalid payment_card_last4: {} (must be exactly 4 digits)",
-            raw
-        ));
-    }
-
-    Ok(Some(trimmed.to_string()))
 }
 
 fn normalize_import_alias_key(value: &str) -> String {
@@ -1121,18 +1109,8 @@ async fn preview_receipts(
                         }
                     };
 
-                let payment_card_last4 =
-                    match normalize_optional_last4(row.payment_card_last4.as_deref()) {
-                        Ok(v) => v,
-                        Err(message) => {
-                            error_rows.push(PreviewErrorRow {
-                                row: row_num,
-                                message,
-                                original_data: original_line,
-                            });
-                            continue;
-                        }
-                    };
+                let payment_method =
+                    normalize_optional_payment_method(row.payment_method.as_deref());
 
                 let receipt_number = row
                     .receipt_number
@@ -1178,7 +1156,7 @@ async fn preview_receipts(
                         receipt_date: receipt_date.to_string(),
                         subtotal: subtotal.to_string(),
                         tax_amount: tax_amount.map(|t| t.to_string()),
-                        payment_card_last4,
+                        payment_method,
                         notes: row
                             .notes
                             .as_ref()
@@ -1316,18 +1294,8 @@ async fn import_receipts(
                         }
                     };
 
-                let payment_card_last4 =
-                    match normalize_optional_last4(row.payment_card_last4.as_deref()) {
-                        Ok(v) => v,
-                        Err(message) => {
-                            errors.push(ImportError {
-                                row: row_num,
-                                message,
-                                original_data: original_line,
-                            });
-                            continue;
-                        }
-                    };
+                let payment_method =
+                    normalize_optional_payment_method(row.payment_method.as_deref());
 
                 let receipt_number = row
                     .receipt_number
@@ -1397,7 +1365,7 @@ async fn import_receipts(
                     subtotal,
                     tax_amount,
                     tax_rate: None,
-                    payment_card_last4,
+                    payment_method,
                     ingestion_metadata: Some(json!({
                         "source": "csv",
                         "auto_parsed": false,
@@ -1840,7 +1808,7 @@ pub struct ParsedReceipt {
     pub subtotal: Option<String>,
     pub tax: Option<String>,
     pub total: Option<String>,
-    pub card_last4: Option<String>,
+    pub payment_method: Option<String>,
     #[serde(default)]
     pub confidence_score: Option<f32>,
     #[serde(default)]
@@ -1862,6 +1830,85 @@ pub struct InvoicePdfCommitErrorResponse {
 
 fn parse_decimal_input(raw: &str) -> Result<Decimal, ()> {
     Decimal::from_str(&raw.replace(['$', ',', ' '], "")).map_err(|_| ())
+}
+
+fn map_receipt_multipart_error<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
+    let message = err.to_string();
+    let message_lower = message.to_ascii_lowercase();
+
+    if message_lower.contains("too large")
+        || message_lower.contains("size limit")
+        || message_lower.contains("length limit")
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Uploaded file is too large. Maximum allowed size is {} MB.",
+                IMPORT_MULTIPART_MAX_BYTES / (1024 * 1024)
+            ),
+        );
+    }
+
+    (
+        StatusCode::BAD_REQUEST,
+        "Invalid upload payload. Please upload one PDF, JPG, JPEG, PNG, or WEBP file."
+            .to_string(),
+    )
+}
+
+fn map_receipt_ocr_failure(status: StatusCode, body: &str) -> (StatusCode, String) {
+    let body_lower = body.to_ascii_lowercase();
+
+    if status == StatusCode::BAD_REQUEST {
+        return (
+            StatusCode::BAD_REQUEST,
+            "OCR could not read the uploaded file. Please upload a valid, non-empty PDF or image."
+                .to_string(),
+        );
+    }
+
+    if status == StatusCode::UNPROCESSABLE_ENTITY {
+        if body_lower.contains("paddleocr-vl is unavailable")
+            || body_lower.contains("paddleocrvl is not available")
+            || body_lower.contains("forced ocr mode 'vl' requested")
+        {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "PaddleOCR-VL is unavailable in this environment. Use OCR mode 'PaddleOCR' "
+                    .to_string()
+                    + "or keep 'Auto' to continue with PaddleOCR when VL is unavailable.",
+            );
+        }
+
+        if body_lower.contains("unable to decode image") {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "OCR could not decode this file. Try a clearer photo, a different image, or a PDF export."
+                    .to_string(),
+            );
+        }
+
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "OCR could not extract receipt data from this file. Please try another image or PDF."
+                .to_string(),
+        );
+    }
+
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Uploaded file is too large. Maximum allowed size is {} MB.",
+                IMPORT_MULTIPART_MAX_BYTES / (1024 * 1024)
+            ),
+        );
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        "Receipt OCR service returned an unexpected error. Please retry.".to_string(),
+    )
 }
 
 async fn parse_invoice_pdf(
@@ -2018,6 +2065,7 @@ async fn parse_invoice_pdf(
 async fn parse_receipt_image(
     State(state): State<AppState>,
     _user: AuthenticatedUser,
+    Query(query): Query<ParseReceiptImageQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<ParsedReceipt>, (StatusCode, String)> {
     let mut file_bytes: Option<Vec<u8>> = None;
@@ -2027,7 +2075,7 @@ async fn parse_receipt_image(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {e}")))?
+        .map_err(map_receipt_multipart_error)?
     {
         if field.name() == Some("file") {
             file_name = field.file_name().unwrap_or("receipt-upload").to_string();
@@ -2037,7 +2085,7 @@ async fn parse_receipt_image(
             let bytes = field
                 .bytes()
                 .await
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Read error: {e}")))?;
+                .map_err(map_receipt_multipart_error)?;
             file_bytes = Some(bytes.to_vec());
             break;
         }
@@ -2045,12 +2093,15 @@ async fn parse_receipt_image(
 
     let file_bytes = file_bytes.ok_or((
         StatusCode::BAD_REQUEST,
-        "No file field in upload".to_string(),
+        "No file was uploaded. Please select a PDF or image file.".to_string(),
     ))?;
 
     let ocr_service_url =
         std::env::var("OCR_SERVICE_URL").unwrap_or_else(|_| "http://localhost:8001".to_string());
-    let endpoint = format!("{}/parse-receipt", ocr_service_url.trim_end_matches('/'));
+    let mut endpoint = format!("{}/parse-receipt", ocr_service_url.trim_end_matches('/'));
+    if let Some(mode) = query.ocr_mode {
+        endpoint = format!("{}?mode={}", endpoint, mode.as_query_value());
+    }
 
     let client = reqwest::Client::new();
     let part = match reqwest::multipart::Part::bytes(file_bytes.clone())
@@ -2067,10 +2118,11 @@ async fn parse_receipt_image(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| {
+        .map_err(|_| {
             (
                 StatusCode::BAD_GATEWAY,
-                format!("Receipt OCR service is unavailable: {e}"),
+                "Receipt OCR service is unavailable right now. Please try again in a moment."
+                    .to_string(),
             )
         })?;
 
@@ -2079,17 +2131,14 @@ async fn parse_receipt_image(
         let body = response
             .text()
             .await
-            .unwrap_or_else(|_| "<unable to read OCR error body>".to_string());
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("Receipt OCR service failed ({status}): {body}"),
-        ));
+            .unwrap_or_default();
+        return Err(map_receipt_ocr_failure(status, &body));
     }
 
-    let mut parsed = response.json::<ParsedReceipt>().await.map_err(|e| {
+    let mut parsed = response.json::<ParsedReceipt>().await.map_err(|_| {
         (
             StatusCode::BAD_GATEWAY,
-            format!("Receipt OCR service returned invalid JSON: {e}"),
+            "Receipt OCR service returned an invalid response. Please retry.".to_string(),
         )
     })?;
 
@@ -2134,6 +2183,30 @@ async fn parse_receipt_image(
     }
 
     Ok(Json(parsed))
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum ReceiptOcrMode {
+    Auto,
+    Classic,
+    Vl,
+}
+
+impl ReceiptOcrMode {
+    fn as_query_value(self) -> &'static str {
+        match self {
+            ReceiptOcrMode::Auto => "auto",
+            ReceiptOcrMode::Classic => "classic",
+            ReceiptOcrMode::Vl => "vl",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ParseReceiptImageQuery {
+    #[serde(default)]
+    ocr_mode: Option<ReceiptOcrMode>,
 }
 
 async fn commit_invoice_pdf(
