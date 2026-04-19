@@ -1,0 +1,29 @@
+{
+  "source_file": "429657545369864156.pdf",
+  "content_type": "application/pdf",
+  "expected": {
+    "receipt_number": "429657545369864156",
+    "receipt_date": "2025-11-05",
+    "subtotal": "3016.00",
+    "tax": "392.08",
+    "total": "3408.08",
+    "payment_method": null,
+    "line_items_count": 2,
+    "line_items_expected": [
+      {
+        "description_contains": "steam deck 512",
+        "quantity": 2,
+        "unit_cost": "689.00",
+        "line_total": "1378.00"
+      },
+      {
+        "description_contains": "steam deck 1 tb oled",
+        "quantity": 2,
+        "unit_cost": "819.00",
+        "line_total": "1638.00"
+      }
+    ],
+    "raw_text_contains": ["steam support", "invoice", "subtotal"],
+    "warnings_contains": []
+  }
+}

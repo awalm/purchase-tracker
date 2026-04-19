@@ -1,0 +1,18 @@
+{
+  "source_file": "single_order.pdf",
+  "content_type": "application/pdf",
+  "expected": {
+    "receipt_number": "CA53AEQIOACCUI",
+    "receipt_date": "2025-11-14",
+    "subtotal": "89.97",
+    "tax": "11.70",
+    "total": "101.67",
+    "payment_method": null,
+    "line_items_count": 1,
+    "line_item_description_contains": "roku streaming stick",
+    "line_item_qty": 3,
+    "line_item_unit_cost": "29.99",
+    "raw_text_contains": ["amazon.ca", "invoice", "total payable"],
+    "warnings_contains": []
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "source_file": "zarif_prw_16_black.jpeg",
+  "content_type": "image/jpeg",
+  "expected": {
+    "receipt_number": "BB-S977-R57-T2119-20260325",
+    "receipt_date": "2026-03-25",
+    "subtotal": "1399.90",
+    "tax": "181.99",
+    "total": "1581.89",
+    "payment_method": "1006",
+    "line_items_count": 1,
+    "line_item_description_contains": "kndl",
+    "line_item_qty": 10,
+    "line_item_unit_cost": "139.99",
+    "raw_text_contains": ["best buy", "kndl", "total"],
+    "warnings_contains": []
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "source_file": "82955962638.pdf",
+  "content_type": "application/pdf",
+  "expected": {
+    "receipt_number": "6389863470710438287",
+    "receipt_date": "2025-11-13",
+    "subtotal": "879.99",
+    "tax": "114.40",
+    "total": "994.39",
+    "payment_method": null,
+    "line_items_count": 1,
+    "line_item_description_contains": "xbox series x",
+    "line_item_qty": 1,
+    "line_item_unit_cost": "879.99",
+    "raw_text_contains": ["microsoft"],
+    "warnings_contains": []
+  }
+}
