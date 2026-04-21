@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest"
-import { findDuplicateMappedImportItems } from "./receiptImportValidation"
+import {
+  findDuplicateMappedImportItems,
+  mergeMappedImportLines,
+} from "./receiptImportValidation"
 
 describe("findDuplicateMappedImportItems", () => {
   it("returns no duplicates when each mapped item is unique", () => {
@@ -43,6 +46,64 @@ describe("findDuplicateMappedImportItems", () => {
         itemId: "item-a",
         itemName: "Echo Dot",
         lineNumbers: [4, 5],
+      },
+    ])
+  })
+})
+
+describe("mergeMappedImportLines", () => {
+  it("merges env fee lines into mapped item unit cost while keeping base quantity", () => {
+    const merged = mergeMappedImportLines([
+      {
+        itemId: "item-ps5",
+        description: "PS5 SLIM DISC",
+        quantity: 2,
+        unitCost: "519.99",
+        notes: "PS5 SLIM DISC",
+      },
+      {
+        itemId: "item-ps5",
+        description: "Env Fee: Home AU&Rec",
+        quantity: 2,
+        unitCost: "3.75",
+        notes: "Env Fee: Home AU&Rec",
+      },
+    ])
+
+    expect(merged).toEqual([
+      {
+        itemId: "item-ps5",
+        quantity: 2,
+        unitCost: "523.74",
+        notes: "PS5 SLIM DISC | Env Fee: Home AU&Rec",
+      },
+    ])
+  })
+
+  it("sums quantity across non-fee lines mapped to the same item", () => {
+    const merged = mergeMappedImportLines([
+      {
+        itemId: "item-show",
+        description: "Echo Show 5 White",
+        quantity: 1,
+        unitCost: "69.99",
+        notes: "Echo Show 5 White",
+      },
+      {
+        itemId: "item-show",
+        description: "Echo Show 5 White",
+        quantity: 1,
+        unitCost: "69.99",
+        notes: "Echo Show 5 White",
+      },
+    ])
+
+    expect(merged).toEqual([
+      {
+        itemId: "item-show",
+        quantity: 2,
+        unitCost: "69.99",
+        notes: "Echo Show 5 White",
       },
     ])
   })
