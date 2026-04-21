@@ -10,9 +10,133 @@
     "total": "1240.72",
     "payment_method": null,
     "line_items_count": 11,
-    "line_item_description_contains": "amazon echo pop",
-    "line_item_qty": 2,
-    "line_item_unit_cost": "32.99",
+    "line_items_expected": [
+      {
+        "description_contains": "echo pop",
+        "quantity": 2,
+        "unit_cost": "32.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "echo spot",
+        "quantity": 2,
+        "unit_cost": "59.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "echo spot",
+        "quantity": 2,
+        "unit_cost": "59.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "echo dot",
+        "quantity": 2,
+        "unit_cost": "39.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "echo show 5",
+        "quantity": 2,
+        "unit_cost": "69.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "echo dot",
+        "quantity": 2,
+        "unit_cost": "39.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "echo dot kids",
+        "quantity": 2,
+        "unit_cost": "40.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "echo show 5",
+        "quantity": 2,
+        "unit_cost": "69.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "echo dot kids",
+        "quantity": 2,
+        "unit_cost": "40.99"
+      },
+      {
+        "description_contains": "echo dot",
+        "quantity": 2,
+        "unit_cost": "39.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "echo dot kids",
+        "quantity": 2,
+        "unit_cost": "40.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "1.96"
+          }
+        ]
+      }
+    ],
     "raw_text_contains": [
       "amazon.ca",
       "invoice",

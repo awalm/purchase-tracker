@@ -18,7 +18,7 @@
         "line_total": "1039.98"
       },
       {
-        "description_contains": "env fee: home",
+        "description_contains": "fee: home",
         "quantity": 2,
         "unit_cost": "3.75",
         "line_total": "7.50"

@@ -438,6 +438,15 @@ SELECT
 FROM destinations d;
 
 -- ============================================
+-- RECEIPT LINE ITEM PARENT/CHILD (for fees attached to products)
+-- ============================================
+ALTER TABLE receipt_line_items
+  ADD COLUMN IF NOT EXISTS parent_line_item_id UUID REFERENCES receipt_line_items(id) ON DELETE CASCADE;
+
+CREATE INDEX IF NOT EXISTS idx_receipt_line_items_parent
+  ON receipt_line_items(parent_line_item_id) WHERE parent_line_item_id IS NOT NULL;
+
+-- ============================================
 -- RECEIPT NUMBER UNIQUENESS
 -- ============================================
 -- Enforce unique receipt_number when existing data allows it.

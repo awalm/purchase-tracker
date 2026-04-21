@@ -1004,6 +1004,115 @@ def is_amazon_receipt(texts: list[str]) -> bool:
     return "amazon." in joined and "invoice" in joined
 
 
+def is_bestbuy_business(texts: list[str]) -> bool:
+    joined = " ".join(texts).lower()
+    return "best buy business hub" in joined or "bestbuyforbusiness" in joined
+
+
+def extract_bestbuy_business_line_items(
+    lines: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    texts = [l["text"].strip() for l in lines]
+
+    # Find the header row ending at "Quantity"
+    header_end = -1
+    for i, t in enumerate(texts):
+        if t.lower() == "quantity":
+            window = " ".join(texts[max(0, i - 5) : i + 1]).lower()
+            if "sku" in window and "price" in window:
+                header_end = i
+                break
+
+    if header_end < 0:
+        return []
+
+    # Find the footer (Product Total, GST, Subtotal, etc.)
+    footer_start = len(texts)
+    for i in range(header_end + 1, len(texts)):
+        low = texts[i].lower()
+        if any(
+            kw in low
+            for kw in (
+                "product total",
+                "gst / hst",
+                "shipping total",
+                "subtotal:",
+                "ehf:",
+                "remit to",
+            )
+        ):
+            footer_start = i
+            break
+
+    region = texts[header_end + 1 : footer_start]
+    region_lines = lines[header_end + 1 : footer_start]
+    if not region:
+        return []
+
+    # Find price+qty pairs: "$XX.XX" immediately followed by a small integer
+    pairs: list[tuple[int, int, str, int]] = []
+    for i, text in enumerate(region):
+        m = re.match(r"\$(\d+\.\d{2})$", text)
+        if m and i + 1 < len(region) and re.fullmatch(r"\d{1,3}", region[i + 1]):
+            pairs.append((i, i + 1, m.group(1), int(region[i + 1])))
+
+    if not pairs:
+        return []
+
+    # Identify structural indices (prices, quantities, SKU numbers)
+    structural: set[int] = set()
+    for price_i, qty_i, _, _ in pairs:
+        structural.add(price_i)
+        structural.add(qty_i)
+    for i, text in enumerate(region):
+        if re.fullmatch(r"\d{5,10}", text):
+            structural.add(i)
+
+    # Description lines = everything non-structural
+    desc_entries = [
+        (i, region[i])
+        for i in range(len(region))
+        if i not in structural and region[i].strip()
+    ]
+
+    # Assign each description line to its nearest price+qty pair,
+    # preferring items whose price appears AFTER the description line
+    # (since descriptions typically precede their price in reading order).
+    item_desc_indices: list[list[int]] = [[] for _ in pairs]
+    for desc_i, _ in desc_entries:
+        best = min(
+            range(len(pairs)),
+            key=lambda p: (
+                abs(desc_i - pairs[p][0]),
+                0 if desc_i < pairs[p][0] else 1,
+            ),
+        )
+        item_desc_indices[best].append(desc_i)
+
+    result: list[dict[str, Any]] = []
+    for pidx, (price_i, qty_i, price_val, qty_val) in enumerate(pairs):
+        desc_parts = [region[i] for i in sorted(item_desc_indices[pidx])]
+        desc = " ".join(desc_parts).strip() or "Unknown item"
+        qty = max(1, qty_val)
+
+        involved = sorted(item_desc_indices[pidx]) + [price_i, qty_i]
+        conf = min(
+            float(region_lines[i].get("confidence", 0.0)) for i in involved
+        )
+
+        result.append(
+            {
+                "description": desc,
+                "quantity": qty,
+                "unit_cost": price_val,
+                "line_total": f"{float(price_val) * qty:.2f}",
+                "confidence": conf,
+            }
+        )
+
+    return result
+
+
 def detect_fixture_used(
     texts: list[str],
     vendor_name: str | None,
@@ -1417,6 +1526,98 @@ def extract_amazon_line_items(lines: list[dict[str, Any]]) -> list[dict[str, Any
         seen_asins.add(asin_code)
         items.append(item)
 
+    # Attach EnvironmentalHandlingFee lines as sub_items of their nearest
+    # preceding ASIN-based product (the relationship is structurally clear).
+    for idx, line in enumerate(lines):
+        text = line["text"].strip()
+        if text.lower() != "environmentalhandlingfee":
+            continue
+        if idx + 1 >= len(lines):
+            continue
+        next_text = lines[idx + 1]["text"].strip()
+        fee_match = price_only_pattern.fullmatch(next_text)
+        if not fee_match:
+            continue
+        fee_value = _parse_money(fee_match.group(1))
+        if fee_value is None or fee_value <= 0:
+            continue
+        conf = min(
+            float(line.get("confidence", 0.0)),
+            float(lines[idx + 1].get("confidence", 0.0)),
+        )
+        fee_item = {
+            "description": "Environmental Handling Fee",
+            "quantity": 1,
+            "unit_cost": f"{fee_value:.2f}",
+            "line_total": f"{fee_value:.2f}",
+            "confidence": conf,
+        }
+        # Find nearest preceding product item by _source_index
+        parent = None
+        for candidate in reversed(items):
+            src = candidate.get("_source_index", 10**9)
+            if src < idx:
+                parent = candidate
+                break
+        if parent is not None:
+            parent.setdefault("sub_items", []).append(fee_item)
+        else:
+            fee_item["_source_index"] = idx
+            items.append(fee_item)
+
+    # Fallback: if no ASIN-based items found, scan for "qty $price" lines
+    # preceded by a description line.
+    if not items:
+        for idx, line in enumerate(lines):
+            text = line["text"].strip()
+            if not text:
+                continue
+            qty_price_match = qty_price_pattern.fullmatch(text)
+            if not qty_price_match:
+                continue
+            parsed_qty = int(qty_price_match.group(1))
+            parsed_unit = _parse_money(qty_price_match.group(2))
+            if parsed_unit is None or parsed_qty < 1 or parsed_qty > 500 or parsed_unit <= 0:
+                continue
+
+            # Look backwards for a description
+            desc: str | None = None
+            desc_idx: int | None = None
+            for cursor in range(idx - 1, max(-1, idx - 6), -1):
+                candidate_raw = lines[cursor]["text"].strip()
+                if not candidate_raw:
+                    continue
+                candidate_low = candidate_raw.lower()
+                if _is_summary_line(candidate_raw):
+                    continue
+                if any(token in candidate_low for token in blocked_description_tokens):
+                    continue
+                if qty_price_pattern.fullmatch(candidate_raw):
+                    continue
+                candidate_primary = candidate_raw.split(" / ", 1)[0].strip()
+                cleaned = _clean_description(candidate_primary)
+                if cleaned and not _looks_like_non_item_description(cleaned):
+                    desc = cleaned
+                    desc_idx = cursor
+                    break
+
+            if not desc:
+                continue
+
+            conf = min(
+                float(line.get("confidence", 0.0)),
+                float(lines[desc_idx].get("confidence", 0.0)) if desc_idx is not None else 0.0,
+            )
+            line_total = parsed_unit * parsed_qty
+            items.append({
+                "description": desc,
+                "quantity": parsed_qty,
+                "unit_cost": f"{parsed_unit:.2f}",
+                "line_total": f"{line_total:.2f}",
+                "confidence": conf,
+                "_source_index": desc_idx if desc_idx is not None else idx,
+            })
+
     items.sort(
         key=lambda x: (
             int(x.get("_source_index", 10**9)),
@@ -1612,6 +1813,11 @@ def extract_structured(lines: list[dict[str, Any]]) -> dict[str, Any]:
     line_items = extract_generic_line_items(lines)
     item_count_hint = extract_item_count_hint(texts)
 
+    if is_bestbuy_business(texts):
+        bbb_items = extract_bestbuy_business_line_items(lines)
+        if bbb_items:
+            line_items = bbb_items
+
     if subtotal is None and line_items:
         subtotal_value = 0.0
         for line_item in line_items:
@@ -1662,7 +1868,7 @@ def extract_structured(lines: list[dict[str, Any]]) -> dict[str, Any]:
 
         amazon_subtotal, amazon_tax, amazon_total = extract_amazon_totals(
             texts,
-            amazon_line_items,
+            line_items,
         )
         if amazon_subtotal is not None:
             subtotal = amazon_subtotal

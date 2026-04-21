@@ -409,13 +409,26 @@ export function BulkReceiptImportDialog({
       createdReceiptId = created.id
 
       const ctx = makeAutoMatchCtx(activeDraft.vendorId)
-      const { mergedLines, learnedMappings } = buildMergedLinesForSave(
+      const { mergedLines, subItemsForSave, learnedMappings } = buildMergedLinesForSave(
         parsed, getDraftOverrides(activeDraft), activeDraft.manualLines, ctx, itemNameById
       )
 
+      // Create parent lines first and build itemId → DB ID map
+      const parentIdByItemId = new Map<string, string>()
       for (const line of mergedLines) {
-        await receiptsApi.lineItems.create(createdReceiptId, {
+        const created = await receiptsApi.lineItems.create(createdReceiptId, {
           item_id: line.itemId, quantity: line.quantity, unit_cost: line.unitCost, notes: line.notes || undefined,
+        })
+        parentIdByItemId.set(line.itemId, created.id)
+      }
+
+      // Create sub_items with parent_line_item_id
+      for (const sub of subItemsForSave) {
+        const parentDbId = parentIdByItemId.get(sub.parentItemId)
+        if (!parentDbId) continue
+        await receiptsApi.lineItems.create(createdReceiptId, {
+          item_id: sub.itemId, quantity: sub.quantity, unit_cost: sub.unitCost,
+          notes: sub.notes || undefined, parent_line_item_id: parentDbId,
         })
       }
 

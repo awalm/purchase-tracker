@@ -581,7 +581,7 @@ export const receipts = {
   lineItems: {
     list: (id: string) =>
       request<ReceiptLineItem[]>(`/receipts/${id}/line-items`),
-    create: (id: string, data: { item_id: string; quantity: number; unit_cost: string; notes?: string }) =>
+    create: (id: string, data: { item_id: string; quantity: number; unit_cost: string; notes?: string; parent_line_item_id?: string }) =>
       request<ReceiptLineItem>(`/receipts/${id}/line-items`, {
         method: 'POST',
         body: JSON.stringify(data),
@@ -1038,6 +1038,7 @@ export interface ParsedReceiptLineItem {
   unit_cost: string | null;
   line_total: string | null;
   confidence: number | null;
+  sub_items?: ParsedReceiptLineItem[];
 }
 
 export interface ParsedReceipt {
@@ -1145,6 +1146,7 @@ export interface ReceiptLineItem {
   quantity: number;
   unit_cost: string;
   notes: string | null;
+  parent_line_item_id: string | null;
   allocated_qty: number;
   remaining_qty: number;
   created_at: string;

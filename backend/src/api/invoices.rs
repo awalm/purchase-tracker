@@ -1033,6 +1033,7 @@ async fn import_backup_zip_payload(
                     quantity: line_item.quantity,
                     unit_cost: line_item.unit_cost,
                     notes: line_item.notes.clone(),
+                    parent_line_item_id: None,
                 },
             )
             .await

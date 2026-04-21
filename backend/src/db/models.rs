@@ -107,6 +107,7 @@ pub struct ReceiptLineItem {
     pub quantity: i32,
     pub unit_cost: Decimal,
     pub notes: Option<String>,
+    pub parent_line_item_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -120,6 +121,7 @@ pub struct ReceiptLineItemWithItem {
     pub quantity: i32,
     pub unit_cost: Decimal,
     pub notes: Option<String>,
+    pub parent_line_item_id: Option<Uuid>,
     pub allocated_qty: i32,
     pub remaining_qty: i32,
     pub created_at: DateTime<Utc>,
@@ -480,6 +482,7 @@ pub struct CreateReceiptLineItem {
     pub quantity: i32,
     pub unit_cost: Decimal,
     pub notes: Option<String>,
+    pub parent_line_item_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

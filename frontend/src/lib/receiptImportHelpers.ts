@@ -384,8 +384,17 @@ export const computeMergePreview = (
 
 // ── Save pipeline: build merged lines + learned mappings ──
 
+export type SubItemForSave = {
+  parentItemId: string
+  itemId: string
+  quantity: number
+  unitCost: string
+  notes: string
+}
+
 export type BuildMergedLinesResult = {
   mergedLines: MergedMappedImportLine[]
+  subItemsForSave: SubItemForSave[]
   learnedMappings: Array<{ sourceText: string; itemId: string }>
 }
 
@@ -404,6 +413,15 @@ export const buildMergedLinesForSave = (
     notes: string
   }> = []
   const learnedMappings: Array<{ sourceText: string; itemId: string }> = []
+
+  // Collect sub_items keyed by their parent's itemId
+  const rawSubItemsByParentItemId = new Map<string, Array<{
+    itemId: string
+    description: string
+    quantity: number
+    unitCost: number
+    notes: string
+  }>>()
 
   for (let i = 0; i < parsedReceipt.line_items.length; i += 1) {
     if (isLineDeleted(overrides.deletedLineIndexes, i)) continue
@@ -442,6 +460,31 @@ export const buildMergedLinesForSave = (
     })
 
     learnedMappings.push({ sourceText: description, itemId })
+
+    // Process sub_items for this parent line
+    if (li.sub_items && li.sub_items.length > 0) {
+      for (const sub of li.sub_items) {
+        const subDesc = sub.description.trim()
+        if (!subDesc) continue
+        const subItemId = getAutoMatchedItemId(ctx, subDesc)
+        if (!subItemId) continue // Skip unmappable sub_items
+        const subQty = sub.quantity > 0 ? sub.quantity : 1
+        const subUnitCost = sub.unit_cost ? Number.parseFloat(sub.unit_cost) : NaN
+        if (!Number.isFinite(subUnitCost) || subUnitCost <= 0) continue
+
+        const existing = rawSubItemsByParentItemId.get(itemId) || []
+        existing.push({
+          itemId: subItemId,
+          description: subDesc,
+          quantity: subQty,
+          unitCost: subUnitCost,
+          notes: subDesc,
+        })
+        rawSubItemsByParentItemId.set(itemId, existing)
+
+        learnedMappings.push({ sourceText: subDesc, itemId: subItemId })
+      }
+    }
   }
 
   const parsedLineCountForNumbering = parsedReceipt.line_items.reduce(
@@ -479,5 +522,20 @@ export const buildMergedLinesForSave = (
     throw new Error("No valid mapped line items to create")
   }
 
-  return { mergedLines, learnedMappings }
+  // Merge sub_items per parent and build flat list for save
+  const subItemsForSave: SubItemForSave[] = []
+  for (const [parentItemId, rawSubs] of rawSubItemsByParentItemId) {
+    const mergedSubs = mergeMappedImportLines(rawSubs)
+    for (const sub of mergedSubs) {
+      subItemsForSave.push({
+        parentItemId,
+        itemId: sub.itemId,
+        quantity: sub.quantity,
+        unitCost: sub.unitCost,
+        notes: sub.notes,
+      })
+    }
+  }
+
+  return { mergedLines, subItemsForSave, learnedMappings }
 }

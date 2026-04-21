@@ -1966,6 +1966,7 @@ pub async fn get_receipt_line_items(
             rli.quantity,
             rli.unit_cost,
             rli.notes,
+            rli.parent_line_item_id,
             COALESCE(SUM(CASE WHEN p.id IS NOT NULL THEN pa.allocated_qty ELSE 0 END), 0)::INT AS "allocated_qty!: i32",
             (rli.quantity - COALESCE(SUM(CASE WHEN p.id IS NOT NULL THEN pa.allocated_qty ELSE 0 END), 0))::INT AS "remaining_qty!: i32",
             rli.created_at,
@@ -1977,8 +1978,8 @@ pub async fn get_receipt_line_items(
          AND pa.receipt_id = rli.receipt_id
         LEFT JOIN purchases p ON p.id = pa.purchase_id
         WHERE rli.receipt_id = $1
-        GROUP BY rli.id, rli.receipt_id, rli.item_id, i.name, rli.quantity, rli.unit_cost, rli.notes, rli.created_at, rli.updated_at
-        ORDER BY i.name"#,
+        GROUP BY rli.id, rli.receipt_id, rli.item_id, i.name, rli.quantity, rli.unit_cost, rli.notes, rli.parent_line_item_id, rli.created_at, rli.updated_at
+        ORDER BY rli.parent_line_item_id NULLS FIRST, i.name"#,
         receipt_id
     )
     .fetch_all(pool)
@@ -2005,14 +2006,15 @@ pub async fn create_receipt_line_item(
 
     let created = sqlx::query_as!(
         ReceiptLineItem,
-        r#"INSERT INTO receipt_line_items (receipt_id, item_id, quantity, unit_cost, notes)
-           VALUES ($1, $2, $3, $4, $5)
-           RETURNING id, receipt_id, item_id, quantity, unit_cost, notes, created_at, updated_at"#,
+        r#"INSERT INTO receipt_line_items (receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id, receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id, created_at, updated_at"#,
         receipt_id,
         data.item_id,
         data.quantity,
         data.unit_cost,
         data.notes,
+        data.parent_line_item_id,
     )
     .fetch_one(pool)
     .await
@@ -2051,7 +2053,7 @@ pub async fn update_receipt_line_item(
 
     let current = sqlx::query_as!(
         ReceiptLineItem,
-        r#"SELECT id, receipt_id, item_id, quantity, unit_cost, notes, created_at, updated_at
+        r#"SELECT id, receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id, created_at, updated_at
            FROM receipt_line_items
            WHERE id = $1 AND receipt_id = $2"#,
         line_item_id,
@@ -2097,7 +2099,7 @@ pub async fn update_receipt_line_item(
                unit_cost = $5,
                notes = $6
            WHERE id = $1 AND receipt_id = $2
-           RETURNING id, receipt_id, item_id, quantity, unit_cost, notes, created_at, updated_at"#,
+           RETURNING id, receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id, created_at, updated_at"#,
         line_item_id,
         receipt_id,
         next_item_id,

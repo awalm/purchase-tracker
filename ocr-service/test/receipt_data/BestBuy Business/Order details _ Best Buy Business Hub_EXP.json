@@ -1,0 +1,33 @@
+{
+  "source_file": "Order details _ Best Buy Business Hub.pdf",
+  "content_type": "application/pdf",
+  "expected": {
+    "vendor_name": "Best Buy",
+    "receipt_number": "182961",
+    "receipt_date": "2025-11-19",
+    "subtotal": "239.94",
+    "tax": "31.19",
+    "total": "271.13",
+    "payment_method": null,
+    "line_items_count": 3,
+    "line_items_expected": [
+      {
+        "description_contains": "echo dot",
+        "quantity": 2,
+        "unit_cost": "39.99"
+      },
+      {
+        "description_contains": "echo dot",
+        "quantity": 2,
+        "unit_cost": "39.99"
+      },
+      {
+        "description_contains": "echo dot",
+        "quantity": 2,
+        "unit_cost": "39.99"
+      }
+    ],
+    "raw_text_contains": ["best buy", "invoice", "total"],
+    "warnings_contains": []
+  }
+}

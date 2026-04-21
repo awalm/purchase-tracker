@@ -131,6 +131,27 @@ def _line_matches_expected(line: dict, expected_line: dict) -> bool:
     return True
 
 
+def _check_sub_items(parent_line: dict, expected_sub_items: list[dict], fixture_name: str) -> None:
+    actual_subs = parent_line.get("sub_items", [])
+    assert len(actual_subs) == len(expected_sub_items), (
+        f"Expected {len(expected_sub_items)} sub_items for "
+        f"'{parent_line['description']}' in fixture {fixture_name}, "
+        f"got {len(actual_subs)}: {actual_subs}"
+    )
+    unmatched = set(range(len(actual_subs)))
+    for exp_sub in expected_sub_items:
+        matched = next(
+            (i for i in sorted(unmatched) if _line_matches_expected(actual_subs[i], exp_sub)),
+            None,
+        )
+        assert matched is not None, (
+            f"Missing sub_item match for '{exp_sub['description_contains']}' "
+            f"under '{parent_line['description']}' in fixture {fixture_name}. "
+            f"Actual sub_items: {actual_subs}"
+        )
+        unmatched.remove(matched)
+
+
 @pytest.mark.parametrize("fixture", FIXTURES, ids=[fixture["name"] for fixture in FIXTURES])
 def test_receipt_fixture_extracts_expected_fields(fixture: dict) -> None:
     sample_file = fixture["file"]
@@ -204,6 +225,13 @@ def test_receipt_fixture_extracts_expected_fields(fixture: dict) -> None:
                 f"and unit_cost={expected_line['unit_cost']}. Parsed lines: {parsed_lines}"
             )
             unmatched_parsed_indices.remove(matched_index)
+
+            if "sub_items_expected" in expected_line:
+                _check_sub_items(
+                    parsed_lines[matched_index],
+                    expected_line["sub_items_expected"],
+                    fixture["name"],
+                )
 
         unexpected_lines = [parsed_lines[i] for i in sorted(unmatched_parsed_indices)]
         assert not unexpected_lines, (

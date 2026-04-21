@@ -775,34 +775,80 @@ export default function ReceiptDetailPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {receiptLineItems.map((line) => (
-                  <TableRow key={line.id}>
-                    <TableCell className="font-medium">{line.item_name}</TableCell>
-                    <TableCell className="text-right">{line.quantity}</TableCell>
-                    <TableCell className="text-right">{line.allocated_qty}</TableCell>
-                    <TableCell className={`text-right ${line.remaining_qty < 0 ? "text-red-600" : ""}`}>{line.remaining_qty}</TableCell>
-                    <TableCell className="text-right">{formatCurrency(line.unit_cost)}</TableCell>
-                    <TableCell className="text-right">{formatCurrency(Number(line.unit_cost) * line.quantity)}</TableCell>
-                    <TableCell className="text-muted-foreground">{line.notes || "-"}</TableCell>
-                    <TableCell>
-                      <div className="flex gap-1">
-                        <Button size="icon" variant="ghost" onClick={() => handleEditLineItem(line)}>
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="text-red-600"
-                          onClick={() => handleDeleteLineItem(line)}
-                          disabled={line.allocated_qty > 0}
-                          title={line.allocated_qty > 0 ? "Cannot delete while allocated" : "Delete"}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {(() => {
+                  const parentLines = receiptLineItems.filter((l) => !l.parent_line_item_id)
+                  const childrenByParent = new Map<string, typeof receiptLineItems>()
+                  for (const line of receiptLineItems) {
+                    if (line.parent_line_item_id) {
+                      const siblings = childrenByParent.get(line.parent_line_item_id) || []
+                      siblings.push(line)
+                      childrenByParent.set(line.parent_line_item_id, siblings)
+                    }
+                  }
+                  const rows: React.ReactNode[] = []
+                  for (const line of parentLines) {
+                    rows.push(
+                      <TableRow key={line.id}>
+                        <TableCell className="font-medium">{line.item_name}</TableCell>
+                        <TableCell className="text-right">{line.quantity}</TableCell>
+                        <TableCell className="text-right">{line.allocated_qty}</TableCell>
+                        <TableCell className={`text-right ${line.remaining_qty < 0 ? "text-red-600" : ""}`}>{line.remaining_qty}</TableCell>
+                        <TableCell className="text-right">{formatCurrency(line.unit_cost)}</TableCell>
+                        <TableCell className="text-right">{formatCurrency(Number(line.unit_cost) * line.quantity)}</TableCell>
+                        <TableCell className="text-muted-foreground">{line.notes || "-"}</TableCell>
+                        <TableCell>
+                          <div className="flex gap-1">
+                            <Button size="icon" variant="ghost" onClick={() => handleEditLineItem(line)}>
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="text-red-600"
+                              onClick={() => handleDeleteLineItem(line)}
+                              disabled={line.allocated_qty > 0}
+                              title={line.allocated_qty > 0 ? "Cannot delete while allocated" : "Delete"}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    )
+                    const children = childrenByParent.get(line.id) || []
+                    for (const child of children) {
+                      rows.push(
+                        <TableRow key={child.id} className="bg-muted/30">
+                          <TableCell className="pl-8 text-muted-foreground text-sm">↳ {child.item_name}</TableCell>
+                          <TableCell className="text-right text-sm">{child.quantity}</TableCell>
+                          <TableCell className="text-right text-sm">{child.allocated_qty}</TableCell>
+                          <TableCell className={`text-right text-sm ${child.remaining_qty < 0 ? "text-red-600" : ""}`}>{child.remaining_qty}</TableCell>
+                          <TableCell className="text-right text-sm">{formatCurrency(child.unit_cost)}</TableCell>
+                          <TableCell className="text-right text-sm">{formatCurrency(Number(child.unit_cost) * child.quantity)}</TableCell>
+                          <TableCell className="text-muted-foreground text-sm">{child.notes || "-"}</TableCell>
+                          <TableCell>
+                            <div className="flex gap-1">
+                              <Button size="icon" variant="ghost" onClick={() => handleEditLineItem(child)}>
+                                <Pencil className="h-4 w-4" />
+                              </Button>
+                              <Button
+                                size="icon"
+                                variant="ghost"
+                                className="text-red-600"
+                                onClick={() => handleDeleteLineItem(child)}
+                                disabled={child.allocated_qty > 0}
+                                title={child.allocated_qty > 0 ? "Cannot delete while allocated" : "Delete"}
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </Button>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      )
+                    }
+                  }
+                  return rows
+                })()}
                 {receiptLineItems.length === 0 && (
                   <EmptyTableRow colSpan={8} message="No receipt lines yet" />
                 )}
