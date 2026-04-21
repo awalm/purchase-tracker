@@ -42,7 +42,7 @@ def _vl_result() -> dict:
     }
 
 
-def test_orchestrator_routes_to_vl_on_low_confidence(monkeypatch) -> None:
+def test_orchestrator_routes_to_vl_on_low_confidence_classic(monkeypatch) -> None:
     monkeypatch.setenv("OCR_LOW_CONFIDENCE_THRESHOLD", "8.0")
     monkeypatch.setenv("OCR_VL_ENABLED", "1")
     monkeypatch.delenv("OCR_VL_STRICT", raising=False)
@@ -52,12 +52,12 @@ def test_orchestrator_routes_to_vl_on_low_confidence(monkeypatch) -> None:
         "parse_classic_with_score",
         lambda _: (deepcopy(_classic_result()), 2.0),
     )
-    monkeypatch.setattr(orchestrator, "check_vl_engine_available", lambda: (True, None))
     monkeypatch.setattr(
         orchestrator,
         "parse_vl_with_score",
         lambda _: (deepcopy(_vl_result()), 9.5),
     )
+    monkeypatch.setattr(orchestrator, "check_vl_engine_available", lambda: (True, None))
 
     parsed = orchestrator.parse_receipt_path("dummy-path.pdf")
 
@@ -112,6 +112,20 @@ def test_forced_classic_mode_skips_vl(monkeypatch) -> None:
     assert any("Final engine: PaddleOCR." in w for w in parsed["warnings"])
 
 
+def test_forced_classic_mode_failure_does_not_retry_vl(monkeypatch) -> None:
+    def _raise_classic(_: str) -> tuple[dict, float]:
+        raise RuntimeError("classic failed")
+
+    def _raise_if_vl_called(_: str) -> tuple[dict, float]:
+        raise AssertionError("VL parser must not run when forced classic mode fails")
+
+    monkeypatch.setattr(orchestrator, "parse_classic_with_score", _raise_classic)
+    monkeypatch.setattr(orchestrator, "parse_vl_with_score", _raise_if_vl_called)
+
+    with pytest.raises(RuntimeError, match="classic failed"):
+        orchestrator.parse_receipt_path_with_mode("dummy-path.pdf", "classic")
+
+
 def test_forced_vl_mode_skips_classic(monkeypatch) -> None:
     def _raise_if_called(_: str) -> tuple[dict, float]:
         raise AssertionError("Classic parser should not run in forced VL mode")
@@ -130,6 +144,21 @@ def test_forced_vl_mode_skips_classic(monkeypatch) -> None:
     assert parsed["confidence_score"] == 9.0
     assert any("Forced OCR mode: PaddleOCR-VL." in w for w in parsed["warnings"])
     assert any("Final engine: PaddleOCR-VL." in w for w in parsed["warnings"])
+
+
+def test_forced_vl_mode_failure_does_not_retry_classic(monkeypatch) -> None:
+    def _raise_if_classic_called(_: str) -> tuple[dict, float]:
+        raise AssertionError("Classic parser must not run when forced VL mode fails")
+
+    def _raise_vl(_: str) -> tuple[dict, float]:
+        raise RuntimeError("vl failed")
+
+    monkeypatch.setattr(orchestrator, "parse_classic_with_score", _raise_if_classic_called)
+    monkeypatch.setattr(orchestrator, "check_vl_engine_available", lambda: (True, None))
+    monkeypatch.setattr(orchestrator, "parse_vl_with_score", _raise_vl)
+
+    with pytest.raises(RuntimeError, match="vl failed"):
+        orchestrator.parse_receipt_path_with_mode("dummy-path.pdf", "vl")
 
 
 def test_orchestrator_uses_classic_when_vl_unavailable(monkeypatch) -> None:

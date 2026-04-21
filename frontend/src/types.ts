@@ -146,6 +146,7 @@ export interface PurchaseEconomics {
   receipt_id: string | null;
   receipt_number: string | null;
   invoice_number: string | null;
+  allow_receipt_date_override: boolean;
   notes: string | null;
 }
 

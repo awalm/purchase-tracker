@@ -1,0 +1,24 @@
+{
+  "source_file": "CA53CZPZMACCUI.pdf",
+  "content_type": "application/pdf",
+  "expected": {
+    "vendor_name": "Amazon",
+    "receipt_number": "CA53CZPZMACCUI",
+    "receipt_date": "2025-11-19",
+    "subtotal": "1098.04",
+    "tax": "142.68",
+    "total": "1240.72",
+    "payment_method": null,
+    "line_items_count": 11,
+    "line_item_description_contains": "amazon echo pop",
+    "line_item_qty": 2,
+    "line_item_unit_cost": "32.99",
+    "raw_text_contains": [
+      "amazon.ca",
+      "invoice",
+      "total payable",
+      "ca53czpzmaccui"
+    ],
+    "warnings_contains": []
+  }
+}

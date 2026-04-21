@@ -10,12 +10,18 @@ import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from paddleocr import PaddleOCR
 
-from ocr_service_common import env_bool, env_float, extract_structured, score_structured
+from ocr_service_common import env_bool, env_float, env_int, extract_structured, score_structured
 
 
 app = FastAPI(title="bg-tracker-receipt-ocr-classic")
 
 _classic_ocr: PaddleOCR | None = None
+
+
+@app.on_event("startup")
+def _warm_classic_ocr_on_startup() -> None:
+    if env_bool("OCR_CLASSIC_PRELOAD_ON_STARTUP", True):
+        get_classic_ocr()
 
 
 def get_classic_ocr() -> PaddleOCR:
@@ -216,17 +222,44 @@ def _enhance_for_ocr(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
 
 
+def _to_grayscale_bgr(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def _downscale_for_ocr(image: np.ndarray) -> np.ndarray:
+    max_side = env_int("OCR_CLASSIC_MAX_IMAGE_SIDE", 2200, 512)
+    height, width = image.shape[:2]
+    current_max_side = max(height, width)
+    if current_max_side <= max_side:
+        return image
+
+    scale = max_side / float(current_max_side)
+    resized = cv2.resize(
+        image,
+        (max(1, int(width * scale)), max(1, int(height * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+    return resized
+
+
 def _build_image_candidates(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
     base = _auto_crop_document(image)
+    base = _downscale_for_ocr(base)
     base = _deskew(base)
+    grayscale = _to_grayscale_bgr(base)
     enhanced = _enhance_for_ocr(base)
 
     variants: list[tuple[str, np.ndarray]] = [
-        ("base", base),
+        ("grayscale", grayscale),
         ("enhanced", enhanced),
-        ("rot90", cv2.rotate(base, cv2.ROTATE_90_CLOCKWISE)),
-        ("rot270", cv2.rotate(base, cv2.ROTATE_90_COUNTERCLOCKWISE)),
     ]
+
+    if env_bool("OCR_CLASSIC_ROTATION_FALLBACK_ENABLED", True):
+        variants.extend([
+            ("rot90", cv2.rotate(grayscale, cv2.ROTATE_90_CLOCKWISE)),
+            ("rot270", cv2.rotate(grayscale, cv2.ROTATE_90_COUNTERCLOCKWISE)),
+        ])
 
     deduped: list[tuple[str, np.ndarray]] = []
     seen_shapes: set[tuple[str, int, int]] = set()
@@ -251,12 +284,56 @@ def _score_lines(lines: list[dict[str, Any]]) -> float:
     return len(lines) * avg_conf + keyword_bonus
 
 
+def _has_receipt_signals(lines: list[dict[str, Any]]) -> bool:
+    if not lines:
+        return False
+
+    min_lines = env_int("OCR_CLASSIC_MIN_LINES_BEFORE_ENHANCED_SKIP", 8, 1)
+    if len(lines) < min_lines:
+        return False
+
+    text = " ".join(line["text"].lower() for line in lines)
+    return any(keyword in text for keyword in ("total", "subtotal", "tax", "amount due"))
+
+
+def _should_skip_rotation_fallback(lines: list[dict[str, Any]]) -> bool:
+    min_lines = env_int("OCR_CLASSIC_MIN_LINES_BEFORE_ROTATION", 8, 1)
+    if len(lines) < min_lines:
+        return False
+
+    text = " ".join(line["text"].lower() for line in lines)
+    return any(keyword in text for keyword in ("total", "subtotal", "tax", "amount due"))
+
+
 def _ocr_best_from_candidates(candidates: list[tuple[str, np.ndarray]]) -> list[dict[str, Any]]:
     ocr = get_classic_ocr()
     best_lines: list[dict[str, Any]] = []
     best_score = -1.0
 
-    for _, image in candidates:
+    candidate_map = {name: image for name, image in candidates}
+
+    primary_name = "grayscale" if "grayscale" in candidate_map else next(iter(candidate_map), None)
+    if primary_name is not None:
+        lines = _run_classic_ocr(ocr, candidate_map[primary_name])
+        score = _score_lines(lines)
+        if score > best_score:
+            best_score = score
+            best_lines = lines
+
+    enhanced_enabled = env_bool("OCR_CLASSIC_ENHANCED_FALLBACK_ENABLED", True)
+    if enhanced_enabled and "enhanced" in candidate_map and not _has_receipt_signals(best_lines):
+        enhanced_lines = _run_classic_ocr(ocr, candidate_map["enhanced"])
+        enhanced_score = _score_lines(enhanced_lines)
+        if enhanced_score > best_score:
+            best_score = enhanced_score
+            best_lines = enhanced_lines
+
+    if best_lines and _should_skip_rotation_fallback(best_lines):
+        return best_lines
+
+    for name, image in candidates:
+        if not name.startswith("rot"):
+            continue
         lines = _run_classic_ocr(ocr, image)
         score = _score_lines(lines)
         if score > best_score:
@@ -302,31 +379,12 @@ def parse_receipt_path_with_score(path: str | Path) -> tuple[dict[str, Any], flo
         raise ValueError("Unable to decode image")
 
     candidates = _build_image_candidates(image)
-
-    best_structured: dict[str, Any] | None = None
-    best_score = -1.0
-    best_lines: list[dict[str, Any]] = []
-
-    for _, candidate in candidates:
-        lines = _run_classic_ocr(get_classic_ocr(), candidate)
-        if not lines:
-            continue
-
-        structured = extract_structured(lines)
-        score = score_structured(structured)
-        if score > best_score:
-            best_score = score
-            best_structured = structured
-            best_lines = lines
-
-    if best_structured is None and not best_lines:
+    best_lines = _ocr_best_from_candidates(candidates)
+    if not best_lines:
         raise ValueError("No text detected in receipt image")
 
-    if best_structured is not None:
-        return best_structured, best_score
-
-    fallback_structured = extract_structured(best_lines)
-    return fallback_structured, score_structured(fallback_structured)
+    structured = extract_structured(best_lines)
+    return structured, score_structured(structured)
 
 
 def parse_receipt_path(path: str | Path) -> dict[str, Any]:

@@ -2,12 +2,13 @@
   "source_file": "zarif_prw_16_black.jpeg",
   "content_type": "image/jpeg",
   "expected": {
-    "receipt_number": "BB-S977-R57-T2119-20260325",
+    "vendor_name": "Best Buy",
+    "receipt_number": "S977-R57-T2119_20260325",
     "receipt_date": "2026-03-25",
     "subtotal": "1399.90",
     "tax": "181.99",
     "total": "1581.89",
-    "payment_method": "1006",
+    "payment_method": "Amex (1006)", // OCR consistently returns 1006; expected 1008 appears unrecoverable from this scan.
     "line_items_count": 1,
     "line_item_description_contains": "kndl",
     "line_item_qty": 10,

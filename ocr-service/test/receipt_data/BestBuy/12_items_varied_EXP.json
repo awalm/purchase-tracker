@@ -1,0 +1,60 @@
+{
+  "source_file": "12_items_varied.jpg",
+  "content_type": "image/jpeg",
+  "expected": {
+    "vendor_name": "Best Buy",
+    "receipt_number": "S965-R1-T5381_20251117",
+    "receipt_date": "2025-11-17",
+    "subtotal": "515.88",
+    "tax": "67.06",
+    "total": "582.94",
+    "payment_method": null,
+    "line_items_count": 7,
+    "line_items_expected": [
+      {
+        "description_contains": "echo show5 3rdgen ch",
+        "quantity": 1,
+        "unit_cost": "69.99",
+        "line_total": "69.99"
+      },
+      {
+        "description_contains": "echo show5 3rdgen gw",
+        "quantity": 1,
+        "unit_cost": "69.99",
+        "line_total": "69.99"
+      },
+      {
+        "description_contains": "echo pop glacier wh",
+        "quantity": 2,
+        "unit_cost": "32.99",
+        "line_total": "65.98"
+      },
+      {
+        "description_contains": "echo dot 5th kids fd",
+        "quantity": 2,
+        "unit_cost": "40.99",
+        "line_total": "81.98"
+      },
+      {
+        "description_contains": "echo pop charcoal",
+        "quantity": 2,
+        "unit_cost": "32.99",
+        "line_total": "65.98"
+      },
+      {
+        "description_contains": "echo pop 5th kid owl",
+        "quantity": 2,
+        "unit_cost": "40.99",
+        "line_total": "81.98"
+      },
+      {
+        "description_contains": "echo dot 5th char",
+        "quantity": 2,
+        "unit_cost": "39.99",
+        "line_total": "79.98"
+      }
+    ],
+    "raw_text_contains": ["sale", "subtotal", "total", "echo"],
+    "warnings_contains": []
+  }
+}

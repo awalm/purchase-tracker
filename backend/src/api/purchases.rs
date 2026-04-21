@@ -173,8 +173,15 @@ async fn auto_allocate(
     State(state): State<AppState>,
     _user: AuthenticatedUser,
     Path(id): Path<Uuid>,
+    payload: Option<Json<AutoAllocatePurchaseRequest>>,
 ) -> Result<Json<AutoAllocatePurchaseResult>, (StatusCode, String)> {
-    let result = queries::auto_allocate_purchase(&state.pool, id)
+    let request = payload.map(|Json(data)| data).unwrap_or_default();
+
+    let result = queries::auto_allocate_purchase(
+        &state.pool,
+        id,
+        request.allow_receipt_date_override,
+    )
         .await
         .map_err(map_allocation_error)?;
     Ok(Json(result))

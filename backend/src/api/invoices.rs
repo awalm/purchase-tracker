@@ -1135,6 +1135,7 @@ async fn import_backup_zip_payload(
                 CreatePurchaseAllocation {
                     receipt_line_item_id: restored_line_item_id,
                     allocated_qty: allocation.allocated_qty,
+                    allow_receipt_date_override: false,
                 },
             )
             .await

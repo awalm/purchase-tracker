@@ -23,6 +23,7 @@ export interface ReceiptIngestionMetadata {
   auto_parsed?: boolean;
   parse_engine?: string;
   parse_version?: string;
+  fixture_used?: string;
   confidence_score?: number;
   raw_vendor_name?: string;
   warnings?: string[];
@@ -268,6 +269,7 @@ export const items = {
       receipt_id: string | null;
       receipt_number: string | null;
       invoice_number: string | null;
+      allow_receipt_date_override: boolean;
       notes: string | null;
     }[]>(`/items/${id}/purchases`),
 };
@@ -343,6 +345,7 @@ export const invoices = {
       receipt_id: string | null;
       receipt_number: string | null;
       invoice_number: string | null;
+      allow_receipt_date_override: boolean;
       notes: string | null;
     }[]>(`/invoices/${id}/purchases`),
   create: (data: {
@@ -572,6 +575,7 @@ export const receipts = {
       receipt_id: string | null;
       receipt_number: string | null;
       invoice_number: string | null;
+      allow_receipt_date_override: boolean;
       notes: string | null;
     }[]>(`/receipts/${id}/purchases`),
   lineItems: {
@@ -678,6 +682,7 @@ export const purchases = {
       receipt_id: string | null;
       receipt_number: string | null;
       invoice_number: string | null;
+      allow_receipt_date_override: boolean;
       notes: string | null;
     }[]>(`/purchases/economics${query ? `?${query}` : ''}`);
   },
@@ -706,7 +711,7 @@ export const purchases = {
   allocations: {
     list: (purchaseId: string) =>
       request<PurchaseAllocation[]>(`/purchases/${purchaseId}/allocations`),
-    create: (purchaseId: string, data: { receipt_line_item_id: string; allocated_qty: number }) =>
+    create: (purchaseId: string, data: { receipt_line_item_id: string; allocated_qty: number; allow_receipt_date_override?: boolean }) =>
       request<PurchaseAllocation>(`/purchases/${purchaseId}/allocations`, {
         method: 'POST',
         body: JSON.stringify(data),
@@ -714,7 +719,7 @@ export const purchases = {
     update: (
       purchaseId: string,
       allocationId: string,
-      data: { receipt_line_item_id?: string; allocated_qty?: number }
+      data: { receipt_line_item_id?: string; allocated_qty?: number; allow_receipt_date_override?: boolean }
     ) =>
       request<PurchaseAllocation>(`/purchases/${purchaseId}/allocations/${allocationId}`, {
         method: 'PUT',
@@ -724,9 +729,10 @@ export const purchases = {
       request<void>(`/purchases/${purchaseId}/allocations/${allocationId}`, {
         method: 'DELETE',
       }),
-    auto: (purchaseId: string) =>
+    auto: (purchaseId: string, data?: { allow_receipt_date_override?: boolean }) =>
       request<AutoAllocatePurchaseResult>(`/purchases/${purchaseId}/allocations/auto`, {
         method: 'POST',
+        body: JSON.stringify(data ?? {}),
       }),
   },
 };
@@ -1037,6 +1043,7 @@ export interface ParsedReceiptLineItem {
 export interface ParsedReceipt {
   vendor_name: string | null;
   suggested_vendor_id: string | null;
+  fixture_used?: string | null;
   receipt_number: string | null;
   receipt_date: string | null;
   subtotal: string | null;
@@ -1127,6 +1134,7 @@ export interface AutoAllocatePurchaseResult {
   allocations_created: number;
   allocations_updated: number;
   receipts_touched: number;
+  warning: string | null;
 }
 
 export interface ReceiptLineItem {

@@ -242,6 +242,7 @@ pub struct PurchaseEconomics {
     pub receipt_id: Option<Uuid>,
     pub receipt_number: Option<String>,
     pub invoice_number: Option<String>,
+    pub allow_receipt_date_override: bool,
     pub notes: Option<String>,
 }
 
@@ -532,12 +533,21 @@ pub struct StatusUpdate {
 pub struct CreatePurchaseAllocation {
     pub receipt_line_item_id: Uuid,
     pub allocated_qty: i32,
+    #[serde(default)]
+    pub allow_receipt_date_override: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdatePurchaseAllocation {
     pub receipt_line_item_id: Option<Uuid>,
     pub allocated_qty: Option<i32>,
+    pub allow_receipt_date_override: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AutoAllocatePurchaseRequest {
+    #[serde(default)]
+    pub allow_receipt_date_override: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -551,6 +561,7 @@ pub struct AutoAllocatePurchaseResult {
     pub allocations_created: i32,
     pub allocations_updated: i32,
     pub receipts_touched: i32,
+    pub warning: Option<String>,
 }
 
 // ============================================
@@ -1127,6 +1138,7 @@ mod tests {
                 receipt_id: None,
                 receipt_number: None,
                 invoice_number: None,
+                allow_receipt_date_override: false,
                 notes: None,
             };
 
@@ -1161,6 +1173,7 @@ mod tests {
                 receipt_id: None,
                 receipt_number: None,
                 invoice_number: None,
+                allow_receipt_date_override: false,
                 notes: None,
             };
 
@@ -1186,6 +1199,7 @@ mod tests {
                 receipt_id: None,
                 receipt_number: None,
                 invoice_number: None,
+                allow_receipt_date_override: false,
                 notes: None,
             };
 
@@ -1470,6 +1484,7 @@ mod tests {
                 receipt_id: None,
                 receipt_number: None,
                 invoice_number: None,
+                allow_receipt_date_override: false,
                 notes: None,
             }
         }
@@ -1499,6 +1514,7 @@ mod tests {
                 receipt_id: None,
                 receipt_number: None,
                 invoice_number: None,
+                allow_receipt_date_override: false,
                 notes: None,
             }
         }

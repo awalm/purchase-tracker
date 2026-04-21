@@ -129,6 +129,9 @@ SET invoice_unit_price = NULL
 WHERE invoice_id IS NULL
   AND invoice_unit_price IS NOT NULL;
 
+ALTER TABLE purchases
+  ADD COLUMN IF NOT EXISTS allow_receipt_date_override BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- ============================================
 -- INVOICE RECONCILIATION STATE
 -- ============================================

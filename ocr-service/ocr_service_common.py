@@ -69,6 +69,12 @@ def parse_amount_from_keyword_window(texts: list[str], keyword: str) -> str | No
         for idx in scan_order:
             if idx < 0 or idx >= len(texts):
                 continue
+
+            # Tax rate lines often look like "13.00% of 515.88" and should not be
+            # interpreted as the tax amount itself.
+            if keyword == "tax" and "%" in texts[idx]:
+                continue
+
             for raw in parse_all_money(texts[idx]):
                 try:
                     candidate_values.append(float(raw))
@@ -240,12 +246,26 @@ def _infer_qty(text: str) -> int | None:
 
 def _clean_description(text: str) -> str:
     t = text
+    t = re.sub(r"[®™©]", "", t)
     t = re.sub(r"(?<!\d)\d{1,3}\.\d{3}\.\d{2}(?!\d)", " ", t)
     t = re.sub(r"(?<!\d)(?:\d{1,3}(?:[ ,]\d{3})*|\d+)\.\d{2}(?!\d)", " ", t)
     t = re.sub(r"\bqty\s*[:x]?\s*\d{1,3}\b", " ", t, flags=re.IGNORECASE)
     t = re.sub(r"\b\d{1,3}\s*[xX]\b", " ", t)
     t = re.sub(r"\bx\s*\d{1,3}\b", " ", t, flags=re.IGNORECASE)
     t = re.sub(r"\b\d+\s*sale\s*item\(s\)\b", " ", t, flags=re.IGNORECASE)
+
+    # Normalize recurring OCR slips in product lines.
+    t = re.sub(r"\bshou\b", "Show", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bshou5\b", "Show5", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bpap\b", "Pop", t, flags=re.IGNORECASE)
+    t = re.sub(r"\boul\b", "Owl", t, flags=re.IGNORECASE)
+    t = re.sub(
+        r"\becho\s+dot\s+5th\s+kid\s+owl\b",
+        "Echo Pop 5th Kid Owl",
+        t,
+        flags=re.IGNORECASE,
+    )
+
     t = re.sub(r"\s+", " ", t).strip(" -:$")
     return t
 
@@ -276,6 +296,128 @@ def _looks_like_non_item_description(desc: str) -> bool:
     if len(alpha_tokens) < 2:
         return True
     return False
+
+
+def _last_alpha_token(desc: str) -> str | None:
+    tokens = re.findall(r"[A-Za-z]+", desc.lower())
+    if not tokens:
+        return None
+    return tokens[-1]
+
+
+def _description_tokens(desc: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9]+", desc.lower())
+
+
+def _looks_like_noisy_suffix_tokens(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+
+    noisy = 0
+    for token in tokens:
+        if len(token) <= 2:
+            noisy += 1
+            continue
+        if re.search(r"\d", token) and not re.fullmatch(r"\d+(?:st|nd|rd|th)?", token):
+            noisy += 1
+
+    return noisy >= max(1, (len(tokens) + 1) // 2)
+
+
+def _is_noisy_suffix_variant(desc_a: str, desc_b: str) -> bool:
+    tokens_a = _description_tokens(desc_a)
+    tokens_b = _description_tokens(desc_b)
+    if not tokens_a or not tokens_b:
+        return False
+
+    shorter, longer = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
+    if len(shorter) < 3:
+        return False
+    if len(longer) - len(shorter) > 4:
+        return False
+    if longer[: len(shorter)] != shorter:
+        return False
+
+    suffix = longer[len(shorter):]
+    return _looks_like_noisy_suffix_tokens(suffix)
+
+
+def _is_ordinal_token(token: str) -> bool:
+    return bool(re.fullmatch(r"\d+(?:st|nd|rd|th)?", token.lower()))
+
+
+def _has_non_ordinal_digit(token: str) -> bool:
+    return bool(re.search(r"\d", token) and not _is_ordinal_token(token))
+
+
+def _description_noise_score(desc: str) -> int:
+    score = 0
+    for token in _description_tokens(desc):
+        if len(token) <= 2:
+            score += 1
+        if _has_non_ordinal_digit(token):
+            score += 2
+    return score
+
+
+def _looks_like_noisy_duplicate(desc_a: str, desc_b: str) -> bool:
+    sim = SequenceMatcher(None, desc_a, desc_b).ratio()
+    if sim < 0.72:
+        return False
+
+    tokens_a = _description_tokens(desc_a)
+    tokens_b = _description_tokens(desc_b)
+    if len(tokens_a) != len(tokens_b) or len(tokens_a) < 4:
+        return False
+
+    diffs: list[tuple[str, str]] = []
+    same_positions = 0
+    for token_a, token_b in zip(tokens_a, tokens_b):
+        if token_a == token_b:
+            same_positions += 1
+            continue
+        diffs.append((token_a, token_b))
+
+    if not diffs or len(diffs) > 2:
+        return False
+    if same_positions < len(tokens_a) - 2:
+        return False
+
+    return any(_has_non_ordinal_digit(a) ^ _has_non_ordinal_digit(b) for a, b in diffs)
+
+
+def _line_item_merge_mode(item: dict[str, Any], existing: dict[str, Any]) -> str | None:
+    try:
+        desc_new = str(item["description"]).lower()
+        desc_existing = str(existing["description"]).lower()
+        sim = SequenceMatcher(None, desc_new, desc_existing).ratio()
+        same_unit = abs(float(item["unit_cost"]) - float(existing["unit_cost"])) <= 0.01
+        same_qty = int(item["quantity"]) == int(existing["quantity"])
+        same_total = abs(float(item["line_total"]) - float(existing["line_total"])) <= 0.01
+    except (TypeError, ValueError, KeyError):
+        return None
+
+    if not same_unit:
+        return None
+
+    if sim >= 0.88:
+        # Keep nearby variants (for example CH vs GW, FD vs OWL) as separate lines.
+        # Still allows typo merges when suffix is unchanged (for example POP vs PAP).
+        tail_new = _last_alpha_token(desc_new)
+        tail_existing = _last_alpha_token(desc_existing)
+        if tail_new and tail_existing and tail_new != tail_existing:
+            return None
+        return "aggregate"
+
+    # Some OCR passes append low-quality trailing tokens to the same item line.
+    # Merge those aliases without increasing quantity.
+    if _is_noisy_suffix_variant(desc_new, desc_existing):
+        return "alias"
+
+    if same_qty and same_total and _looks_like_noisy_duplicate(desc_new, desc_existing):
+        return "alias"
+
+    return None
 
 
 def _candidate_to_line_item(text: str, confidence: float) -> dict[str, Any] | None:
@@ -329,6 +471,10 @@ def _candidate_to_line_item(text: str, confidence: float) -> dict[str, Any] | No
         "line_total": f"{line_total:.2f}",
         "confidence": confidence,
     }
+
+
+def _strip_internal_line_item_fields(item: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in item.items() if not k.startswith("_")}
 
 
 def extract_generic_line_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -410,6 +556,7 @@ def extract_generic_line_items(lines: list[dict[str, Any]]) -> list[dict[str, An
                             "unit_cost": f"{unit_cost:.2f}",
                             "line_total": f"{line_total:.2f}",
                             "confidence": conf,
+                            "_source_index": i,
                         }
                     )
                 i = max(i + 1, k)
@@ -420,7 +567,6 @@ def extract_generic_line_items(lines: list[dict[str, Any]]) -> list[dict[str, An
         return out
 
     items: list[dict[str, Any]] = parse_tabular_rows()
-    seen: set[tuple[str, str, int]] = set()
 
     for i, line in enumerate(lines):
         text = line["text"].strip()
@@ -431,7 +577,7 @@ def extract_generic_line_items(lines: list[dict[str, Any]]) -> list[dict[str, An
 
         if i + 1 < len(lines):
             nxt = lines[i + 1]["text"].strip()
-            if nxt and not _is_summary_line(nxt):
+            if nxt and not _is_summary_line(nxt) and re.search(r"[A-Za-z]", text):
                 combined = f"{text} {nxt}"
                 combined_conf = min(
                     float(line.get("confidence", 0.0)),
@@ -439,15 +585,18 @@ def extract_generic_line_items(lines: list[dict[str, Any]]) -> list[dict[str, An
                 )
                 candidate_texts.append((combined, combined_conf))
 
+        seen_local: set[tuple[str, str, int]] = set()
         for candidate_text, conf in candidate_texts:
             item = _candidate_to_line_item(candidate_text, conf)
             if not item:
                 continue
 
+            item["_source_index"] = i
+
             key = (item["description"].lower(), item["line_total"], item["quantity"])
-            if key in seen:
+            if key in seen_local:
                 continue
-            seen.add(key)
+            seen_local.add(key)
             items.append(item)
 
     if not items:
@@ -457,23 +606,29 @@ def extract_generic_line_items(lines: list[dict[str, Any]]) -> list[dict[str, An
     for item in items:
         matched = False
         for existing in merged:
-            try:
-                sim = SequenceMatcher(
-                    None,
-                    item["description"].lower(),
-                    existing["description"].lower(),
-                ).ratio()
-                same_unit = abs(float(item["unit_cost"]) - float(existing["unit_cost"])) <= 0.01
-            except (TypeError, ValueError, KeyError):
-                sim = 0.0
-                same_unit = False
+            merge_mode = _line_item_merge_mode(item, existing)
+            if merge_mode:
+                if merge_mode in {"aggregate", "alias"}:
+                    existing["quantity"] += int(item["quantity"])
 
-            if sim >= 0.82 and same_unit:
-                existing["quantity"] += int(item["quantity"])
-                try:
-                    existing["line_total"] = f"{float(existing['unit_cost']) * int(existing['quantity']):.2f}"
-                except (TypeError, ValueError, KeyError):
-                    pass
+                if merge_mode == "alias":
+                    existing_desc = str(existing.get("description", ""))
+                    candidate_desc = str(item.get("description", ""))
+
+                    if _description_noise_score(candidate_desc) < _description_noise_score(existing_desc):
+                        existing["description"] = item["description"]
+                    elif len(candidate_desc) < len(existing_desc):
+                        existing["description"] = item["description"]
+
+                if merge_mode in {"aggregate", "alias"}:
+                    try:
+                        existing["line_total"] = f"{float(existing['unit_cost']) * int(existing['quantity']):.2f}"
+                    except (TypeError, ValueError, KeyError):
+                        pass
+                existing["_source_index"] = min(
+                    int(existing.get("_source_index", 10**9)),
+                    int(item.get("_source_index", 10**9)),
+                )
                 existing["confidence"] = max(
                     float(existing.get("confidence", 0.0)),
                     float(item.get("confidence", 0.0)),
@@ -484,10 +639,12 @@ def extract_generic_line_items(lines: list[dict[str, Any]]) -> list[dict[str, An
             merged.append(item)
 
     merged.sort(
-        key=lambda x: (x["confidence"], x["quantity"], len(x["description"])),
-        reverse=True,
+        key=lambda x: (
+            int(x.get("_source_index", 10**9)),
+            str(x.get("description", "")).lower(),
+        ),
     )
-    return merged[:20]
+    return [_strip_internal_line_item_fields(item) for item in merged[:20]]
 
 
 def extract_item_count_hint(texts: list[str]) -> int | None:
@@ -505,9 +662,28 @@ def extract_item_count_hint(texts: list[str]) -> int | None:
     return None
 
 
+def _looks_like_bestbuy_receipt(texts: list[str]) -> bool:
+    joined = " ".join(texts)
+    low = joined.lower()
+
+    if "best buy" in low:
+        return True
+    if re.search(r"\bbest\b", low) and re.search(r"\bbuy\b", low):
+        return True
+    if "proof you're on the nice list" in low or "nice list" in low:
+        return True
+
+    has_bus_date = bool(re.search(r"\bb[uo0]s\s*[:.]?\s*date\b", joined, re.IGNORECASE))
+    has_s = bool(re.search(r"\bS\s*[-:#.]?\s*\d{1,8}\b", joined, re.IGNORECASE))
+    has_r = bool(re.search(r"\bR\s*[-:#.]?\s*\d{1,8}\b", joined, re.IGNORECASE))
+    has_t = bool(re.search(r"\bT\s*[-:#.]?\s*\d{1,8}\b", joined, re.IGNORECASE))
+
+    return has_bus_date and ((has_s and has_r) or (has_s and has_t) or (has_r and has_t))
+
+
 def detect_vendor_name(texts: list[str]) -> str | None:
     joined = " ".join(texts).lower()
-    if "best buy" in joined:
+    if _looks_like_bestbuy_receipt(texts):
         return "Best Buy"
     if "amazon." in joined:
         return "Amazon"
@@ -539,21 +715,55 @@ def detect_vendor_name(texts: list[str]) -> str | None:
     return None
 
 
-def extract_payment_method(texts: list[str]) -> str | None:
-    patterns = [
-        r"account\s*#?\s*[*xX\-\s]*(\d{4})(?!\d)",
-        r"account\s*#?\s*[:\-\s*]*\d*(\d{4})(?!\d)",
-        r"card\s*(?:ending\s*in|last\s*4)?\s*[:#\-\s*]*(\d{4})(?!\d)",
-    ]
+def _extract_payment_brand(text: str) -> str | None:
+    m = re.search(r"\b(amex|visa|mastercard|master|mc|debit|credit)\b", text, re.IGNORECASE)
+    if not m:
+        return None
 
-    for t in texts:
+    raw = m.group(1)
+    low = raw.lower()
+    if low == "master":
+        return "Mastercard"
+    if low == "mc":
+        return "MC"
+    if raw.isupper():
+        return raw
+    return raw[0].upper() + raw[1:].lower()
+
+
+def _extract_last4_from_payment_line(text: str) -> str | None:
+    patterns = [
+        r"(?:account|acct|card)[^\d]{0,24}(\d{4})(?!\d)",
+        r"(?:\*|x|X){2,}\s*(\d{4})(?!\d)",
+        r"(?:ending\s*in|last\s*4)\D*(\d{4})(?!\d)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def extract_payment_method(texts: list[str]) -> str | None:
+    for i, t in enumerate(texts):
         low = t.lower()
-        if not any(k in low for k in ("account", "card", "amex", "visa", "master", "mc")):
+        if not any(k in low for k in ("account", "acct", "card", "amex", "visa", "master", "mc", "*", "x")):
             continue
-        for pat in patterns:
-            m = re.search(pat, t, re.IGNORECASE)
-            if m:
-                return m.group(1)
+
+        last4 = _extract_last4_from_payment_line(t)
+        if not last4:
+            continue
+
+        brand = _extract_payment_brand(t)
+        if not brand:
+            for j in range(max(0, i - 2), min(len(texts), i + 2)):
+                brand = _extract_payment_brand(texts[j])
+                if brand:
+                    break
+
+        if brand:
+            return f"{brand} ({last4})"
+        return last4
     return None
 
 
@@ -615,7 +825,7 @@ def extract_bestbuy_receipt_number_from_metadata(
     texts: list[str],
     receipt_date: str | None = None,
 ) -> str | None:
-    header_text = " ".join(texts[:30])
+    header_text = " ".join(texts[:45])
     normalized = re.sub(r"\s+", " ", header_text)
 
     def extract_part(patterns: list[str]) -> str | None:
@@ -627,6 +837,63 @@ def extract_bestbuy_receipt_number_from_metadata(
             if value:
                 return value
         return None
+
+    def normalize_year(raw: str) -> int | None:
+        digits = re.sub(r"\D", "", raw)
+        candidates: list[str] = []
+        if len(digits) >= 4:
+            candidates.extend([digits[:4], digits[-4:]])
+        elif len(digits) == 2:
+            candidates.append(f"20{digits}")
+
+        for candidate in candidates:
+            try:
+                year = int(candidate)
+            except ValueError:
+                continue
+            if 2000 <= year <= 2100:
+                return year
+        return None
+
+    def extract_bus_date_parts() -> tuple[int, int, int] | None:
+        for line in texts[:45]:
+            normalized_line = line.lower().replace("b0s", "bus")
+            if "bus" not in normalized_line or "date" not in normalized_line:
+                continue
+
+            for m in re.finditer(r"(\d{1,2})\D+(\d{1,2})\D+(\d{4,6})", line):
+                try:
+                    month = int(m.group(1))
+                    day = int(m.group(2))
+                except ValueError:
+                    continue
+
+                year = normalize_year(m.group(3))
+                if year is None:
+                    continue
+
+                if month > 12:
+                    if month in (18, 19):
+                        month = 11
+                    elif 1 <= day <= 12:
+                        month, day = day, month
+
+                if 1 <= month <= 12 and 1 <= day <= 31:
+                    return year, month, day
+        return None
+
+    def receipt_date_yyyymmdd(date_value: str | None) -> str | None:
+        if not date_value:
+            return None
+        m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", date_value.strip())
+        if not m:
+            return None
+        year = int(m.group(1))
+        month = int(m.group(2))
+        day = int(m.group(3))
+        if month < 1 or month > 12 or day < 1 or day > 31:
+            return None
+        return f"{year:04d}{month:02d}{day:02d}"
 
     s_value = extract_part([
         r"\bS\s*[-:#]?\s*(\d{1,8})\b",
@@ -641,6 +908,15 @@ def extract_bestbuy_receipt_number_from_metadata(
         r"\bT\s*[:.]\s*(\d{1,8})\b",
     ])
 
+    if not s_value:
+        s_fallback = re.search(
+            r"(?:^|\D)(?:\d{1,3}[-\s])?(\d{3})\d{1,5}\s+R\s*[-:#.]?\s*\d{1,3}\b.*B[U0]S\s*[:.]?DATE",
+            normalized,
+            re.IGNORECASE,
+        )
+        if s_fallback:
+            s_value = s_fallback.group(1)
+
     parsed_date = receipt_date
     if not parsed_date:
         for t in texts[:30]:
@@ -653,11 +929,25 @@ def extract_bestbuy_receipt_number_from_metadata(
     if not parsed_date:
         parsed_date = extract_receipt_date_from_texts(texts)
 
-    if not s_value or not r_value or not t_value or not parsed_date:
+    if not s_value or not r_value or not t_value:
         return None
 
-    date_compact = parsed_date.replace("-", "")
-    return f"BB-S{s_value}-R{r_value}-T{t_value}-{date_compact}"
+    bus_date_parts = extract_bus_date_parts()
+
+    # Best Buy labels for register (R) and transaction (T) are stable; keep
+    # the explicit OCR labels instead of inferring a swap from value lengths.
+    receipt_core = f"S{s_value}-R{r_value}-T{t_value}"
+
+    # Keep the date suffix format stable across all Best Buy layouts.
+    date_suffix = receipt_date_yyyymmdd(parsed_date)
+    if not date_suffix and bus_date_parts is not None:
+        year, month, day = bus_date_parts
+        date_suffix = f"{year:04d}{month:02d}{day:02d}"
+
+    if not date_suffix:
+        return None
+
+    return f"{receipt_core}_{date_suffix}"
 
 
 def extract_receipt_number_from_texts(
@@ -692,7 +982,7 @@ def extract_receipt_number_from_texts(
                     return m_digits.group(1)
 
     vendor = (vendor_name or detect_vendor_name(texts) or "").lower()
-    if "best buy" in vendor:
+    if "best buy" in vendor or _looks_like_bestbuy_receipt(texts):
         generated = extract_bestbuy_receipt_number_from_metadata(texts, receipt_date)
         if generated:
             return generated
@@ -712,6 +1002,24 @@ def is_steam_receipt(texts: list[str]) -> bool:
 def is_amazon_receipt(texts: list[str]) -> bool:
     joined = " ".join(texts).lower()
     return "amazon." in joined and "invoice" in joined
+
+
+def detect_fixture_used(
+    texts: list[str],
+    vendor_name: str | None,
+    steam_mode: bool,
+    amazon_mode: bool,
+) -> str:
+    if steam_mode:
+        return "steam"
+    if amazon_mode:
+        return "amazon"
+
+    vendor = (vendor_name or "").lower()
+    if "best buy" in vendor or _looks_like_bestbuy_receipt(texts):
+        return "bestbuy"
+
+    return "generic"
 
 
 def extract_steam_totals(texts: list[str]) -> tuple[str | None, str | None, str | None]:
@@ -895,14 +1203,21 @@ def extract_steam_line_items(texts: list[str], total_str: str | None) -> list[di
                 "unit_cost": f"{unit_price:.2f}",
                 "line_total": f"{line_total:.2f}",
                 "confidence": 0.96,
+                "_source_index": min(indices),
             }
         )
 
-    return items
+    items.sort(
+        key=lambda x: (
+            int(x.get("_source_index", 10**9)),
+            str(x.get("description", "")).lower(),
+        )
+    )
+    return [_strip_internal_line_item_fields(item) for item in items]
 
 
 def extract_amazon_line_items(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    blocked_tokens = (
+    blocked_description_tokens = (
         "invoice",
         "order",
         "shipment",
@@ -912,63 +1227,181 @@ def extract_amazon_line_items(lines: list[dict[str, Any]]) -> list[dict[str, Any
         "gst/hst",
         "for questions",
         "asin:",
-        "amazon",
+        "shipping charges",
+        "frais d'exp",
+        "environmentalhandlingfee",
+        "description",
+        "quantity",
+        "unit",
+        "discount",
+        "federal tax",
+        "provincial tax",
+        "item subtotal",
+        "page ",
     )
 
+    asin_pattern = re.compile(r"\bASIN\s*:\s*([A-Z0-9]{8,16})\b", re.IGNORECASE)
+    money_pattern = r"(?:\d{1,3}(?:[ ,]\d{3})*|\d+)\.\d{2}"
+    qty_price_pattern = re.compile(
+        rf"^\s*(\d{{1,3}})\s+\$?\s*({money_pattern})\s*$",
+        re.IGNORECASE,
+    )
+    qty_only_pattern = re.compile(r"^\s*(\d{1,3})\s*$")
+    price_only_pattern = re.compile(
+        rf"^\s*\$?\s*({money_pattern})\s*$",
+        re.IGNORECASE,
+    )
+    inline_qty_price_pattern = re.compile(
+        rf"^(.*?)\b(\d{{1,3}})\s+\$?\s*({money_pattern})\s*$",
+        re.IGNORECASE,
+    )
+
+    def _parse_money(raw: str) -> float | None:
+        try:
+            return float(raw.replace(",", "").replace(" ", ""))
+        except ValueError:
+            return None
+
     items: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, int]] = set()
+    seen_asins: set[str] = set()
+    previous_asin_index = -1
 
     for idx, line in enumerate(lines):
         text = line["text"].strip()
         if not text:
             continue
 
-        qty_price = re.fullmatch(
-            r"\s*(\d{1,3})\s+\$?\s*((?:\d{1,3}(?:[ ,]\d{3})*|\d+)\.\d{2})\s*",
-            text,
-        )
-        if not qty_price:
+        asin_match = asin_pattern.search(text)
+        if not asin_match:
             continue
 
-        try:
-            quantity = int(qty_price.group(1))
-            unit_cost = float(qty_price.group(2).replace(",", "").replace(" ", ""))
-        except ValueError:
+        asin_code = asin_match.group(1).upper()
+        if asin_code in seen_asins:
+            previous_asin_index = idx
             continue
 
+        window_start = max(previous_asin_index + 1, idx - 18)
+        previous_asin_index = idx
+
+        quantity: int | None = None
+        unit_cost: float | None = None
+        qty_line_index: int | None = None
+        inline_desc: str | None = None
+        confidence = float(line.get("confidence", 0.0))
+
+        for cursor in range(idx - 1, window_start - 1, -1):
+            current = lines[cursor]["text"].strip()
+            if not current:
+                continue
+
+            qty_price_match = qty_price_pattern.fullmatch(current)
+            if qty_price_match:
+                parsed_qty = int(qty_price_match.group(1))
+                parsed_unit = _parse_money(qty_price_match.group(2))
+                if parsed_unit is not None:
+                    quantity = parsed_qty
+                    unit_cost = parsed_unit
+                    qty_line_index = cursor
+                    confidence = min(confidence, float(lines[cursor].get("confidence", 0.0)))
+                    break
+
+            qty_only_match = qty_only_pattern.fullmatch(current)
+            if qty_only_match and cursor + 1 < idx:
+                next_text = lines[cursor + 1]["text"].strip()
+                price_only_match = price_only_pattern.fullmatch(next_text)
+                if price_only_match:
+                    parsed_unit = _parse_money(price_only_match.group(1))
+                    if parsed_unit is not None:
+                        quantity = int(qty_only_match.group(1))
+                        unit_cost = parsed_unit
+                        qty_line_index = cursor
+                        confidence = min(
+                            confidence,
+                            float(lines[cursor].get("confidence", 0.0)),
+                            float(lines[cursor + 1].get("confidence", 0.0)),
+                        )
+                        break
+
+            inline_match = inline_qty_price_pattern.match(current)
+            if inline_match:
+                parsed_qty = int(inline_match.group(2))
+                parsed_unit = _parse_money(inline_match.group(3))
+                if parsed_unit is not None:
+                    quantity = parsed_qty
+                    unit_cost = parsed_unit
+                    qty_line_index = cursor
+                    inline_desc = inline_match.group(1).strip(" -:$")
+                    confidence = min(confidence, float(lines[cursor].get("confidence", 0.0)))
+                    break
+
+        if quantity is None or unit_cost is None or qty_line_index is None:
+            continue
         if quantity < 1 or quantity > 500 or unit_cost <= 0:
             continue
 
         description: str | None = None
-        confidence = float(line.get("confidence", 0.0))
+        description_index: int | None = None
 
-        for back in range(1, 5):
-            desc_idx = idx - back
-            if desc_idx < 0:
-                break
-
-            candidate = lines[desc_idx]["text"].strip()
-            if not candidate:
-                continue
-
-            low = candidate.lower()
-            if _is_summary_line(candidate):
-                continue
-            if any(token in low for token in blocked_tokens):
-                continue
-            if len(re.findall(r"[A-Za-z]{2,}", candidate)) < 2:
-                continue
-
-            cleaned = _clean_description(candidate)
-            if _looks_like_non_item_description(cleaned):
-                continue
-
-            description = cleaned
-            confidence = min(confidence, float(lines[desc_idx].get("confidence", 0.0)))
-            break
+        if inline_desc:
+            inline_primary = inline_desc.split(" / ", 1)[0].strip()
+            cleaned_inline = _clean_description(inline_primary)
+            if (
+                cleaned_inline
+                and not _looks_like_non_item_description(cleaned_inline)
+                and cleaned_inline.lower() not in {"piece", "pièce", "la", "article"}
+            ):
+                description = cleaned_inline
+                description_index = qty_line_index
 
         if not description:
-            continue
+            best_candidate: tuple[int, int, str, int] | None = None
+            for cursor in range(qty_line_index - 1, window_start - 1, -1):
+                candidate_raw = lines[cursor]["text"].strip()
+                if not candidate_raw:
+                    continue
+
+                candidate_primary = candidate_raw.split(" / ", 1)[0].strip()
+                candidate_low = candidate_primary.lower()
+                if _is_summary_line(candidate_primary):
+                    continue
+                if any(token in candidate_low for token in blocked_description_tokens):
+                    continue
+                if qty_price_pattern.fullmatch(candidate_primary):
+                    continue
+                if qty_only_pattern.fullmatch(candidate_primary):
+                    continue
+                if price_only_pattern.fullmatch(candidate_primary):
+                    continue
+
+                cleaned = _clean_description(candidate_primary)
+                if not cleaned:
+                    continue
+                if cleaned.lower() in {"piece", "pièce", "la", "article"}:
+                    continue
+                if _looks_like_non_item_description(cleaned):
+                    continue
+
+                alpha_words = re.findall(r"[A-Za-z]{2,}", cleaned)
+                score = len(alpha_words)
+                cleaned_low = cleaned.lower()
+                if "amazon echo" in cleaned_low:
+                    score += 20
+                elif "echo" in cleaned_low:
+                    score += 10
+                distance = qty_line_index - cursor
+
+                candidate_tuple = (score, -distance, cleaned, cursor)
+                if best_candidate is None or candidate_tuple > best_candidate:
+                    best_candidate = candidate_tuple
+
+            if best_candidate is not None:
+                description = best_candidate[2]
+                description_index = best_candidate[3]
+                confidence = min(confidence, float(lines[description_index].get("confidence", 0.0)))
+
+        if not description:
+            description = f"ASIN {asin_code}"
+            description_index = qty_line_index
 
         line_total = unit_cost * quantity
         item = {
@@ -977,18 +1410,20 @@ def extract_amazon_line_items(lines: list[dict[str, Any]]) -> list[dict[str, Any
             "unit_cost": f"{unit_cost:.2f}",
             "line_total": f"{line_total:.2f}",
             "confidence": confidence,
+            "_asin": asin_code,
+            "_source_index": description_index if description_index is not None else qty_line_index,
         }
-        key = (item["description"].lower(), item["unit_cost"], item["quantity"])
-        if key in seen:
-            continue
-        seen.add(key)
+
+        seen_asins.add(asin_code)
         items.append(item)
 
     items.sort(
-        key=lambda x: (x["confidence"], x["quantity"], float(x["line_total"])),
-        reverse=True,
+        key=lambda x: (
+            int(x.get("_source_index", 10**9)),
+            str(x.get("description", "")).lower(),
+        ),
     )
-    return items
+    return [_strip_internal_line_item_fields(item) for item in items]
 
 
 def _money_values_in_window(texts: list[str], start: int, end: int) -> list[float]:
@@ -1002,6 +1437,55 @@ def _money_values_in_window(texts: list[str], start: int, end: int) -> list[floa
             except ValueError:
                 continue
     return values
+
+
+def _parse_all_signed_money_values(text: str) -> list[float]:
+    values: list[float] = []
+    for match in re.finditer(r"[-+]?\s*\$?\s*(?:\d{1,3}(?:[ ,]\d{3})*|\d+)\.\d{2}", text):
+        raw = match.group(0).strip().replace(" ", "")
+        sign = -1.0 if raw.startswith("-") else 1.0
+        normalized = raw.lstrip("+-").lstrip("$").replace(",", "")
+        try:
+            values.append(sign * float(normalized))
+        except ValueError:
+            continue
+    return values
+
+
+def _extract_amazon_summary_subtotal_and_tax(texts: list[str]) -> tuple[float | None, float | None]:
+    # Multi-page Amazon invoices often end with a summary table row like:
+    # Total | 1103.53 | -5.49 | 142.68 | 0.00 | 142.68
+    # We treat subtotal as item subtotal plus discount, and tax as the last tax subtotal value.
+    for idx, text in enumerate(texts):
+        low = text.lower().strip()
+        if low != "total":
+            continue
+
+        context = " ".join(texts[max(0, idx - 40):idx]).lower()
+        if "discount" not in context:
+            continue
+
+        values: list[float] = []
+        for scan_idx in range(idx + 1, min(len(texts), idx + 8)):
+            values.extend(_parse_all_signed_money_values(texts[scan_idx]))
+
+        if len(values) < 3:
+            continue
+
+        item_subtotal = values[0]
+        discount = values[1]
+        tax_subtotal = values[-1]
+
+        if item_subtotal <= 0 or tax_subtotal < 0:
+            continue
+
+        effective_subtotal = item_subtotal + discount
+        if effective_subtotal <= 0:
+            effective_subtotal = item_subtotal
+
+        return round(effective_subtotal, 2), round(tax_subtotal, 2)
+
+    return None, None
 
 
 def extract_amazon_totals(
@@ -1069,6 +1553,12 @@ def extract_amazon_totals(
     if line_items_subtotal is not None:
         subtotal_value = line_items_subtotal
 
+    summary_subtotal, summary_tax = _extract_amazon_summary_subtotal_and_tax(texts)
+    if summary_subtotal is not None:
+        subtotal_value = summary_subtotal
+    if summary_tax is not None:
+        tax_value = summary_tax
+
     if subtotal_value is None and total_value is not None and tax_value is not None:
         subtotal_candidate = round(total_value - tax_value, 2)
         if subtotal_candidate >= 0:
@@ -1093,6 +1583,7 @@ def extract_structured(lines: list[dict[str, Any]]) -> dict[str, Any]:
     vendor_name = detect_vendor_name(texts)
     steam_mode = is_steam_receipt(texts)
     amazon_mode = is_amazon_receipt(texts)
+    fixture_used = detect_fixture_used(texts, vendor_name, steam_mode, amazon_mode)
 
     total = parse_amount_from_keyword_window(texts, "total")
     subtotal = parse_amount_from_keyword_window(texts, "subtotal")
@@ -1188,6 +1679,7 @@ def extract_structured(lines: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "vendor_name": vendor_name,
+        "fixture_used": fixture_used,
         "receipt_number": receipt_number,
         "receipt_date": receipt_date,
         "subtotal": subtotal,

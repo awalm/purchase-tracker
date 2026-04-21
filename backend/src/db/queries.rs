@@ -89,6 +89,11 @@ const UNLINK_PURCHASES_FOR_INVOICE_SQL: &str = r#"UPDATE purchases
            invoice_unit_price = NULL
        WHERE invoice_id = $1"#;
 
+const DELETE_ALLOCATIONS_FOR_INVOICE_PURCHASES_SQL: &str = r#"DELETE FROM purchase_allocations pa
+             USING purchases p
+             WHERE pa.purchase_id = p.id
+                 AND p.invoice_id = $1"#;
+
 const DELETE_ORPHAN_PURCHASES_SQL: &str = r#"DELETE FROM purchases p
        WHERE p.invoice_id IS NULL
          AND p.receipt_id IS NULL
@@ -268,6 +273,31 @@ async fn ensure_receipt_not_linked_to_locked_invoice_for_line_item(
         return Err(PurchaseAllocationError::Validation(message.to_string()));
     }
     Ok(())
+}
+
+fn validate_receipt_date_for_invoice(
+    invoice_date: Option<NaiveDate>,
+    receipt_date: NaiveDate,
+    allow_receipt_date_override: bool,
+) -> Result<(), PurchaseAllocationError> {
+    if let Some(invoice_date) = invoice_date {
+        if receipt_date > invoice_date && !allow_receipt_date_override {
+            return Err(PurchaseAllocationError::Validation(format!(
+                "Receipt date {} is after invoice date {}. Enable receipt date override to proceed.",
+                receipt_date.format("%Y-%m-%d"),
+                invoice_date.format("%Y-%m-%d")
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn no_eligible_receipts_before_invoice_warning(invoice_date: NaiveDate) -> String {
+    format!(
+        "No receipts on or before invoice date {} are available for allocation.",
+        invoice_date.format("%Y-%m-%d")
+    )
 }
 
 // ============================================
@@ -814,9 +844,9 @@ pub async fn get_active_items(pool: &PgPool) -> Result<Vec<ActiveItem>, sqlx::Er
         r#"SELECT 
             i.id as "id!",
             i.name as "name!",
-            i.default_destination_id,
-            d.code as default_destination_code,
-            i.notes,
+            i.default_destination_id as "default_destination_id?",
+            d.code as "default_destination_code?",
+            i.notes as "notes?",
             i.created_at as "created_at!"
         FROM items i
         LEFT JOIN destinations d ON d.id = i.default_destination_id
@@ -1171,6 +1201,13 @@ pub async fn delete_invoice(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bo
         }
     }
 
+    // Remove allocation links for this invoice's purchases so deleting an invoice
+    // behaves like the invoice never existed for allocation-backed rows.
+    sqlx::query(DELETE_ALLOCATIONS_FOR_INVOICE_PURCHASES_SQL)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
     // Unlink purchases that reference this invoice (SET NULL, not delete)
     sqlx::query(UNLINK_PURCHASES_FOR_INVOICE_SQL)
         .bind(id)
@@ -1428,6 +1465,7 @@ pub async fn get_purchases_by_invoice(
                    p.invoice_id,
                    COALESCE(p.receipt_id, alloc.any_receipt_id) AS resolved_receipt_id,
                    p.destination_id,
+                   p.allow_receipt_date_override,
                    p.notes,
                    p.created_at,
                    CASE
@@ -1472,6 +1510,7 @@ pub async fn get_purchases_by_invoice(
                pr.resolved_receipt_id AS "receipt_id?",
                r.receipt_number AS "receipt_number?",
                inv.invoice_number AS "invoice_number?",
+               pr.allow_receipt_date_override AS "allow_receipt_date_override!",
                pr.notes
            FROM purchase_rows pr
            LEFT JOIN items i ON i.id = pr.item_id
@@ -1588,7 +1627,15 @@ pub async fn create_purchase_allocation(
     let mut tx = pool.begin().await?;
 
     let purchase = sqlx::query!(
-        r#"SELECT id, item_id, quantity FROM purchases WHERE id = $1"#,
+          r#"SELECT
+                  p.id,
+                  p.item_id,
+                  p.quantity,
+                  p.allow_receipt_date_override,
+                inv.invoice_date AS "invoice_date?"
+              FROM purchases p
+              LEFT JOIN invoices inv ON inv.id = p.invoice_id
+              WHERE p.id = $1"#,
         purchase_id
     )
     .fetch_optional(&mut *tx)
@@ -1596,9 +1643,16 @@ pub async fn create_purchase_allocation(
     .ok_or_else(|| PurchaseAllocationError::NotFound("Purchase not found".to_string()))?;
 
     let receipt_line = sqlx::query!(
-        r#"SELECT id, receipt_id, item_id, quantity, unit_cost
-           FROM receipt_line_items
-           WHERE id = $1"#,
+          r#"SELECT
+                  rli.id,
+                  rli.receipt_id,
+                  rli.item_id,
+                  rli.quantity,
+                  rli.unit_cost,
+                  r.receipt_date
+           FROM receipt_line_items rli
+              JOIN receipts r ON r.id = rli.receipt_id
+           WHERE rli.id = $1"#,
         data.receipt_line_item_id
     )
     .fetch_optional(&mut *tx)
@@ -1610,6 +1664,14 @@ pub async fn create_purchase_allocation(
             "Receipt line item item must match invoice line item".to_string(),
         ));
     }
+
+    let allow_receipt_date_override =
+        data.allow_receipt_date_override || purchase.allow_receipt_date_override;
+    validate_receipt_date_for_invoice(
+        purchase.invoice_date,
+        receipt_line.receipt_date,
+        allow_receipt_date_override,
+    )?;
 
     let allocated_for_purchase_sum = sqlx::query_scalar!(
         r#"SELECT COALESCE(SUM(allocated_qty), 0)::INT FROM purchase_allocations WHERE purchase_id = $1"#,
@@ -1666,6 +1728,15 @@ pub async fn create_purchase_allocation(
         PurchaseAllocationError::Sql(e)
     })?;
 
+    if data.allow_receipt_date_override && !purchase.allow_receipt_date_override {
+        sqlx::query!(
+            r#"UPDATE purchases SET allow_receipt_date_override = TRUE WHERE id = $1"#,
+            purchase_id
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
     tx.commit().await?;
 
     let rows = get_purchase_allocations(pool, purchase_id).await?;
@@ -1692,7 +1763,15 @@ pub async fn update_purchase_allocation(
     let mut tx = pool.begin().await?;
 
     let purchase = sqlx::query!(
-        r#"SELECT id, item_id, quantity FROM purchases WHERE id = $1"#,
+        r#"SELECT
+              p.id,
+              p.item_id,
+              p.quantity,
+              p.allow_receipt_date_override,
+                  inv.invoice_date AS "invoice_date?"
+           FROM purchases p
+           LEFT JOIN invoices inv ON inv.id = p.invoice_id
+           WHERE p.id = $1"#,
         purchase_id
     )
     .fetch_optional(&mut *tx)
@@ -1728,9 +1807,16 @@ pub async fn update_purchase_allocation(
     }
 
     let receipt_line = sqlx::query!(
-        r#"SELECT id, receipt_id, item_id, quantity, unit_cost
-           FROM receipt_line_items
-           WHERE id = $1"#,
+        r#"SELECT
+              rli.id,
+              rli.receipt_id,
+              rli.item_id,
+              rli.quantity,
+              rli.unit_cost,
+              r.receipt_date
+           FROM receipt_line_items rli
+           JOIN receipts r ON r.id = rli.receipt_id
+           WHERE rli.id = $1"#,
         next_receipt_line_item_id
     )
     .fetch_optional(&mut *tx)
@@ -1741,6 +1827,41 @@ pub async fn update_purchase_allocation(
         return Err(PurchaseAllocationError::Validation(
             "Receipt line item item must match invoice line item".to_string(),
         ));
+    }
+
+    let requested_override = data.allow_receipt_date_override;
+    let effective_override = requested_override.unwrap_or(purchase.allow_receipt_date_override);
+    validate_receipt_date_for_invoice(
+        purchase.invoice_date,
+        receipt_line.receipt_date,
+        effective_override,
+    )?;
+
+    if requested_override == Some(false) {
+        if let Some(invoice_date) = purchase.invoice_date {
+            let has_other_late_allocations = sqlx::query_scalar!(
+                r#"SELECT EXISTS(
+                       SELECT 1
+                       FROM purchase_allocations pa
+                       JOIN receipts r ON r.id = pa.receipt_id
+                       WHERE pa.purchase_id = $1
+                         AND pa.id <> $2
+                         AND r.receipt_date > $3
+                   ) AS "exists!""#,
+                purchase_id,
+                allocation_id,
+                invoice_date
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+
+            if has_other_late_allocations {
+                return Err(PurchaseAllocationError::Validation(
+                    "Cannot disable receipt date override while allocations after the invoice date still exist."
+                        .to_string(),
+                ));
+            }
+        }
     }
 
     let other_allocated_purchase_sum = sqlx::query_scalar!(
@@ -1808,6 +1929,18 @@ pub async fn update_purchase_allocation(
         }
         PurchaseAllocationError::Sql(e)
     })?;
+
+    if let Some(next_override) = requested_override {
+        if next_override != purchase.allow_receipt_date_override {
+            sqlx::query!(
+                r#"UPDATE purchases SET allow_receipt_date_override = $2 WHERE id = $1"#,
+                purchase_id,
+                next_override
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
 
     tx.commit().await?;
 
@@ -2062,6 +2195,7 @@ pub async fn delete_purchase_allocation(
 pub async fn auto_allocate_purchase(
     pool: &PgPool,
     purchase_id: Uuid,
+    allow_receipt_date_override: bool,
 ) -> Result<AutoAllocatePurchaseResult, PurchaseAllocationError> {
     ensure_purchase_not_linked_to_locked_invoice_for_allocation(
         pool,
@@ -2073,12 +2207,28 @@ pub async fn auto_allocate_purchase(
     let mut tx = pool.begin().await?;
 
     let purchase = sqlx::query!(
-        r#"SELECT id, item_id, quantity FROM purchases WHERE id = $1"#,
+        r#"SELECT
+              p.id,
+              p.item_id,
+              p.quantity,
+              p.allow_receipt_date_override,
+                  inv.invoice_date AS "invoice_date?"
+           FROM purchases p
+           LEFT JOIN invoices inv ON inv.id = p.invoice_id
+           WHERE p.id = $1"#,
         purchase_id
     )
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| PurchaseAllocationError::NotFound("Purchase not found".to_string()))?;
+
+    let effective_allow_receipt_date_override =
+        allow_receipt_date_override || purchase.allow_receipt_date_override;
+    let invoice_date_cutoff = if effective_allow_receipt_date_override {
+        None
+    } else {
+        purchase.invoice_date
+    };
 
     let existing_allocations = sqlx::query!(
         r#"SELECT id, receipt_id, allocated_qty
@@ -2117,10 +2267,12 @@ pub async fn auto_allocate_purchase(
             JOIN receipts r ON r.id = rli.receipt_id
             LEFT JOIN purchase_allocations pa ON pa.receipt_line_item_id = rli.id
             WHERE rli.item_id = $2
+                            AND ($3::date IS NULL OR r.receipt_date <= $3)
             GROUP BY rli.id, rli.receipt_id, rli.quantity, rli.unit_cost, r.receipt_date
             ORDER BY r.receipt_date ASC, rli.receipt_id ASC"#,
             purchase_id,
-            purchase.item_id
+                        purchase.item_id,
+                        invoice_date_cutoff
         )
         .fetch_all(&mut *tx)
         .await?;
@@ -2191,10 +2343,26 @@ pub async fn auto_allocate_purchase(
         }
     }
 
+    if allow_receipt_date_override && !purchase.allow_receipt_date_override {
+        sqlx::query!(
+            r#"UPDATE purchases SET allow_receipt_date_override = TRUE WHERE id = $1"#,
+            purchase_id
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
     tx.commit().await?;
 
     let total_allocated_qty = previously_allocated_qty + auto_allocated_qty;
     let remaining_qty = (purchase.quantity - total_allocated_qty).max(0);
+    let warning = if invoice_date_cutoff.is_some() && remaining_qty > 0 && auto_allocated_qty <= 0 {
+        Some(no_eligible_receipts_before_invoice_warning(
+            invoice_date_cutoff.expect("cutoff is_some checked"),
+        ))
+    } else {
+        None
+    };
 
     Ok(AutoAllocatePurchaseResult {
         purchase_id,
@@ -2206,6 +2374,7 @@ pub async fn auto_allocate_purchase(
         allocations_created,
         allocations_updated,
         receipts_touched: touched_receipts.len() as i32,
+        warning,
     })
 }
 
@@ -2518,6 +2687,7 @@ pub async fn get_purchase_economics(
             pe.receipt_id,
             pe.receipt_number,
             pe.invoice_number,
+            p.allow_receipt_date_override AS "allow_receipt_date_override!",
             pe.notes
         FROM v_purchase_economics pe
         JOIN purchases p ON p.id = pe.purchase_id
@@ -3121,6 +3291,7 @@ pub async fn get_purchases_by_receipt(
                    r.id AS receipt_id,
                    r.receipt_number,
                    inv.invoice_number,
+                   p.allow_receipt_date_override,
                    p.notes,
                    p.created_at AS sort_created_at
                FROM purchase_allocations pa
@@ -3161,6 +3332,7 @@ pub async fn get_purchases_by_receipt(
                    r.id AS receipt_id,
                    r.receipt_number,
                    inv.invoice_number,
+                   p.allow_receipt_date_override,
                    p.notes,
                    p.created_at AS sort_created_at
                FROM purchases p
@@ -3199,6 +3371,7 @@ pub async fn get_purchases_by_receipt(
                c.receipt_id AS "receipt_id?",
                c.receipt_number AS "receipt_number?",
                c.invoice_number AS "invoice_number?",
+               c.allow_receipt_date_override AS "allow_receipt_date_override!",
                c.notes
            FROM (
                SELECT * FROM allocation_rows
@@ -3239,6 +3412,7 @@ pub async fn get_purchases_by_item(
                    p.invoice_id,
                    COALESCE(p.receipt_id, alloc.any_receipt_id) AS resolved_receipt_id,
                    p.destination_id,
+                   p.allow_receipt_date_override,
                    p.notes,
                    p.created_at,
                    CASE
@@ -3288,6 +3462,7 @@ pub async fn get_purchases_by_item(
                pr.resolved_receipt_id AS "receipt_id?",
                r.receipt_number AS "receipt_number?",
                inv.invoice_number AS "invoice_number?",
+               pr.allow_receipt_date_override AS "allow_receipt_date_override!",
                pr.notes
            FROM purchase_rows pr
            LEFT JOIN items i ON i.id = pr.item_id
@@ -3402,6 +3577,23 @@ mod tests {
             UNLINK_PURCHASES_FOR_DESTINATION_INVOICES_SQL
                 .contains("SELECT id FROM invoices WHERE destination_id = $1"),
             "Destination unlink SQL must target invoices in the destination"
+        );
+    }
+
+    #[test]
+    fn invoice_delete_sql_removes_allocations_for_linked_purchases() {
+        assert!(
+            DELETE_ALLOCATIONS_FOR_INVOICE_PURCHASES_SQL
+                .contains("DELETE FROM purchase_allocations pa"),
+            "Invoice delete SQL must remove allocation rows"
+        );
+        assert!(
+            DELETE_ALLOCATIONS_FOR_INVOICE_PURCHASES_SQL.contains("USING purchases p"),
+            "Invoice delete SQL must scope allocation deletion through purchases"
+        );
+        assert!(
+            DELETE_ALLOCATIONS_FOR_INVOICE_PURCHASES_SQL.contains("p.invoice_id = $1"),
+            "Invoice delete SQL must target allocations for the deleted invoice"
         );
     }
 
@@ -3962,6 +4154,7 @@ mod tests {
             CreatePurchaseAllocation {
                 receipt_line_item_id: line_item_id,
                 allocated_qty: 2,
+                allow_receipt_date_override: false,
             },
         )
         .await
@@ -4010,6 +4203,7 @@ mod tests {
             CreatePurchaseAllocation {
                 receipt_line_item_id: line_item_id,
                 allocated_qty: 1,
+                allow_receipt_date_override: false,
             },
         )
         .await
@@ -4017,6 +4211,123 @@ mod tests {
 
         assert_eq!(allocation.receipt_line_item_id, Some(line_item_id));
         assert_eq!(allocation.unit_cost, Decimal::new(77777, 2));
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn allocation_rejects_receipt_after_invoice_without_override() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        sqlx::query(r#"UPDATE receipts SET receipt_date = $2 WHERE id = $1"#)
+            .bind(receipt_id)
+            .bind(NaiveDate::from_ymd_opt(2026, 4, 20).unwrap())
+            .execute(&pool)
+            .await
+            .expect("set receipt date after invoice");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let err = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 1,
+                allow_receipt_date_override: false,
+            },
+        )
+        .await
+        .expect_err("should reject allocations with receipt date after invoice date");
+
+        match err {
+            PurchaseAllocationError::Validation(msg) => {
+                assert!(msg.contains("after invoice date"));
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn allocation_allows_receipt_after_invoice_with_override() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        sqlx::query(r#"UPDATE receipts SET receipt_date = $2 WHERE id = $1"#)
+            .bind(receipt_id)
+            .bind(NaiveDate::from_ymd_opt(2026, 4, 20).unwrap())
+            .execute(&pool)
+            .await
+            .expect("set receipt date after invoice");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let allocation = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 1,
+                allow_receipt_date_override: true,
+            },
+        )
+        .await
+        .expect("override should allow late receipt allocation");
+
+        assert_eq!(allocation.receipt_id, receipt_id);
+
+        let persisted_override = sqlx::query_scalar!(
+            r#"SELECT allow_receipt_date_override FROM purchases WHERE id = $1"#,
+            purchase_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read purchase override flag");
+
+        assert!(persisted_override, "override flag should persist on purchase");
 
         cleanup_seeded(
             &pool,
@@ -4127,7 +4438,7 @@ mod tests {
         )
         .await;
 
-        let result = auto_allocate_purchase(&pool, purchase_id)
+        let result = auto_allocate_purchase(&pool, purchase_id, false)
             .await
             .expect("auto allocation should succeed");
 
@@ -4181,7 +4492,7 @@ mod tests {
         )
         .await;
 
-        let result = auto_allocate_purchase(&pool, purchase_id)
+        let result = auto_allocate_purchase(&pool, purchase_id, false)
             .await
             .expect("auto allocation should succeed");
 
@@ -4192,6 +4503,112 @@ mod tests {
         assert_eq!(result.allocations_created, 1);
         assert_eq!(result.allocations_updated, 0);
         assert_eq!(result.receipts_touched, 1);
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_allocate_purchase_warns_when_only_late_receipts_are_available() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        sqlx::query(r#"UPDATE receipts SET receipt_date = $2 WHERE id = $1"#)
+            .bind(receipt_id)
+            .bind(NaiveDate::from_ymd_opt(2026, 4, 20).unwrap())
+            .execute(&pool)
+            .await
+            .expect("set receipt date after invoice");
+
+        let _line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let result = auto_allocate_purchase(&pool, purchase_id, false)
+            .await
+            .expect("auto allocation should return warning result");
+
+        assert_eq!(result.auto_allocated_qty, 0);
+        assert_eq!(result.remaining_qty, 2);
+        assert!(
+            result
+                .warning
+                .as_deref()
+                .unwrap_or_default()
+                .contains("on or before invoice date"),
+            "expected date-cutoff warning"
+        );
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_allocate_purchase_override_allows_late_receipts() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        sqlx::query(r#"UPDATE receipts SET receipt_date = $2 WHERE id = $1"#)
+            .bind(receipt_id)
+            .bind(NaiveDate::from_ymd_opt(2026, 4, 20).unwrap())
+            .execute(&pool)
+            .await
+            .expect("set receipt date after invoice");
+
+        let _line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let result = auto_allocate_purchase(&pool, purchase_id, true)
+            .await
+            .expect("override should allow auto allocation from late receipt");
+
+        assert_eq!(result.auto_allocated_qty, 2);
+        assert_eq!(result.remaining_qty, 0);
+        assert!(result.warning.is_none());
+
+        let persisted_override = sqlx::query_scalar!(
+            r#"SELECT allow_receipt_date_override FROM purchases WHERE id = $1"#,
+            purchase_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read purchase override flag");
+        assert!(persisted_override);
 
         cleanup_seeded(
             &pool,
@@ -4229,6 +4646,7 @@ mod tests {
             CreatePurchaseAllocation {
                 receipt_line_item_id: line_item_id,
                 allocated_qty: 1,
+                allow_receipt_date_override: false,
             },
         )
         .await
@@ -4251,7 +4669,7 @@ mod tests {
         )
         .await;
 
-        let result = auto_allocate_purchase(&pool, purchase_id)
+        let result = auto_allocate_purchase(&pool, purchase_id, false)
             .await
             .expect("auto allocation should succeed");
 
@@ -4307,7 +4725,7 @@ mod tests {
         )
         .await;
 
-        let err = auto_allocate_purchase(&pool, purchase_id)
+        let err = auto_allocate_purchase(&pool, purchase_id, false)
             .await
             .expect_err("auto allocation should fail on locked invoice");
 
@@ -4404,6 +4822,7 @@ mod tests {
             CreatePurchaseAllocation {
                 receipt_line_item_id: line_item_id,
                 allocated_qty: 2,
+                allow_receipt_date_override: false,
             },
         )
         .await
@@ -4474,6 +4893,7 @@ mod tests {
             CreatePurchaseAllocation {
                 receipt_line_item_id: line_item_id,
                 allocated_qty: 2,
+                allow_receipt_date_override: false,
             },
         )
         .await
@@ -4535,6 +4955,7 @@ mod tests {
             CreatePurchaseAllocation {
                 receipt_line_item_id: line_item_id,
                 allocated_qty: 2,
+                allow_receipt_date_override: false,
             },
         )
         .await
@@ -4610,6 +5031,7 @@ mod tests {
             CreatePurchaseAllocation {
                 receipt_line_item_id: line_item_id,
                 allocated_qty: 2,
+                allow_receipt_date_override: false,
             },
         )
         .await
@@ -4680,6 +5102,124 @@ mod tests {
         assert!(
             after.is_none(),
             "Invoice-only purchase should be removed instead of becoming orphaned"
+        );
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deleting_locked_invoice_requires_reopen_first() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id, invoice_id) =
+            seed_purchase_with_receipt_and_state(&pool, "locked")
+                .await
+                .expect("seed data");
+
+        let err = delete_invoice(&pool, invoice_id, Uuid::new_v4())
+            .await
+            .expect_err("locked invoice should not be deletable");
+
+        assert_locked_invoice_sql_error(&err);
+
+        let invoice_after = get_invoice_by_id(&pool, invoice_id)
+            .await
+            .expect("invoice lookup should succeed after failed delete");
+        assert!(
+            invoice_after.is_some(),
+            "Locked invoice should remain after failed delete"
+        );
+
+        cleanup_seeded(
+            &pool,
+            vendor_id,
+            destination_id,
+            item_id,
+            receipt_id,
+            purchase_id,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deleting_invoice_cleans_allocation_backed_invoice_only_purchase() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("Skipping test: DATABASE_URL is not set or unreachable");
+            return;
+        };
+
+        let (vendor_id, destination_id, item_id, receipt_id, purchase_id) =
+            seed_purchase_with_receipt(&pool).await.expect("seed data");
+
+        let before = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read before")
+            .expect("purchase exists before");
+        let invoice_id = before
+            .invoice_id
+            .expect("seed purchase should have invoice");
+
+        let line_item_id = create_receipt_line_item_for_seed(
+            &pool,
+            receipt_id,
+            item_id,
+            2,
+            Decimal::new(87999, 2),
+        )
+        .await;
+
+        let _allocation = create_purchase_allocation(
+            &pool,
+            purchase_id,
+            CreatePurchaseAllocation {
+                receipt_line_item_id: line_item_id,
+                allocated_qty: 2,
+                allow_receipt_date_override: false,
+            },
+        )
+        .await
+        .expect("allocation should be created");
+
+        sqlx::query(r#"UPDATE purchases SET receipt_id = NULL WHERE id = $1"#)
+            .bind(purchase_id)
+            .execute(&pool)
+            .await
+            .expect("should detach direct receipt link");
+
+        let deleted = delete_invoice(&pool, invoice_id, Uuid::new_v4())
+            .await
+            .expect("delete invoice should succeed");
+        assert!(deleted, "invoice should be deleted");
+
+        let after = get_purchase_by_id(&pool, purchase_id)
+            .await
+            .expect("purchase read after delete");
+        assert!(
+            after.is_none(),
+            "Allocation-backed invoice-only purchase should be removed after invoice delete"
+        );
+
+        let allocation_count = sqlx::query_scalar!(
+            r#"SELECT COUNT(*)::BIGINT AS "count!" FROM purchase_allocations WHERE purchase_id = $1"#,
+            purchase_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("allocation count read");
+        assert_eq!(
+            allocation_count, 0,
+            "Allocation rows should be removed for deleted-invoice purchases"
         );
 
         cleanup_seeded(
@@ -5026,6 +5566,7 @@ mod tests {
             CreatePurchaseAllocation {
                 receipt_line_item_id: line_item_id,
                 allocated_qty: 1,
+                allow_receipt_date_override: false,
             },
         )
         .await
@@ -5071,6 +5612,7 @@ mod tests {
             CreatePurchaseAllocation {
                 receipt_line_item_id: line_item_id,
                 allocated_qty: 1,
+                allow_receipt_date_override: false,
             },
         )
         .await
@@ -5101,6 +5643,7 @@ mod tests {
             UpdatePurchaseAllocation {
                 receipt_line_item_id: Some(line_item_id),
                 allocated_qty: Some(1),
+                allow_receipt_date_override: None,
             },
         )
         .await
@@ -5150,6 +5693,7 @@ mod tests {
             CreatePurchaseAllocation {
                 receipt_line_item_id: line_item_id,
                 allocated_qty: 2,
+                allow_receipt_date_override: false,
             },
         )
         .await

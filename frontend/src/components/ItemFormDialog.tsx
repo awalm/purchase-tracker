@@ -16,6 +16,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { ConfirmCloseDialog } from "@/components/ConfirmCloseDialog"
 import type { ActiveItem } from "@/types"
 
 interface ItemFormDialogProps {
@@ -49,6 +50,30 @@ export function ItemFormDialog({
   const [name, setName] = useState("")
   const [defaultDestinationId, setDefaultDestinationId] = useState("")
   const [notes, setNotes] = useState("")
+  const [confirmCloseOpen, setConfirmCloseOpen] = useState(false)
+
+  const initialName = editingItem?.name || defaults?.name || ""
+  const initialDefaultDestinationId =
+    editingItem?.default_destination_id || defaults?.defaultDestinationId || ""
+  const initialNotes = editingItem?.notes || ""
+  const isDirty =
+    name !== initialName ||
+    defaultDestinationId !== initialDefaultDestinationId ||
+    notes !== initialNotes
+  const hasActionInProgress = createItem.isPending || updateItem.isPending || isDirty
+
+  const closeDialogNow = () => {
+    setConfirmCloseOpen(false)
+    onOpenChange(false)
+  }
+
+  const requestCloseDialog = () => {
+    if (hasActionInProgress) {
+      setConfirmCloseOpen(true)
+      return
+    }
+    closeDialogNow()
+  }
 
   // Reset form when dialog opens/closes or editing item changes
   useEffect(() => {
@@ -75,7 +100,7 @@ export function ItemFormDialog({
         notes: notes || null,
       })
       onUpdated?.()
-      onOpenChange(false)
+      closeDialogNow()
     } else {
       const { id } = await createItem.mutateAsync({
         name,
@@ -83,14 +108,24 @@ export function ItemFormDialog({
         notes: notes || undefined,
       })
       onCreated?.(id)
-      onOpenChange(false)
+      closeDialogNow()
     }
   }
 
   const isEditing = !!editingItem
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <>
+      <Dialog
+        open={open}
+        onOpenChange={(nextOpen) => {
+          if (nextOpen) {
+            onOpenChange(true)
+            return
+          }
+          requestCloseDialog()
+        }}
+      >
       <DialogContent className="max-w-md">
         <DialogHeader>
           <DialogTitle>{isEditing ? "Edit Item" : "Add Item"}</DialogTitle>
@@ -132,7 +167,7 @@ export function ItemFormDialog({
             />
           </div>
           <div className="flex justify-end gap-2">
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+            <Button type="button" variant="outline" onClick={requestCloseDialog}>
               Cancel
             </Button>
             <Button type="submit" disabled={createItem.isPending || updateItem.isPending}>
@@ -141,6 +176,12 @@ export function ItemFormDialog({
           </div>
         </form>
       </DialogContent>
-    </Dialog>
+      </Dialog>
+      <ConfirmCloseDialog
+        open={confirmCloseOpen}
+        onOpenChange={setConfirmCloseOpen}
+        onConfirm={closeDialogNow}
+      />
+    </>
   )
 }

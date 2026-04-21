@@ -89,7 +89,7 @@ if [ "${ENABLE_RECEIPT_OCR:-1}" = "0" ] || [ "${DISABLE_RECEIPT_OCR:-0}" = "1" ]
 else
   echo "🔎 Receipt OCR sidecar enabled on port ${RECEIPT_OCR_PORT:-8001}"
   export OCR_VL_ENABLED="${OCR_VL_ENABLED:-1}"
-  export OCR_HTTP_WORKERS="${OCR_HTTP_WORKERS:-2}"
+  export OCR_HTTP_WORKERS="${OCR_HTTP_WORKERS:-1}"
   export OCR_PARSE_CONCURRENCY_PER_WORKER="${OCR_PARSE_CONCURRENCY_PER_WORKER:-1}"
   echo "🔎 OCR fallback (VL) enabled: ${OCR_VL_ENABLED}"
   echo "🔎 OCR HTTP workers: ${OCR_HTTP_WORKERS}"

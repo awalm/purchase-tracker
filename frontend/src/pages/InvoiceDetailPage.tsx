@@ -226,6 +226,7 @@ export default function InvoiceDetailPage() {
   const [allocationUnitCost, setAllocationUnitCost] = useState("")
   const [showNewReceipt, setShowNewReceipt] = useState(false)
   const [linkNotes, setLinkNotes] = useState("")
+  const [allowReceiptDateOverride, setAllowReceiptDateOverride] = useState(false)
   const [expandedAllocations, setExpandedAllocations] = useState<Record<string, boolean>>({})
   const [allocationApiUnavailable, setAllocationApiUnavailable] = useState(false)
   const [allocatableReceiptIds, setAllocatableReceiptIds] = useState<string[]>([])
@@ -282,6 +283,15 @@ export default function InvoiceDetailPage() {
     }
   }
 
+  const isReceiptDateEligibleForInvoice = (
+    receiptDate: string | null | undefined,
+    overrideEnabled: boolean
+  ) => {
+    if (overrideEnabled) return true
+    if (!invoice?.invoice_date || !receiptDate) return true
+    return receiptDate.slice(0, 10) <= invoice.invoice_date
+  }
+
   useEffect(() => {
     const load = async () => {
       if (!purchases.length) {
@@ -331,6 +341,7 @@ export default function InvoiceDetailPage() {
     setLinkingPurchaseId(purchase.purchase_id)
     setLinkingPurchase(purchase)
     setLinkNotes(purchase.notes || "")
+    setAllowReceiptDateOverride(Boolean(purchase.allow_receipt_date_override))
     setLoadingAllocations(true)
     const existing = getEffectiveAllocations(purchase)
     setAllocations(existing)
@@ -408,6 +419,18 @@ export default function InvoiceDetailPage() {
   }
 
   const loadReceiptLineItemsForAllocation = async (receiptId: string, purchase: InvoicePurchase) => {
+    const selectedReceipt = receipts.find((row) => row.id === receiptId)
+    const receiptDateOutOfRange = !isReceiptDateEligibleForInvoice(
+      selectedReceipt?.receipt_date,
+      allowReceiptDateOverride
+    )
+
+    if (receiptDateOutOfRange) {
+      setAllocationWarning(
+        `Receipt date ${formatDate(selectedReceipt?.receipt_date)} is after invoice date ${formatDate(invoice?.invoice_date)}. Enable override to proceed.`
+      )
+    }
+
     const rows = await getReceiptLineItemsCached(receiptId)
     const sameItemRows = rows
       .filter((row) => row.item_id === purchase.item_id)
@@ -432,6 +455,14 @@ export default function InvoiceDetailPage() {
       setAllocationWarning("No allocatable quantity remains for this line.")
       return
     }
+
+    if (receiptDateOutOfRange) {
+      setAllocationWarning(
+        `Receipt date ${formatDate(selectedReceipt?.receipt_date)} is after invoice date ${formatDate(invoice?.invoice_date)}. Enable override to proceed.`
+      )
+      return
+    }
+
     setAllocationWarning("")
   }
 
@@ -442,6 +473,10 @@ export default function InvoiceDetailPage() {
       const candidateIds = (
         await Promise.all(
           receipts.map(async (receipt) => {
+            if (!isReceiptDateEligibleForInvoice(receipt.receipt_date, allowReceiptDateOverride)) {
+              return null
+            }
+
             const rows = await getReceiptLineItemsCached(receipt.id)
             const sameItemRows = rows.filter((row) => row.item_id === purchase.item_id)
             const hasAllocatableLine = sameItemRows.some(
@@ -460,7 +495,13 @@ export default function InvoiceDetailPage() {
         setAllocationReceiptLineItems([])
         setAllocationUnitCost("")
         setAllocationQty("")
-        setAllocationWarning("No receipts currently have allocatable line items for this product.")
+        if (allowReceiptDateOverride) {
+          setAllocationWarning("No receipts currently have allocatable line items for this product.")
+        } else {
+          setAllocationWarning(
+            `No receipts on or before invoice date ${formatDate(invoice?.invoice_date)} have allocatable line items for this product. Enable override to include later receipts.`
+          )
+        }
         return
       }
 
@@ -492,6 +533,8 @@ export default function InvoiceDetailPage() {
     allocations,
     editingAllocationId,
     receipts,
+    allowReceiptDateOverride,
+    invoice?.invoice_date,
   ])
 
   const handleAllocationReceiptChange = async (value: string) => {
@@ -570,6 +613,14 @@ export default function InvoiceDetailPage() {
       return
     }
 
+    const selectedReceipt = receipts.find((row) => row.id === allocationReceiptId)
+    if (!isReceiptDateEligibleForInvoice(selectedReceipt?.receipt_date, allowReceiptDateOverride)) {
+      setAllocationError(
+        `Receipt date ${formatDate(selectedReceipt?.receipt_date)} is after invoice date ${formatDate(invoice?.invoice_date)}. Enable override to continue.`
+      )
+      return
+    }
+
     const selectedLineItem = allocationReceiptLineItems.find((row) => row.id === allocationReceiptLineItemId)
     if (!selectedLineItem) {
       setAllocationError("Selected receipt line item is unavailable. Reload and try again.")
@@ -611,11 +662,13 @@ export default function InvoiceDetailPage() {
         await purchasesApi.allocations.update(linkingPurchaseId, editingAllocationId, {
           receipt_line_item_id: allocationReceiptLineItemId,
           allocated_qty: qty,
+          allow_receipt_date_override: allowReceiptDateOverride,
         })
       } else {
         await purchasesApi.allocations.create(linkingPurchaseId, {
           receipt_line_item_id: allocationReceiptLineItemId,
           allocated_qty: qty,
+          allow_receipt_date_override: allowReceiptDateOverride,
         })
       }
 
@@ -677,19 +730,28 @@ export default function InvoiceDetailPage() {
         : ""
 
     if (result.auto_allocated_qty <= 0) {
-      return `No additional quantity could be auto-allocated for ${purchase.item_name}. ${formatUnits(result.remaining_qty)} remain unallocated.`
+      const base = `No additional quantity could be auto-allocated for ${purchase.item_name}. ${formatUnits(result.remaining_qty)} remain unallocated.`
+      return result.warning ? `${base} ${result.warning}` : base
     }
 
     if (result.remaining_qty > 0) {
       return `Auto-allocated ${formatUnits(result.auto_allocated_qty)}${touchedReceiptLabel} for ${purchase.item_name}. ${formatUnits(result.remaining_qty)} still need manual allocation.`
     }
 
-    return `Auto-allocation complete for ${purchase.item_name}: ${formatUnits(result.auto_allocated_qty)}${touchedReceiptLabel}.`
+    const completed = `Auto-allocation complete for ${purchase.item_name}: ${formatUnits(result.auto_allocated_qty)}${touchedReceiptLabel}.`
+    return result.warning ? `${completed} ${result.warning}` : completed
   }
 
   const buildAutoAllocateLineSummary = (
     result: AutoAllocatePurchaseResult
   ): AutoAllocateLineSummary => {
+    if (result.warning) {
+      return {
+        message: "Auto: no eligible receipts before invoice date",
+        tone: "warning",
+      }
+    }
+
     if (result.auto_allocated_qty <= 0) {
       return {
         message: `Auto: no qty allocated (${result.remaining_qty} remaining)`,
@@ -710,11 +772,19 @@ export default function InvoiceDetailPage() {
     }
   }
 
-  const handleAutoAllocatePurchase = async (purchase: InvoicePurchase) => {
+  const handleAutoAllocatePurchase = async (
+    purchase: InvoicePurchase,
+    options?: {
+      allowReceiptDateOverride?: boolean
+    }
+  ) => {
     if (invoiceLocked) {
       setReconciliationActionError("Finalized invoices are locked.")
       return
     }
+
+    const allowDateOverride =
+      options?.allowReceiptDateOverride ?? Boolean(purchase.allow_receipt_date_override)
 
     setReconciliationActionError("")
     setReconciliationActionNotice("")
@@ -726,7 +796,9 @@ export default function InvoiceDetailPage() {
     setAutoAllocatingPurchaseId(purchase.purchase_id)
 
     try {
-      const result = await purchasesApi.allocations.auto(purchase.purchase_id)
+      const result = await purchasesApi.allocations.auto(purchase.purchase_id, {
+        allow_receipt_date_override: allowDateOverride,
+      })
       clearReceiptLineItemsCache()
       await reloadAllocations(purchase.purchase_id)
 
@@ -742,7 +814,10 @@ export default function InvoiceDetailPage() {
         [purchase.purchase_id]: buildAutoAllocateLineSummary(result),
       }))
 
-      if (linkingPurchaseId === purchase.purchase_id && result.remaining_qty > 0) {
+      if (
+        linkingPurchaseId === purchase.purchase_id &&
+        (result.remaining_qty > 0 || Boolean(result.warning))
+      ) {
         setAllocationWarning(notice)
       }
     } catch (err) {
@@ -989,12 +1064,15 @@ export default function InvoiceDetailPage() {
         quantity: purchase.quantity,
         purchase_cost: purchase.purchase_cost,
         receipt_id: purchase.receipt_id,
+        invoice_date: invoice.invoice_date,
         invoice_id: purchase.invoice_id,
         invoice_unit_price: purchase.invoice_unit_price,
         destination_code: purchase.destination_code,
         requireAllocations: true,
         allocationCount: allocs.length,
         allocatedQty,
+        allocationReceiptDates: allocs.map((allocation) => allocation.receipt_date),
+        allowReceiptDateOverride: Boolean(purchase.allow_receipt_date_override),
       }),
     }
   })
@@ -1789,6 +1867,7 @@ export default function InvoiceDetailPage() {
           setLinkingPurchaseId(null)
           setAllocations([])
           setAllocatableReceiptIds([])
+          setAllowReceiptDateOverride(false)
           resetAllocationForm()
         }
       }}>
@@ -1838,6 +1917,26 @@ export default function InvoiceDetailPage() {
                   {allocationWarning}
                 </div>
               )}
+
+              <div className="rounded-md border border-muted p-3 text-sm">
+                <label className="flex items-start gap-2">
+                  <input
+                    type="checkbox"
+                    checked={allowReceiptDateOverride}
+                    onChange={(event) => setAllowReceiptDateOverride(event.target.checked)}
+                    disabled={isFinalized}
+                    className="mt-0.5"
+                  />
+                  <span>
+                    Allow receipts dated after invoice date ({formatDate(invoice?.invoice_date)}) for this line item.
+                  </span>
+                </label>
+                {!allowReceiptDateOverride && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    By default, only receipts on or before the invoice date are eligible.
+                  </p>
+                )}
+              </div>
 
               {loadingAllocations ? (
                 <p className="text-sm text-muted-foreground">Loading allocations...</p>
@@ -1927,9 +2026,17 @@ export default function InvoiceDetailPage() {
                 {loadingAllocatableReceipts ? (
                   <p className="text-xs text-muted-foreground">Finding receipts with allocatable line items...</p>
                 ) : allocatableReceiptIds.length === 0 ? (
-                  <p className="text-xs text-amber-700">No allocatable receipts found for this product.</p>
+                  <p className="text-xs text-amber-700">
+                    {allowReceiptDateOverride
+                      ? "No allocatable receipts found for this product."
+                      : `No allocatable receipts on or before invoice date ${formatDate(invoice?.invoice_date)}.`}
+                  </p>
                 ) : (
-                  <p className="text-xs text-muted-foreground">Showing only receipts with allocatable line items for this product. Top result is auto-selected.</p>
+                  <p className="text-xs text-muted-foreground">
+                    {allowReceiptDateOverride
+                      ? "Showing receipts with allocatable line items for this product (including dates after invoice date)."
+                      : `Showing receipts with allocatable line items on or before invoice date ${formatDate(invoice?.invoice_date)}.`}
+                  </p>
                 )}
                 <div className="flex flex-wrap items-center gap-2 pt-1">
                   <Button
@@ -2029,7 +2136,9 @@ export default function InvoiceDetailPage() {
                 )}
                 <Button
                   variant="outline"
-                  onClick={() => linkingPurchase && void handleAutoAllocatePurchase(linkingPurchase)}
+                  onClick={() => linkingPurchase && void handleAutoAllocatePurchase(linkingPurchase, {
+                    allowReceiptDateOverride,
+                  })}
                   disabled={
                     isFinalized ||
                     allocationApiUnavailable ||

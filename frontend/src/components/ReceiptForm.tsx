@@ -42,6 +42,7 @@ interface ReceiptFormProps {
   onBack?: () => void
   onImport?: () => void
   importButtonLabel?: string
+  onDirtyChange?: (dirty: boolean) => void
 }
 
 export function ReceiptForm({
@@ -57,6 +58,7 @@ export function ReceiptForm({
   onBack,
   onImport,
   importButtonLabel = "Import Receipt",
+  onDirtyChange,
 }: ReceiptFormProps) {
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -91,6 +93,47 @@ export function ReceiptForm({
     initialValues?.tax_amount,
     initialValues?.payment_method,
     initialValues?.notes,
+  ])
+
+  useEffect(() => {
+    if (!onDirtyChange) return
+
+    if (!open) {
+      onDirtyChange(false)
+      return
+    }
+
+    const initialVendorId = initialValues?.vendor_id || ""
+    const initialReceiptNumber = initialValues?.receipt_number || ""
+    const initialReceiptDate = initialValues?.receipt_date || ""
+    const initialSubtotal = initialValues?.subtotal || ""
+    const initialTaxAmount = initialValues?.tax_amount || ""
+    const initialPaymentMethod = initialValues?.payment_method || ""
+    const initialNotes = initialValues?.notes || ""
+
+    const dirty =
+      vendorId !== initialVendorId ||
+      receiptNumber !== initialReceiptNumber ||
+      receiptDate !== initialReceiptDate ||
+      subtotal !== initialSubtotal ||
+      taxAmount !== initialTaxAmount ||
+      paymentMethod !== initialPaymentMethod ||
+      notes !== initialNotes ||
+      documentFile !== null
+
+    onDirtyChange(dirty)
+  }, [
+    open,
+    onDirtyChange,
+    initialValues,
+    vendorId,
+    receiptNumber,
+    receiptDate,
+    subtotal,
+    taxAmount,
+    paymentMethod,
+    notes,
+    documentFile,
   ])
 
   const handleSubmit = async (e: React.FormEvent) => {

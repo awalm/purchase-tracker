@@ -1,6 +1,7 @@
 import multiprocessing as mp
 import os
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ def _format_vl_exception(exc: Exception) -> str:
     return f"{exc.__class__.__name__}: {message}"
 
 
+@lru_cache(maxsize=1)
 def check_vl_engine_available() -> tuple[bool, str | None]:
     try:
         from paddleocr import PaddleOCRVL  # noqa: F401

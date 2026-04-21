@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::{header, StatusCode},
     response::Response,
     routing::get,
@@ -14,6 +14,8 @@ use crate::{
 };
 
 use super::AppState;
+
+const RECEIPT_MULTIPART_MAX_BYTES: usize = 25 * 1024 * 1024;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -38,6 +40,32 @@ pub fn router() -> Router<AppState> {
             "/{id}/document",
             get(download_document).post(upload_document),
         )
+        .layer(DefaultBodyLimit::max(RECEIPT_MULTIPART_MAX_BYTES))
+}
+
+fn map_receipt_multipart_error<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
+    let message = err.to_string();
+    let message_lower = message.to_ascii_lowercase();
+
+    if message_lower.contains("too large")
+        || message_lower.contains("size limit")
+        || message_lower.contains("length limit")
+        || message_lower.contains("body")
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Uploaded file is too large. Maximum allowed size is {} MB.",
+                RECEIPT_MULTIPART_MAX_BYTES / (1024 * 1024)
+            ),
+        );
+    }
+
+    (
+        StatusCode::BAD_REQUEST,
+        "Invalid upload payload. Please upload one PDF, JPG, JPEG, PNG, or WEBP file."
+            .to_string(),
+    )
 }
 
 async fn list_receipts(
@@ -259,7 +287,7 @@ async fn upload_document(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+        .map_err(map_receipt_multipart_error)?
     {
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
@@ -267,7 +295,7 @@ async fn upload_document(
             let data = field
                 .bytes()
                 .await
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+                .map_err(map_receipt_multipart_error)?;
 
             queries::save_receipt_pdf(&state.pool, id, &data, &filename)
                 .await
@@ -277,7 +305,10 @@ async fn upload_document(
         }
     }
 
-    Err((StatusCode::BAD_REQUEST, "No file field found".to_string()))
+    Err((
+        StatusCode::BAD_REQUEST,
+        "No file field found. Please upload one file using the 'file' form field.".to_string(),
+    ))
 }
 
 async fn download_document(

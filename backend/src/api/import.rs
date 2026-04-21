@@ -1803,6 +1803,8 @@ pub struct ParsedReceipt {
     pub vendor_name: Option<String>,
     #[serde(default)]
     pub suggested_vendor_id: Option<Uuid>,
+    #[serde(default)]
+    pub fixture_used: Option<String>,
     pub receipt_number: Option<String>,
     pub receipt_date: Option<String>,
     pub subtotal: Option<String>,

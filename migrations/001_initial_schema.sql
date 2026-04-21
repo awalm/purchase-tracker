@@ -103,6 +103,7 @@ CREATE TABLE purchases (
     status delivery_status NOT NULL DEFAULT 'pending',
     delivery_date DATE,
     notes TEXT,
+    allow_receipt_date_override BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

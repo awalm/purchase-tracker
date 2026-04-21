@@ -8,7 +8,10 @@ import uvicorn
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from starlette.concurrency import run_in_threadpool
 
-from ocr_service_classic_engine import parse_receipt_path_with_score as parse_classic_with_score
+from ocr_service_classic_engine import (
+    get_classic_ocr,
+    parse_receipt_path_with_score as parse_classic_with_score,
+)
 from ocr_service_common import env_bool, env_float, env_int, is_low_confidence
 from ocr_service_llm_engine import (
     check_vl_engine_available,
@@ -20,9 +23,14 @@ app = FastAPI(title="bg-tracker-receipt-ocr")
 _parse_limiter = asyncio.Semaphore(env_int("OCR_PARSE_CONCURRENCY_PER_WORKER", 1, 1))
 
 
+@app.on_event("startup")
+async def _warm_classic_model_on_startup() -> None:
+    if env_bool("OCR_CLASSIC_PRELOAD_ON_STARTUP", True):
+        await run_in_threadpool(get_classic_ocr)
+
+
 def _http_workers() -> int:
-    cpu_count = os.cpu_count() or 1
-    default_workers = 2 if cpu_count > 1 else 1
+    default_workers = 1
     return env_int("OCR_HTTP_WORKERS", default_workers, 1)
 
 
@@ -122,7 +130,9 @@ def parse_receipt_path(path: str | Path) -> dict[str, Any]:
                 f"{fallback_reason}; {msg}; no PaddleOCR result was available."
             ) from exc
         if env_bool("OCR_VL_STRICT", False):
-            raise RuntimeError(f"{fallback_reason}; {msg}; strict mode requires VL fallback.") from exc
+            raise RuntimeError(
+                f"{fallback_reason}; {msg}; strict mode requires VL fallback."
+            ) from exc
         if classic_result is not None:
             _append_warning_with_final_engine(classic_result, f"{fallback_reason}; {msg}", "paddleocr")
             return classic_result

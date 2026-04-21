@@ -17,6 +17,7 @@ import {
   TableCell,
 } from "@/components/ui/table"
 import { Upload, CheckCircle, XCircle, AlertCircle, Download, Loader2, Eye } from "lucide-react"
+import { ConfirmCloseDialog } from "@/components/ConfirmCloseDialog"
 import type { PreviewResult, PreviewRow } from "@/api"
 
 interface ImportResult {
@@ -65,6 +66,7 @@ export function ImportDialog<T>({
   const [result, setResult] = useState<ImportResult | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [confirmCloseOpen, setConfirmCloseOpen] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -169,11 +171,38 @@ export function ImportDialog<T>({
     onOpenChange?.(nextOpen)
   }
 
+  const hasActionInProgress =
+    isLoading ||
+    isPending ||
+    step === "preview" ||
+    (step === "upload" && csvContent.trim().length > 0)
+
+  const closeDialogNow = () => {
+    setConfirmCloseOpen(false)
+    setDialogOpen(false)
+    resetState()
+  }
+
+  const requestCloseDialog = () => {
+    if (hasActionInProgress) {
+      setConfirmCloseOpen(true)
+      return
+    }
+    closeDialogNow()
+  }
+
   return (
-    <Dialog open={isOpen} onOpenChange={(open) => {
-      setDialogOpen(open)
-      if (!open) resetState()
-    }}>
+    <>
+      <Dialog
+        open={isOpen}
+        onOpenChange={(nextOpen) => {
+          if (nextOpen) {
+            setDialogOpen(true)
+            return
+          }
+          requestCloseDialog()
+        }}
+      >
       <DialogTrigger asChild>
         <Button variant="outline">
           <Upload className="h-4 w-4 mr-2" />
@@ -362,7 +391,7 @@ export function ImportDialog<T>({
                   ← Back
                 </Button>
                 <div className="flex gap-2">
-                  <Button variant="outline" onClick={() => setDialogOpen(false)}>
+                  <Button variant="outline" onClick={requestCloseDialog}>
                     Cancel
                   </Button>
                   <Button 
@@ -455,7 +484,7 @@ export function ImportDialog<T>({
                 <Button variant="outline" onClick={resetState}>
                   Import Another
                 </Button>
-                <Button onClick={() => setDialogOpen(false)}>
+                <Button onClick={requestCloseDialog}>
                   Done
                 </Button>
               </div>
@@ -463,6 +492,12 @@ export function ImportDialog<T>({
           )}
         </div>
       </DialogContent>
-    </Dialog>
+      </Dialog>
+      <ConfirmCloseDialog
+        open={confirmCloseOpen}
+        onOpenChange={setConfirmCloseOpen}
+        onConfirm={closeDialogNow}
+      />
+    </>
   )
 }

@@ -49,11 +49,14 @@ import { EmptyTableRow } from "@/components/EmptyTableRow"
 import { ExportCsvButton } from "@/components/ExportCsvButton"
 import { BulkReceiptImportDialog } from "@/components/BulkReceiptImportDialog"
 import { ItemFormDialog } from "@/components/ItemFormDialog"
+import { ConfirmCloseDialog } from "@/components/ConfirmCloseDialog"
 import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
 import { Plus, Trash2, Pencil, FileText, Upload, CheckCircle2, AlertCircle, Clock, Loader2 } from "lucide-react"
 import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
 import {
   computeImportLineItemsSubtotal,
+  findDuplicateMappedImportItems,
+  findExistingReceiptByNumber,
   getImportSubtotalDifference,
   importSubtotalMatches,
   truncateOptionLabel,
@@ -62,6 +65,10 @@ import {
   getReceiptItemsDisplayCount,
   getReceiptReconciliationBadgeState,
 } from "@/lib/receiptSummary"
+import {
+  getCachedVendorItemId,
+  rememberVendorItemMappings,
+} from "@/lib/vendorItemMappingCache"
 
 type Receipt = ReturnType<typeof useReceipts>["data"] extends (infer T)[] | undefined ? T : never
 
@@ -107,6 +114,12 @@ const getOcrEngineDisplayName = (engine: string | null | undefined): string => {
   return engine?.trim() || "Unknown"
 }
 
+const getFixtureUsedDisplayName = (fixtureUsed: string | null | undefined): string => {
+  const normalized = fixtureUsed?.trim().toLowerCase()
+  if (!normalized) return "generic"
+  return normalized
+}
+
 function ReconciliationBadge({ receipt }: { receipt: Receipt }) {
   const badgeState = getReceiptReconciliationBadgeState(receipt)
 
@@ -143,18 +156,27 @@ export default function ReceiptsPage() {
   const { data: allReceipts = [], isLoading } = useReceipts()
   const { data: vendors = [] } = useVendors()
   const { data: items = [] } = useItems()
+  const itemIdSet = useMemo(() => new Set(items.map((item) => item.id)), [items])
+  const itemNameById = useMemo(
+    () => new Map(items.map((item) => [item.id, item.name])),
+    [items]
+  )
 
   const createReceipt = useCreateReceipt()
   const updateReceipt = useUpdateReceipt()
   const deleteReceipt = useDeleteReceipt()
 
   const [isOpen, setIsOpen] = useState(false)
+  const [isReceiptFormDirty, setIsReceiptFormDirty] = useState(false)
+  const [confirmReceiptCloseOpen, setConfirmReceiptCloseOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [vendorFilter, setVendorFilter] = useState<string>("")
 
   const [isImportOpen, setIsImportOpen] = useState(false)
+  const [confirmImportCloseOpen, setConfirmImportCloseOpen] = useState(false)
   const [bulkImportOpen, setBulkImportOpen] = useState(false)
   const [bulkImportPrefillFiles, setBulkImportPrefillFiles] = useState<File[]>([])
+  const [bulkImportPrefillOcrMode, setBulkImportPrefillOcrMode] = useState<ReceiptOcrMode | null>(null)
   const [bulkImportAutoStart, setBulkImportAutoStart] = useState(false)
   const [importFile, setImportFile] = useState<File | null>(null)
   const [parsedReceipt, setParsedReceipt] = useState<ParsedReceipt | null>(null)
@@ -175,6 +197,7 @@ export default function ReceiptsPage() {
   const [importLineItemOverrides, setImportLineItemOverrides] = useState<Record<number, string>>({})
   const [importLineQtyOverrides, setImportLineQtyOverrides] = useState<Record<number, string>>({})
   const [importLineUnitCostOverrides, setImportLineUnitCostOverrides] = useState<Record<number, string>>({})
+  const [importDeletedLineIndexes, setImportDeletedLineIndexes] = useState<Record<number, true>>({})
   const [importManualLines, setImportManualLines] = useState<ManualImportLine[]>([])
   const [importNewItemTarget, setImportNewItemTarget] = useState<ImportNewItemTarget | null>(null)
   const [importWarnings, setImportWarnings] = useState<string[]>([])
@@ -214,16 +237,14 @@ export default function ReceiptsPage() {
     : allReceipts
 
   const duplicateImportedReceipt = useMemo(() => {
-    const normalized = importReceiptNumber.trim().toLowerCase()
-    if (!normalized) return null
-
-    return allReceipts.find((r) => r.receipt_number.trim().toLowerCase() === normalized) || null
+    return findExistingReceiptByNumber(allReceipts, importReceiptNumber)
   }, [allReceipts, importReceiptNumber])
 
   const hasDuplicateImportedReceipt = Boolean(duplicateImportedReceipt)
 
   const resetForm = () => {
     setEditingId(null)
+    setIsReceiptFormDirty(false)
   }
 
   const resetImportForm = () => {
@@ -246,6 +267,7 @@ export default function ReceiptsPage() {
     setImportLineItemOverrides({})
     setImportLineQtyOverrides({})
     setImportLineUnitCostOverrides({})
+    setImportDeletedLineIndexes({})
     setImportManualLines([])
     setImportNewItemTarget(null)
     setImportWarnings([])
@@ -261,6 +283,14 @@ export default function ReceiptsPage() {
 
   const getAutoMatchedItemId = (description: string): string | null => {
     const descriptionNormalized = normalizeItemName(description)
+
+    if (importVendorId) {
+      const cachedItemId = getCachedVendorItemId(importVendorId, description)
+      if (cachedItemId && itemIdSet.has(cachedItemId)) {
+        return cachedItemId
+      }
+    }
+
     const direct = items.find((it) => normalizeItemName(it.name) === descriptionNormalized)
     if (direct) return direct.id
 
@@ -319,6 +349,23 @@ export default function ReceiptsPage() {
     return getAutoMatchedItemId(resolveImportedDescription(index, description))
   }
 
+  const resolveImportedLineNotes = (index: number, fallbackDescription: string): string => {
+    const explicitDescription = importLineDescriptionOverrides[index]
+    if (typeof explicitDescription === "string") {
+      return explicitDescription
+    }
+
+    const mappedItemOverrideId = importLineItemOverrides[index]
+    if (mappedItemOverrideId) {
+      const mappedName = itemNameById.get(mappedItemOverrideId)
+      if (mappedName) {
+        return mappedName
+      }
+    }
+
+    return fallbackDescription
+  }
+
   const resolveImportedQty = (index: number, fallbackQty: number): number => {
     const raw = importLineQtyOverrides[index]
     if (!raw) return fallbackQty
@@ -339,8 +386,11 @@ export default function ReceiptsPage() {
     return null
   }
 
+  const isImportedLineDeleted = (index: number): boolean => Boolean(importDeletedLineIndexes[index])
+
   const unresolvedParsedCount = parsedReceipt
     ? parsedReceipt.line_items.filter((li, idx) => {
+        if (isImportedLineDeleted(idx)) return false
         const description = resolveImportedDescription(idx, li.description).trim()
         const itemId = resolveImportedItemId(li.description, idx)
         const qty = resolveImportedQty(idx, li.quantity)
@@ -364,17 +414,60 @@ export default function ReceiptsPage() {
   }).length
 
   const unresolvedImportedCount = unresolvedParsedCount + unresolvedManualCount
-  const totalImportLineCount = (parsedReceipt?.line_items.length || 0) + importManualLines.length
+  const totalParsedLineCount = parsedReceipt
+    ? parsedReceipt.line_items.filter((_, idx) => !isImportedLineDeleted(idx)).length
+    : 0
+  const totalImportLineCount = totalParsedLineCount + importManualLines.length
 
-  const importLineItemsSubtotal = useMemo(() => {
-    const parsedLines = (parsedReceipt?.line_items || []).map((li, idx) => {
-      const qty = resolveImportedQty(idx, li.quantity)
-      const unitCost = resolveImportedUnitCost(idx, li.unit_cost, qty, li.line_total)
+  const duplicateMappedImportedItems = (() => {
+    if (!parsedReceipt) {
+      return []
+    }
+
+    let lineNumber = 0
+    const parsedMappedLines = parsedReceipt.line_items
+      .map((li, idx) => ({ li, idx }))
+      .filter(({ idx }) => !isImportedLineDeleted(idx))
+      .map(({ li, idx }) => {
+        lineNumber += 1
+        const itemId = resolveImportedItemId(li.description, idx)
+        return {
+          lineNumber,
+          itemId,
+          itemName: itemId ? itemNameById.get(itemId) || null : null,
+        }
+      })
+
+    const manualMappedLines = importManualLines.map((line) => {
+      lineNumber += 1
+      const itemId = line.itemId.trim() || null
       return {
-        quantity: qty,
-        unitCost,
+        lineNumber,
+        itemId,
+        itemName: itemId ? itemNameById.get(itemId) || null : null,
       }
     })
+
+    return findDuplicateMappedImportItems([...parsedMappedLines, ...manualMappedLines])
+  })()
+
+  const hasDuplicateMappedImportedItems = duplicateMappedImportedItems.length > 0
+  const duplicateMappedImportedMessage = hasDuplicateMappedImportedItems
+    ? `Item \"${duplicateMappedImportedItems[0].itemName}\" is mapped on multiple lines (${duplicateMappedImportedItems[0].lineNumbers.join(", ")}). Each item can appear only once per receipt.`
+    : ""
+
+  const importLineItemsSubtotal = useMemo(() => {
+    const parsedLines = (parsedReceipt?.line_items || [])
+      .map((li, idx) => ({ li, idx }))
+      .filter(({ idx }) => !isImportedLineDeleted(idx))
+      .map(({ li, idx }) => {
+        const qty = resolveImportedQty(idx, li.quantity)
+        const unitCost = resolveImportedUnitCost(idx, li.unit_cost, qty, li.line_total)
+        return {
+          quantity: qty,
+          unitCost,
+        }
+      })
 
     const manualLines = importManualLines.map((line) => ({
       quantity: line.quantity,
@@ -382,7 +475,7 @@ export default function ReceiptsPage() {
     }))
 
     return computeImportLineItemsSubtotal([...parsedLines, ...manualLines])
-  }, [parsedReceipt, importLineQtyOverrides, importLineUnitCostOverrides, importManualLines])
+  }, [parsedReceipt, importLineQtyOverrides, importLineUnitCostOverrides, importDeletedLineIndexes, importManualLines])
 
   const importSubtotalDifference = useMemo(
     () => getImportSubtotalDifference(importSubtotal, importLineItemsSubtotal),
@@ -401,6 +494,44 @@ export default function ReceiptsPage() {
     selectedVendorAliases.some(
       (alias) => alias.raw_alias.trim().toLowerCase() === importVendorLabel.trim().toLowerCase()
     )
+
+  const hasImportActionInProgress =
+    importParsing ||
+    importCreating ||
+    importFile !== null ||
+    parsedReceipt !== null ||
+    importManualLines.length > 0
+
+  const closeImportDialogNow = () => {
+    setConfirmImportCloseOpen(false)
+    setIsImportOpen(false)
+    resetImportForm()
+  }
+
+  const requestImportDialogClose = () => {
+    if (hasImportActionInProgress) {
+      setConfirmImportCloseOpen(true)
+      return
+    }
+    closeImportDialogNow()
+  }
+
+  const hasReceiptActionInProgress =
+    createReceipt.isPending || updateReceipt.isPending || isReceiptFormDirty
+
+  const closeReceiptDialogNow = () => {
+    setConfirmReceiptCloseOpen(false)
+    setIsOpen(false)
+    resetForm()
+  }
+
+  const requestReceiptDialogClose = () => {
+    if (hasReceiptActionInProgress) {
+      setConfirmReceiptCloseOpen(true)
+      return
+    }
+    closeReceiptDialogNow()
+  }
 
   const handleSaveVendorMapping = async () => {
     const rawVendorLabel = importVendorLabel.trim()
@@ -439,9 +570,11 @@ export default function ReceiptsPage() {
     if (selectedFiles.length === 0) return
 
     if (selectedFiles.length > 1) {
+      const selectedMode = importOcrMode
       setIsImportOpen(false)
       resetImportForm()
       setBulkImportPrefillFiles(selectedFiles)
+      setBulkImportPrefillOcrMode(selectedMode)
       setBulkImportAutoStart(true)
       setBulkImportOpen(true)
       return
@@ -460,6 +593,7 @@ export default function ReceiptsPage() {
     setImportLineItemOverrides({})
     setImportLineQtyOverrides({})
     setImportLineUnitCostOverrides({})
+    setImportDeletedLineIndexes({})
     setImportManualLines([])
     setImportNewItemTarget(null)
     setImportWarnings([])
@@ -533,6 +667,10 @@ export default function ReceiptsPage() {
       }
       return
     }
+    if (hasDuplicateMappedImportedItems) {
+      setImportError(duplicateMappedImportedMessage)
+      return
+    }
     if (hasImportSubtotalMismatch) {
       const expected = Number.parseFloat(importSubtotal)
       setImportError(
@@ -545,6 +683,7 @@ export default function ReceiptsPage() {
     setImportError("")
 
     let createdReceiptId: string | null = null
+    const learnedMappings: Array<{ sourceText: string; itemId: string }> = []
 
     try {
       setImportStatus("Creating receipt...")
@@ -561,6 +700,7 @@ export default function ReceiptsPage() {
           auto_parsed: true,
           parse_engine: parsedReceipt.parse_engine || "unknown",
           ...(parsedReceipt.parse_version ? { parse_version: parsedReceipt.parse_version } : {}),
+          ...(parsedReceipt.fixture_used ? { fixture_used: parsedReceipt.fixture_used } : {}),
           ...(typeof parsedReceipt.confidence_score === "number"
             ? { confidence_score: parsedReceipt.confidence_score }
             : {}),
@@ -577,8 +717,13 @@ export default function ReceiptsPage() {
 
       setImportStatus("Creating receipt line items...")
       for (let i = 0; i < parsedReceipt.line_items.length; i += 1) {
+        if (isImportedLineDeleted(i)) {
+          continue
+        }
+
         const li = parsedReceipt.line_items[i]
         const description = resolveImportedDescription(i, li.description).trim()
+        const lineNotes = resolveImportedLineNotes(i, li.description).trim()
         const itemId = resolveImportedItemId(li.description, i)
         const qty = resolveImportedQty(i, li.quantity)
         const unitCost = resolveImportedUnitCost(i, li.unit_cost, qty, li.line_total)
@@ -600,13 +745,23 @@ export default function ReceiptsPage() {
           item_id: itemId,
           quantity: qty,
           unit_cost: unitCost,
-          notes: description,
+          notes: lineNotes || description,
+        })
+
+        learnedMappings.push({
+          sourceText: description,
+          itemId,
         })
       }
 
+      const parsedLineCountForNumbering = parsedReceipt.line_items.reduce(
+        (count, _line, idx) => count + (isImportedLineDeleted(idx) ? 0 : 1),
+        0
+      )
+
       for (let i = 0; i < importManualLines.length; i += 1) {
         const line = importManualLines[i]
-        const manualLineNumber = parsedReceipt.line_items.length + i + 1
+        const manualLineNumber = parsedLineCountForNumbering + i + 1
         const itemId = line.itemId
         const qty = Number.parseInt(line.quantity, 10)
         const unitCost = line.unitCost.trim()
@@ -632,6 +787,11 @@ export default function ReceiptsPage() {
           unit_cost: unitCostNumber.toFixed(2),
           notes: description,
         })
+
+        learnedMappings.push({
+          sourceText: description,
+          itemId,
+        })
       }
 
       setImportStatus("Uploading original receipt document...")
@@ -639,17 +799,31 @@ export default function ReceiptsPage() {
         bypassCompression: importBypassCompression,
       })
 
+      rememberVendorItemMappings(importVendorId, learnedMappings)
+
       setImportStatus("Done")
       queryClient.invalidateQueries({ queryKey: ["receipts"] })
-      setIsImportOpen(false)
-      resetImportForm()
+      closeImportDialogNow()
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to import receipt"
-      setImportError(
-        createdReceiptId
-          ? `${msg}. Receipt was created (${createdReceiptId}) but import did not fully complete.`
-          : msg
-      )
+      const baseMessage = err instanceof Error ? err.message : "Failed to import receipt"
+      let message = baseMessage
+
+      if (createdReceiptId) {
+        try {
+          await receiptsApi.delete(createdReceiptId)
+          message = `${baseMessage}. Import was rolled back and temporary receipt (${createdReceiptId}) was deleted.`
+        } catch (cleanupErr) {
+          const cleanupMessage =
+            cleanupErr instanceof Error
+              ? cleanupErr.message
+              : "Failed to clean up created receipt"
+          message = `${baseMessage}. Receipt was created (${createdReceiptId}) but rollback failed: ${cleanupMessage}`
+        }
+
+        queryClient.invalidateQueries({ queryKey: ["receipts"] })
+      }
+
+      setImportError(message)
     } finally {
       setImportCreating(false)
       setImportStatus("")
@@ -687,8 +861,7 @@ export default function ReceiptsPage() {
       await receiptsApi.uploadPdf(receiptId, data.document_file)
     }
 
-    setIsOpen(false)
-    resetForm()
+    closeReceiptDialogNow()
   }
 
   const handleEdit = (r: (typeof allReceipts)[0]) => {
@@ -758,8 +931,11 @@ export default function ReceiptsPage() {
           <Dialog
             open={isImportOpen}
             onOpenChange={(open) => {
-              setIsImportOpen(open)
-              if (!open) resetImportForm()
+              if (open) {
+                setIsImportOpen(true)
+                return
+              }
+              requestImportDialogClose()
             }}
           >
             <DialogTrigger asChild>
@@ -889,6 +1065,7 @@ export default function ReceiptsPage() {
                         <div className="text-sm text-sky-700 bg-sky-50 border border-sky-200 rounded-md px-3 py-2">
                           <div className="font-medium mb-1">OCR result</div>
                           <div>Final engine: {getOcrEngineDisplayName(parsedReceipt.parse_engine)}</div>
+                          <div>Fixture used: {getFixtureUsedDisplayName(parsedReceipt.fixture_used)}</div>
                           {typeof parsedReceipt.confidence_score === "number" && (
                             <div>Confidence score: {parsedReceipt.confidence_score.toFixed(2)}</div>
                           )}
@@ -973,7 +1150,10 @@ export default function ReceiptsPage() {
                             </TableRow>
                           </TableHeader>
                           <TableBody>
-                            {parsedReceipt.line_items.map((li, idx) => {
+                            {parsedReceipt.line_items
+                              .map((li, idx) => ({ li, idx }))
+                              .filter(({ idx }) => !isImportedLineDeleted(idx))
+                              .map(({ li, idx }) => {
                               const selectedItemId = resolveImportedItemId(li.description, idx) || "__none__"
                               const descriptionValue = resolveImportedDescription(idx, li.description)
                               const qtyValue = importLineQtyOverrides[idx] ?? String(li.quantity)
@@ -1062,7 +1242,49 @@ export default function ReceiptsPage() {
                                   <TableCell className="align-top text-center text-xs text-muted-foreground">
                                     {li.confidence !== null ? `${Math.round(li.confidence * 100)}%` : "-"}
                                   </TableCell>
-                                  <TableCell className="align-top text-center text-muted-foreground">-</TableCell>
+                                  <TableCell className="align-top text-center">
+                                    <Button
+                                      type="button"
+                                      size="icon"
+                                      variant="ghost"
+                                      className="text-red-600"
+                                      onClick={() => {
+                                        setImportDeletedLineIndexes((prev) => ({
+                                          ...prev,
+                                          [idx]: true,
+                                        }))
+                                        setImportLineDescriptionOverrides((prev) => {
+                                          const next = { ...prev }
+                                          delete next[idx]
+                                          return next
+                                        })
+                                        setImportLineItemOverrides((prev) => {
+                                          const next = { ...prev }
+                                          delete next[idx]
+                                          return next
+                                        })
+                                        setImportLineQtyOverrides((prev) => {
+                                          const next = { ...prev }
+                                          delete next[idx]
+                                          return next
+                                        })
+                                        setImportLineUnitCostOverrides((prev) => {
+                                          const next = { ...prev }
+                                          delete next[idx]
+                                          return next
+                                        })
+                                        setImportNewItemTarget((prev) => {
+                                          if (prev?.kind === "parsed" && prev.index === idx) {
+                                            return null
+                                          }
+                                          return prev
+                                        })
+                                      }}
+                                      title="Remove parsed line"
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                    </Button>
+                                  </TableCell>
                                 </TableRow>
                               )
                             })}
@@ -1183,7 +1405,7 @@ export default function ReceiptsPage() {
 
                       <div
                         className={`text-xs px-3 py-2 rounded-md ${
-                          hasDuplicateImportedReceipt || hasImportSubtotalMismatch
+                          hasDuplicateImportedReceipt || hasDuplicateMappedImportedItems || hasImportSubtotalMismatch
                             ? "text-red-700 bg-red-50"
                             : unresolvedImportedCount > 0 || totalImportLineCount === 0
                               ? "text-amber-700 bg-amber-50"
@@ -1192,6 +1414,8 @@ export default function ReceiptsPage() {
                       >
                         {hasDuplicateImportedReceipt
                           ? "Receipt number must be unique before creating this receipt."
+                          : hasDuplicateMappedImportedItems
+                            ? duplicateMappedImportedMessage
                           : hasImportSubtotalMismatch
                             ? `Line-item subtotal ${formatCurrency(importLineItemsSubtotal.toFixed(2))} must match receipt subtotal ${formatCurrency(Number.parseFloat(importSubtotal).toFixed(2))}.`
                           : unresolvedImportedCount > 0
@@ -1202,7 +1426,7 @@ export default function ReceiptsPage() {
                       </div>
 
                       <div className="flex justify-end gap-2">
-                        <Button variant="outline" onClick={() => setIsImportOpen(false)} disabled={importCreating || importParsing}>
+                        <Button variant="outline" onClick={requestImportDialogClose} disabled={importCreating || importParsing}>
                           Cancel
                         </Button>
                         <Button
@@ -1215,6 +1439,7 @@ export default function ReceiptsPage() {
                             !importReceiptDate ||
                             !importSubtotal ||
                             hasDuplicateImportedReceipt ||
+                            hasDuplicateMappedImportedItems ||
                             unresolvedImportedCount > 0 ||
                             totalImportLineCount === 0 ||
                             hasImportSubtotalMismatch
@@ -1313,10 +1538,16 @@ export default function ReceiptsPage() {
               </div>
             </DialogContent>
           </Dialog>
+          <ConfirmCloseDialog
+            open={confirmImportCloseOpen}
+            onOpenChange={setConfirmImportCloseOpen}
+            onConfirm={closeImportDialogNow}
+          />
           <Button
             variant="outline"
             onClick={() => {
               setBulkImportPrefillFiles([])
+              setBulkImportPrefillOcrMode(null)
               setBulkImportAutoStart(false)
               setBulkImportOpen(true)
             }}
@@ -1330,10 +1561,12 @@ export default function ReceiptsPage() {
               setBulkImportOpen(open)
               if (!open) {
                 setBulkImportPrefillFiles([])
+                setBulkImportPrefillOcrMode(null)
                 setBulkImportAutoStart(false)
               }
             }}
             prefillFiles={bulkImportPrefillFiles}
+            prefillOcrMode={bulkImportPrefillOcrMode ?? undefined}
             autoStartParse={bulkImportAutoStart}
           />
           <ItemFormDialog
@@ -1374,8 +1607,11 @@ export default function ReceiptsPage() {
           <Dialog
             open={isOpen}
             onOpenChange={(open) => {
-              setIsOpen(open)
-              if (!open) resetForm()
+              if (open) {
+                setIsOpen(true)
+                return
+              }
+              requestReceiptDialogClose()
             }}
           >
             <DialogTrigger asChild>
@@ -1409,15 +1645,21 @@ export default function ReceiptsPage() {
                 submittingLabel={editingId ? "Saving..." : "Creating..."}
                 isSubmitting={createReceipt.isPending || updateReceipt.isPending}
                 onSubmit={handleSubmit}
-                onCancel={() => setIsOpen(false)}
+                onCancel={requestReceiptDialogClose}
                 onImport={!editingId ? () => {
-                  setIsOpen(false)
+                  closeReceiptDialogNow()
                   setIsImportOpen(true)
                 } : undefined}
                 importButtonLabel="Import Receipt"
+                onDirtyChange={setIsReceiptFormDirty}
               />
             </DialogContent>
           </Dialog>
+          <ConfirmCloseDialog
+            open={confirmReceiptCloseOpen}
+            onOpenChange={setConfirmReceiptCloseOpen}
+            onConfirm={closeReceiptDialogNow}
+          />
         </div>
       </div>
 

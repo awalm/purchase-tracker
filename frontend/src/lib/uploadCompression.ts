@@ -2,7 +2,7 @@ import { PDFDocument } from 'pdf-lib';
 
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
 const MAX_IMAGE_DIMENSION = 2200;
-const IMAGE_QUALITY_STEPS = [0.72, 0.6, 0.5, 0.4];
+const IMAGE_QUALITY_STEPS = [0.95];
 
 function getFileExtension(name: string): string {
   const lastDot = name.lastIndexOf('.');

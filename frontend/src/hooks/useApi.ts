@@ -212,7 +212,15 @@ export function useDeleteInvoice() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: string) => invoices.delete(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["invoices"] }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["invoices"] }),
+        queryClient.invalidateQueries({ queryKey: ["receipts"] }),
+        queryClient.invalidateQueries({ queryKey: ["purchases"] }),
+        queryClient.invalidateQueries({ queryKey: ["item"] }),
+        queryClient.invalidateQueries({ queryKey: ["items"] }),
+      ])
+    },
   })
 }
 

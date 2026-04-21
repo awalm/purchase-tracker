@@ -3,7 +3,15 @@ import { useNavigate, useSearchParams } from "react-router-dom"
 import { useQueryClient } from "@tanstack/react-query"
 import { useInvoices, useCreateInvoice, useUpdateInvoice, useDeleteInvoice, useDestinations, useItems } from "@/hooks/useApi"
 import { useMultiSelect } from "@/hooks/useMultiSelect"
-import { ApiValidationError, importApi, invoices as invoicesApi, type InvoicePdfCommitErrorResponse, type InvoicePdfLineFailure, type ParsedInvoice } from "@/api"
+import {
+  ApiValidationError,
+  importApi,
+  invoices as invoicesApi,
+  type InvoicePdfCommitErrorResponse,
+  type InvoicePdfLineFailure,
+  type ParsedInvoice,
+  type ReceiptOcrMode,
+} from "@/api"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { DateInput } from "@/components/ui/date-input"
@@ -223,6 +231,7 @@ export default function InvoicesPage() {
   const [pdfCreateStatus, setPdfCreateStatus] = useState("")
   const [bulkReceiptImportOpen, setBulkReceiptImportOpen] = useState(false)
   const [bulkReceiptImportPrefillFiles, setBulkReceiptImportPrefillFiles] = useState<File[]>([])
+  const [bulkReceiptImportPrefillOcrMode, setBulkReceiptImportPrefillOcrMode] = useState<ReceiptOcrMode | null>(null)
 
   // Bulk backup modal + import state
   const bulkImportInputRef = useRef<HTMLInputElement>(null)
@@ -235,12 +244,15 @@ export default function InvoicesPage() {
   const [isImportingAllBackups, setIsImportingAllBackups] = useState(false)
   const [bulkBackupError, setBulkBackupError] = useState("")
   const [bulkBackupNotice, setBulkBackupNotice] = useState("")
+  const [deleteError, setDeleteError] = useState("")
 
   useEffect(() => {
     const shouldOpenBulkReceiptImport = searchParams.get("bulkReceiptImport") === "1"
     if (!shouldOpenBulkReceiptImport) return
 
-    setBulkReceiptImportPrefillFiles(consumePendingBulkReceiptFiles())
+    const pending = consumePendingBulkReceiptFiles()
+    setBulkReceiptImportPrefillFiles(pending.files)
+    setBulkReceiptImportPrefillOcrMode(pending.ocrMode)
     setBulkReceiptImportOpen(true)
     const nextParams = new URLSearchParams(searchParams)
     nextParams.delete("bulkReceiptImport")
@@ -419,6 +431,44 @@ export default function InvoicesPage() {
     setIsOpen(true)
   }
 
+  const isFinalizedInvoice = (invoice: Invoice) => invoice.reconciliation_state === "locked"
+
+  const handleDeleteInvoice = async (invoice: Invoice) => {
+    if (isFinalizedInvoice(invoice)) {
+      setDeleteError(`Invoice ${invoice.invoice_number} is finalized. Reopen it before deleting.`)
+      return
+    }
+
+    if (!confirm("Delete this invoice?")) return
+
+    setDeleteError("")
+    try {
+      await deleteInvoice.mutateAsync(invoice.id)
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : "Failed to delete invoice")
+    }
+  }
+
+  const handleDeleteSelectedInvoices = async () => {
+    if (selectedIds.size === 0) return
+
+    const selectedInvoices = invoices.filter((invoice) => selectedIds.has(invoice.id))
+    const finalizedCount = selectedInvoices.filter(isFinalizedInvoice).length
+    if (finalizedCount > 0) {
+      setDeleteError(
+        `${finalizedCount} selected invoice(s) are finalized. Reopen finalized invoices before deleting.`
+      )
+      return
+    }
+
+    setDeleteError("")
+    try {
+      await handleBulkDelete((invoiceId) => deleteInvoice.mutateAsync(invoiceId), "invoice(s)")
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : "Failed to delete selected invoices")
+    }
+  }
+
   // Summary stats
   const totalInvoiceValue = invoices.reduce((sum, inv) => sum + parseFloat(inv.subtotal), 0)
   const unfinalizedCount = invoices.filter((inv) => inv.reconciliation_state !== "locked").length
@@ -557,7 +607,9 @@ export default function InvoicesPage() {
           {selectedIds.size > 0 && (
             <Button 
               variant="destructive" 
-              onClick={() => handleBulkDelete((id) => deleteInvoice.mutateAsync(id), "invoice(s)")}
+              onClick={() => {
+                void handleDeleteSelectedInvoices()
+              }}
               disabled={isDeleting}
             >
               <Trash2 className="h-4 w-4 mr-2" />
@@ -936,9 +988,11 @@ export default function InvoicesPage() {
           setBulkReceiptImportOpen(open)
           if (!open) {
             setBulkReceiptImportPrefillFiles([])
+            setBulkReceiptImportPrefillOcrMode(null)
           }
         }}
         prefillFiles={bulkReceiptImportPrefillFiles}
+        prefillOcrMode={bulkReceiptImportPrefillOcrMode ?? undefined}
       />
 
       {bulkBackupError && (
@@ -950,6 +1004,12 @@ export default function InvoicesPage() {
       {bulkBackupNotice && (
         <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
           {bulkBackupNotice}
+        </div>
+      )}
+
+      {deleteError && (
+        <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {deleteError}
         </div>
       )}
 
@@ -1045,10 +1105,10 @@ export default function InvoicesPage() {
                     <RowActions
                       onEdit={() => openEditDialog(inv)}
                       onDelete={() => {
-                        if (confirm("Delete this invoice?")) {
-                          deleteInvoice.mutateAsync(inv.id)
-                        }
+                        void handleDeleteInvoice(inv)
                       }}
+                      deleteDisabled={isFinalizedInvoice(inv)}
+                      deleteTitle={isFinalizedInvoice(inv) ? "Finalized invoices must be reopened before deletion" : undefined}
                     />
                   </TableCell>
                 </TableRow>

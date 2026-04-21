@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useQueryClient } from "@tanstack/react-query"
 import {
   importApi,
@@ -10,6 +10,8 @@ import {
 import { useItems, useReceipts, useVendors } from "@/hooks/useApi"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { ConfirmCloseDialog } from "@/components/ConfirmCloseDialog"
+import { ItemFormDialog } from "@/components/ItemFormDialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
@@ -19,9 +21,42 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { formatDate } from "@/lib/utils"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+import { EmptyTableRow } from "@/components/EmptyTableRow"
+import { AlertCircle, CheckCircle2, Loader2, Plus, Trash2 } from "lucide-react"
+import { formatCurrency, formatDate } from "@/lib/utils"
+import {
+  findExistingReceiptByNumber,
+  hasBatchDuplicateReceiptNumber,
+  computeImportLineItemsSubtotal,
+  findDuplicateMappedImportItems,
+  getImportSubtotalDifference,
+  importSubtotalMatches,
+  truncateOptionLabel,
+} from "@/lib/receiptImportValidation"
+import {
+  getCachedVendorItemId,
+  rememberVendorItemMappings,
+} from "@/lib/vendorItemMappingCache"
 
-type BulkImportStage = "upload" | "parsing" | "review" | "creating" | "result"
+type BulkImportManualLine = {
+  id: string
+  description: string
+  itemId: string
+  quantity: string
+  unitCost: string
+}
+
+type BulkImportNewItemTarget =
+  | { draftId: string; kind: "parsed"; index: number }
+  | { draftId: string; kind: "manual"; lineId: string }
 
 type BulkReceiptDraft = {
   id: string
@@ -35,19 +70,26 @@ type BulkReceiptDraft = {
   receiptDate: string
   subtotal: string
   taxAmount: string
+  total: string
   paymentMethod: string
   notes: string
-  selected: boolean
   parseStage: ReceiptImageParseProgress["stage"] | null
   parseProgress: number | null
-  result: "pending" | "success" | "failed" | "skipped"
-  resultMessage: string
+  status: "pending" | "imported" | "failed"
+  statusMessage: string
+  lineDescriptionOverrides: Record<number, string>
+  lineItemOverrides: Record<number, string>
+  lineQtyOverrides: Record<number, string>
+  lineUnitCostOverrides: Record<number, string>
+  deletedLineIndexes: Record<number, true>
+  manualLines: BulkImportManualLine[]
 }
 
 type BulkReceiptImportDialogProps = {
   open: boolean
   onOpenChange: (open: boolean) => void
   prefillFiles?: File[]
+  prefillOcrMode?: ReceiptOcrMode
   autoStartParse?: boolean
 }
 
@@ -62,6 +104,14 @@ const tokenizeName = (name: string) =>
     .map((t) => t.trim())
     .filter((t) => t.length >= 2)
 
+const createManualImportLine = (): BulkImportManualLine => ({
+  id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+  description: "",
+  itemId: "",
+  quantity: "1",
+  unitCost: "",
+})
+
 const createBulkReceiptDraft = (file: File): BulkReceiptDraft => ({
   id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
   file,
@@ -74,13 +124,19 @@ const createBulkReceiptDraft = (file: File): BulkReceiptDraft => ({
   receiptDate: "1970-01-01",
   subtotal: "",
   taxAmount: "",
+  total: "",
   paymentMethod: "",
   notes: "",
-  selected: true,
   parseStage: null,
   parseProgress: null,
-  result: "pending",
-  resultMessage: "",
+  status: "pending",
+  statusMessage: "",
+  lineDescriptionOverrides: {},
+  lineItemOverrides: {},
+  lineQtyOverrides: {},
+  lineUnitCostOverrides: {},
+  deletedLineIndexes: {},
+  manualLines: [],
 })
 
 const getOcrEngineDisplayName = (engine: string | null | undefined): string => {
@@ -94,37 +150,79 @@ const getOcrEngineDisplayName = (engine: string | null | undefined): string => {
   return engine?.trim() || "Unknown"
 }
 
+const getFixtureUsedDisplayName = (fixtureUsed: string | null | undefined): string => {
+  const normalized = fixtureUsed?.trim().toLowerCase()
+  if (!normalized) return "generic"
+  return normalized
+}
+
 export function BulkReceiptImportDialog({
   open,
   onOpenChange,
   prefillFiles = [],
+  prefillOcrMode,
   autoStartParse = false,
 }: BulkReceiptImportDialogProps) {
   const queryClient = useQueryClient()
   const { data: vendors = [] } = useVendors()
   const { data: items = [] } = useItems()
   const { data: allReceipts = [] } = useReceipts()
+  const itemIdSet = useMemo(() => new Set(items.map((item) => item.id)), [items])
+  const itemNameById = useMemo(
+    () => new Map(items.map((item) => [item.id, item.name])),
+    [items]
+  )
 
-  const [bulkImportStage, setBulkImportStage] = useState<BulkImportStage>("upload")
   const [bulkImportDrafts, setBulkImportDrafts] = useState<BulkReceiptDraft[]>([])
   const [bulkImportError, setBulkImportError] = useState("")
   const [bulkImportStatus, setBulkImportStatus] = useState("")
   const [bulkBypassCompression, setBulkBypassCompression] = useState(false)
   const [bulkOcrMode, setBulkOcrMode] = useState<ReceiptOcrMode>("auto")
+  const [confirmCloseOpen, setConfirmCloseOpen] = useState(false)
+  const [activeDraftId, setActiveDraftId] = useState<string | null>(null)
+  const [importingDraftId, setImportingDraftId] = useState<string | null>(null)
+  const [newItemTarget, setNewItemTarget] = useState<BulkImportNewItemTarget | null>(null)
+  const [activePreviewUrl, setActivePreviewUrl] = useState<string | null>(null)
+
   const bulkImportInputRef = useRef<HTMLInputElement>(null)
   const autoParsePendingRef = useRef(false)
+  const autoParseModeRef = useRef<ReceiptOcrMode>("auto")
 
   const resetBulkImportForm = () => {
-    setBulkImportStage("upload")
     setBulkImportDrafts([])
     setBulkImportError("")
     setBulkImportStatus("")
     setBulkBypassCompression(false)
     setBulkOcrMode("auto")
+    setConfirmCloseOpen(false)
+    setActiveDraftId(null)
+    setImportingDraftId(null)
+    setNewItemTarget(null)
+    setActivePreviewUrl(null)
     autoParsePendingRef.current = false
+    autoParseModeRef.current = "auto"
     if (bulkImportInputRef.current) {
       bulkImportInputRef.current.value = ""
     }
+  }
+
+  const hasActionInProgress =
+    importingDraftId !== null ||
+    bulkImportDrafts.some((draft) => draft.parseStage !== null) ||
+    bulkImportDrafts.length > 0
+
+  const closeDialogNow = () => {
+    setConfirmCloseOpen(false)
+    onOpenChange(false)
+    resetBulkImportForm()
+  }
+
+  const requestCloseDialog = () => {
+    if (hasActionInProgress) {
+      setConfirmCloseOpen(true)
+      return
+    }
+    closeDialogNow()
   }
 
   useEffect(() => {
@@ -135,21 +233,70 @@ export function BulkReceiptImportDialog({
   useEffect(() => {
     if (!open || prefillFiles.length === 0) return
 
-    setBulkImportStage("upload")
-    setBulkImportDrafts(prefillFiles.map((file) => createBulkReceiptDraft(file)))
+    const initialMode = prefillOcrMode || "auto"
+    const nextDrafts = prefillFiles.map((file) => createBulkReceiptDraft(file))
+
+    setBulkImportDrafts(nextDrafts)
+    setActiveDraftId(nextDrafts[0]?.id || null)
     setBulkImportError("")
     setBulkImportStatus(
-      `${prefillFiles.length} file(s) selected. Parse to review extracted data.`
+      `${prefillFiles.length} file(s) preloaded. Select a file, review full details, then Finish Import.`
     )
+    setBulkOcrMode(initialMode)
+    autoParseModeRef.current = initialMode
     autoParsePendingRef.current = autoStartParse
 
     if (bulkImportInputRef.current) {
       bulkImportInputRef.current.value = ""
     }
-  }, [open, prefillFiles, autoStartParse])
+  }, [open, prefillFiles, prefillOcrMode, autoStartParse])
 
-  const getAutoMatchedItemId = (description: string): string | null => {
+  useEffect(() => {
+    if (bulkImportDrafts.length === 0) {
+      setActiveDraftId(null)
+      return
+    }
+
+    if (!activeDraftId || !bulkImportDrafts.some((draft) => draft.id === activeDraftId)) {
+      setActiveDraftId(bulkImportDrafts[0].id)
+    }
+  }, [bulkImportDrafts, activeDraftId])
+
+  const activeDraft = useMemo(
+    () => bulkImportDrafts.find((draft) => draft.id === activeDraftId) || null,
+    [bulkImportDrafts, activeDraftId]
+  )
+
+  useEffect(() => {
+    if (!activeDraft) {
+      setActivePreviewUrl(null)
+      return
+    }
+
+    const url = URL.createObjectURL(activeDraft.file)
+    setActivePreviewUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [activeDraft])
+
+  const updateDraft = (
+    draftId: string,
+    updater: (draft: BulkReceiptDraft) => BulkReceiptDraft
+  ) => {
+    setBulkImportDrafts((prev) =>
+      prev.map((draft) => (draft.id === draftId ? updater(draft) : draft))
+    )
+  }
+
+  const getAutoMatchedItemId = (vendorId: string, description: string): string | null => {
     const descriptionNormalized = normalizeItemName(description)
+
+    if (vendorId) {
+      const cachedItemId = getCachedVendorItemId(vendorId, description)
+      if (cachedItemId && itemIdSet.has(cachedItemId)) {
+        return cachedItemId
+      }
+    }
+
     const direct = items.find((it) => normalizeItemName(it.name) === descriptionNormalized)
     if (direct) return direct.id
 
@@ -157,7 +304,8 @@ export function BulkReceiptImportDialog({
       const itemNormalized = normalizeItemName(it.name)
       return (
         itemNormalized.length > 0 &&
-        (descriptionNormalized.includes(itemNormalized) || itemNormalized.includes(descriptionNormalized))
+        (descriptionNormalized.includes(itemNormalized) ||
+          itemNormalized.includes(descriptionNormalized))
       )
     })
     if (containsMatch) return containsMatch.id
@@ -207,65 +355,258 @@ export function BulkReceiptImportDialog({
     )
   }
 
-  const resolveParsedLineUnitCost = (
-    line: ParsedReceipt["line_items"][number]
-  ): string | null => {
-    if (line.unit_cost && line.unit_cost.trim() !== "") {
-      return line.unit_cost.trim()
+  const resolveImportedDescription = (
+    draft: BulkReceiptDraft,
+    index: number,
+    fallbackDescription: string
+  ): string => {
+    const override = draft.lineDescriptionOverrides[index]
+    if (typeof override === "string") {
+      return override
     }
-    if (line.line_total && line.quantity > 0) {
-      const total = Number.parseFloat(line.line_total)
-      if (Number.isFinite(total)) {
-        return (total / line.quantity).toFixed(2)
+    return fallbackDescription
+  }
+
+  const resolveImportedItemId = (
+    draft: BulkReceiptDraft,
+    fallbackDescription: string,
+    index: number
+  ): string | null => {
+    const manual = draft.lineItemOverrides[index]
+    if (manual) return manual
+    return getAutoMatchedItemId(
+      draft.vendorId,
+      resolveImportedDescription(draft, index, fallbackDescription)
+    )
+  }
+
+  const resolveImportedLineNotes = (
+    draft: BulkReceiptDraft,
+    index: number,
+    fallbackDescription: string
+  ): string => {
+    const explicitDescription = draft.lineDescriptionOverrides[index]
+    if (typeof explicitDescription === "string") {
+      return explicitDescription
+    }
+
+    const mappedItemOverrideId = draft.lineItemOverrides[index]
+    if (mappedItemOverrideId) {
+      const mappedName = itemNameById.get(mappedItemOverrideId)
+      if (mappedName) {
+        return mappedName
+      }
+    }
+
+    return fallbackDescription
+  }
+
+  const resolveImportedQty = (
+    draft: BulkReceiptDraft,
+    index: number,
+    fallbackQty: number
+  ): number => {
+    const raw = draft.lineQtyOverrides[index]
+    if (!raw) return fallbackQty
+    const parsed = Number.parseInt(raw, 10)
+    return Number.isFinite(parsed) ? parsed : fallbackQty
+  }
+
+  const resolveImportedUnitCost = (
+    draft: BulkReceiptDraft,
+    index: number,
+    fallbackUnitCost: string | null,
+    qty: number,
+    lineTotal: string | null
+  ): string | null => {
+    const raw = draft.lineUnitCostOverrides[index]
+    if (raw && raw.trim() !== "") return raw.trim()
+    if (fallbackUnitCost && fallbackUnitCost.trim() !== "") return fallbackUnitCost.trim()
+    if (lineTotal && qty > 0) {
+      const numericLineTotal = Number.parseFloat(lineTotal)
+      if (Number.isFinite(numericLineTotal)) {
+        return (numericLineTotal / qty).toFixed(2)
       }
     }
     return null
   }
 
-  const getBulkLineStats = (draft: BulkReceiptDraft) => {
-    if (!draft.parsedReceipt) {
-      return { total: 0, unresolved: 0 }
-    }
-
-    const unresolved = draft.parsedReceipt.line_items.filter((line) => {
-      const itemId = getAutoMatchedItemId(line.description)
-      const unitCost = resolveParsedLineUnitCost(line)
-      const unitCostNumber = unitCost ? Number.parseFloat(unitCost) : NaN
-      return (
-        !itemId ||
-        !Number.isFinite(line.quantity) ||
-        line.quantity <= 0 ||
-        !Number.isFinite(unitCostNumber) ||
-        unitCostNumber <= 0
-      )
-    }).length
-
-    return { total: draft.parsedReceipt.line_items.length, unresolved }
-  }
+  const isDraftLineDeleted = (draft: BulkReceiptDraft, index: number): boolean =>
+    Boolean(draft.deletedLineIndexes[index])
 
   const getExistingDuplicateForBulkDraft = (draft: BulkReceiptDraft) => {
-    const normalized = draft.receiptNumber.trim().toLowerCase()
-    if (!normalized || !draft.vendorId) return null
+    return findExistingReceiptByNumber(allReceipts, draft.receiptNumber)
+  }
 
-    return (
-      allReceipts.find(
-        (r) =>
-          r.vendor_id === draft.vendorId &&
-          r.receipt_number.trim().toLowerCase() === normalized
-      ) || null
+  const hasDuplicateInBatch = (draft: BulkReceiptDraft): boolean => {
+    return hasBatchDuplicateReceiptNumber(
+      bulkImportDrafts.map((entry) => ({
+        id: entry.id,
+        receiptNumber: entry.receiptNumber,
+      })),
+      {
+        id: draft.id,
+        receiptNumber: draft.receiptNumber,
+      }
     )
   }
 
+  const getDraftDuplicateMappedItems = (draft: BulkReceiptDraft) => {
+    if (!draft.parsedReceipt) {
+      return []
+    }
+
+    let lineNumber = 0
+    const mappedLines = draft.parsedReceipt.line_items
+      .map((line, index) => ({ line, index }))
+      .filter(({ index }) => !isDraftLineDeleted(draft, index))
+      .map(({ line, index }) => {
+        lineNumber += 1
+        const itemId = resolveImportedItemId(draft, line.description, index)
+        return {
+          lineNumber,
+          itemId,
+          itemName: itemId ? itemNameById.get(itemId) || null : null,
+        }
+      })
+
+    const manualMappedLines = draft.manualLines.map((line) => {
+      lineNumber += 1
+      const itemId = line.itemId.trim() || null
+      return {
+        lineNumber,
+        itemId,
+        itemName: itemId ? itemNameById.get(itemId) || null : null,
+      }
+    })
+
+    return findDuplicateMappedImportItems([...mappedLines, ...manualMappedLines])
+  }
+
+  const getDuplicateMappedItemMessage = (itemName: string, lineNumbers: number[]) => {
+    return `Item \"${itemName}\" is mapped on multiple lines (${lineNumbers.join(", ")}). Each item can appear only once per receipt.`
+  }
+
+  const getDraftLineStats = (draft: BulkReceiptDraft) => {
+    if (!draft.parsedReceipt) {
+      return {
+        total: draft.manualLines.length,
+        unresolved: draft.manualLines.filter((line) => {
+          const qty = Number.parseInt(line.quantity, 10)
+          const unitCostNum = Number.parseFloat(line.unitCost)
+          return (
+            !line.description.trim() ||
+            !line.itemId ||
+            !Number.isFinite(qty) ||
+            qty <= 0 ||
+            !Number.isFinite(unitCostNum) ||
+            unitCostNum <= 0
+          )
+        }).length,
+        lineSubtotal: computeImportLineItemsSubtotal(
+          draft.manualLines.map((line) => ({ quantity: line.quantity, unitCost: line.unitCost }))
+        ),
+      }
+    }
+
+    const parsedUnresolved = draft.parsedReceipt.line_items.filter((line, index) => {
+      if (isDraftLineDeleted(draft, index)) return false
+      const description = resolveImportedDescription(draft, index, line.description).trim()
+      const itemId = resolveImportedItemId(draft, line.description, index)
+      const qty = resolveImportedQty(draft, index, line.quantity)
+      const unitCost = resolveImportedUnitCost(
+        draft,
+        index,
+        line.unit_cost,
+        qty,
+        line.line_total
+      )
+      const unitCostNum = unitCost ? Number.parseFloat(unitCost) : NaN
+      return (
+        !description ||
+        !itemId ||
+        qty <= 0 ||
+        !Number.isFinite(unitCostNum) ||
+        unitCostNum <= 0
+      )
+    }).length
+
+    const manualUnresolved = draft.manualLines.filter((line) => {
+      const qty = Number.parseInt(line.quantity, 10)
+      const unitCostNum = Number.parseFloat(line.unitCost)
+      return (
+        !line.description.trim() ||
+        !line.itemId ||
+        !Number.isFinite(qty) ||
+        qty <= 0 ||
+        !Number.isFinite(unitCostNum) ||
+        unitCostNum <= 0
+      )
+    }).length
+
+    const parsedLinesSubtotalInput = draft.parsedReceipt.line_items
+      .map((line, index) => ({ line, index }))
+      .filter(({ index }) => !isDraftLineDeleted(draft, index))
+      .map(({ line, index }) => {
+        const qty = resolveImportedQty(draft, index, line.quantity)
+        const unitCost = resolveImportedUnitCost(
+          draft,
+          index,
+          line.unit_cost,
+          qty,
+          line.line_total
+        )
+        return {
+          quantity: qty,
+          unitCost,
+        }
+      })
+
+    const manualLinesSubtotalInput = draft.manualLines.map((line) => ({
+      quantity: line.quantity,
+      unitCost: line.unitCost,
+    }))
+
+    const totalParsedLines = draft.parsedReceipt.line_items.filter(
+      (_line, index) => !isDraftLineDeleted(draft, index)
+    ).length
+
+    return {
+      total: totalParsedLines + draft.manualLines.length,
+      unresolved: parsedUnresolved + manualUnresolved,
+      lineSubtotal: computeImportLineItemsSubtotal([
+        ...parsedLinesSubtotalInput,
+        ...manualLinesSubtotalInput,
+      ]),
+    }
+  }
+
   const getBulkDraftValidationMessage = (draft: BulkReceiptDraft) => {
-    if (!draft.selected) {
-      return { ready: false, message: "Not selected for import." }
+    if (draft.status === "imported") {
+      return { ready: false, message: "Already imported." }
     }
     if (draft.parseError) {
-      return { ready: false, message: "Parse failed. Re-upload or deselect this file." }
+      return { ready: false, message: "Parse failed. Re-parse this file to continue." }
     }
     if (!draft.parsedReceipt) {
       return { ready: false, message: "File has not been parsed yet." }
     }
+
+    if (hasDuplicateInBatch(draft)) {
+      return {
+        ready: false,
+        message: "Duplicate receipt number in this batch.",
+      }
+    }
+
+    const existingDuplicate = getExistingDuplicateForBulkDraft(draft)
+    if (existingDuplicate) {
+      return {
+        ready: false,
+        message: `Receipt # ${draft.receiptNumber.trim()} already exists (${existingDuplicate.vendor_name}, ${formatDate(existingDuplicate.receipt_date)}). Use a unique receipt number.`,
+      }
+    }
+
     if (!draft.vendorId) {
       return { ready: false, message: "Vendor is required." }
     }
@@ -276,728 +617,1398 @@ export function BulkReceiptImportDialog({
       return { ready: false, message: "Subtotal is required." }
     }
 
-    const normalized = draft.receiptNumber.trim().toLowerCase()
-    if (normalized) {
-      const duplicateInBatch = bulkImportDrafts.some(
-        (other) =>
-          other.id !== draft.id &&
-          other.selected &&
-          other.vendorId === draft.vendorId &&
-          other.receiptNumber.trim().toLowerCase() === normalized
-      )
-      if (duplicateInBatch) {
-        return {
-          ready: false,
-          message: "Duplicate receipt number in this batch for the same vendor.",
-        }
-      }
-
-      const existingDuplicate = getExistingDuplicateForBulkDraft(draft)
-      if (existingDuplicate) {
-        return {
-          ready: false,
-          message: `Receipt # ${draft.receiptNumber.trim()} already exists for ${existingDuplicate.vendor_name} (${formatDate(existingDuplicate.receipt_date)}).`,
-        }
-      }
+    const lineStats = getDraftLineStats(draft)
+    if (lineStats.total === 0) {
+      return { ready: false, message: "Add at least one line item to continue." }
     }
-
-    const { total, unresolved } = getBulkLineStats(draft)
-    if (total === 0) {
-      return { ready: false, message: "No receipt lines were extracted." }
-    }
-    if (unresolved > 0) {
+    if (lineStats.unresolved > 0) {
       return {
         ready: false,
-        message: `${unresolved} line item(s) need item matches or valid costs.`,
+        message: `${lineStats.unresolved} line item(s) need mapping or valid costs.`,
       }
     }
 
-    return { ready: true, message: `Ready to import (${total} line items).` }
+    const duplicateMappedItems = getDraftDuplicateMappedItems(draft)
+    if (duplicateMappedItems.length > 0) {
+      const duplicate = duplicateMappedItems[0]
+      return {
+        ready: false,
+        message: getDuplicateMappedItemMessage(duplicate.itemName, duplicate.lineNumbers),
+      }
+    }
+
+    const subtotalDifference = getImportSubtotalDifference(draft.subtotal, lineStats.lineSubtotal)
+    if (
+      subtotalDifference !== null &&
+      !importSubtotalMatches(draft.subtotal, lineStats.lineSubtotal)
+    ) {
+      return {
+        ready: false,
+        message: `Line-item subtotal ${formatCurrency(lineStats.lineSubtotal.toFixed(2))} must match receipt subtotal ${formatCurrency(Number.parseFloat(draft.subtotal).toFixed(2))}.`,
+      }
+    }
+
+    return {
+      ready: true,
+      message: `Ready to Finish Import (${lineStats.total} line item${lineStats.total === 1 ? "" : "s"}).`,
+    }
   }
 
   const handleBulkImportFilesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || [])
     if (files.length === 0) return
 
-    setBulkImportDrafts(files.map((file) => createBulkReceiptDraft(file)))
-    setBulkImportStage("upload")
+    const nextDrafts = files.map((file) => createBulkReceiptDraft(file))
+    setBulkImportDrafts(nextDrafts)
+    setActiveDraftId(nextDrafts[0]?.id || null)
     setBulkImportError("")
-    setBulkImportStatus(`${files.length} file(s) selected. Parse to review extracted data.`)
+    setBulkImportStatus(
+      `${files.length} file(s) loaded. Select each file, review full details, then Finish Import.`
+    )
+    setNewItemTarget(null)
   }
 
-  const handleBulkParseAll = async () => {
+  const parseDraft = async (
+    draftId: string,
+    modeOverride?: ReceiptOcrMode
+  ): Promise<boolean> => {
+    const draft = bulkImportDrafts.find((entry) => entry.id === draftId)
+    if (!draft) return false
+
+    const ocrMode = modeOverride || bulkOcrMode
+    setBulkImportError("")
+    setBulkImportStatus(`Parsing ${draft.file.name}...`)
+
+    updateDraft(draftId, (entry) => ({
+      ...entry,
+      parseError: null,
+      warnings: [],
+      parseStage: "uploading",
+      parseProgress: 0,
+      status: entry.status === "imported" ? "imported" : "pending",
+      statusMessage: "",
+    }))
+
+    try {
+      const parsed = await importApi.receiptImage(
+        draft.file,
+        ({ stage, progress }) => {
+          updateDraft(draftId, (entry) => ({
+            ...entry,
+            parseStage: stage,
+            parseProgress: progress ?? null,
+          }))
+        },
+        { bypassCompression: bulkBypassCompression, ocrMode }
+      )
+
+      const taxFromPayload = parsed.tax || ""
+      let inferredTax = ""
+      if (!taxFromPayload && parsed.total && parsed.subtotal) {
+        const totalNumber = Number.parseFloat(parsed.total)
+        const subtotalNumber = Number.parseFloat(parsed.subtotal)
+        if (Number.isFinite(totalNumber) && Number.isFinite(subtotalNumber)) {
+          inferredTax = (totalNumber - subtotalNumber).toFixed(2)
+        }
+      }
+
+      updateDraft(draftId, (entry) => ({
+        ...entry,
+        parsedReceipt: parsed,
+        parseError: null,
+        warnings: parsed.warnings || [],
+        vendorLabel: parsed.vendor_name?.trim() || "",
+        vendorId: resolveBulkVendorIdFromParsed(parsed),
+        receiptNumber: parsed.receipt_number || "",
+        receiptDate: parsed.receipt_date || "1970-01-01",
+        subtotal: parsed.subtotal || "",
+        taxAmount: taxFromPayload || inferredTax,
+        total: parsed.total || "",
+        paymentMethod: parsed.payment_method || "",
+        notes: "",
+        parseStage: null,
+        parseProgress: null,
+        status: entry.status === "imported" ? "imported" : "pending",
+        statusMessage: "",
+        lineDescriptionOverrides: {},
+        lineItemOverrides: {},
+        lineQtyOverrides: {},
+        lineUnitCostOverrides: {},
+        deletedLineIndexes: {},
+        manualLines: [],
+      }))
+
+      setBulkImportStatus(
+        `Parsed ${draft.file.name} using ${getOcrEngineDisplayName(parsed.parse_engine)}.`
+      )
+      return true
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to parse receipt image"
+      updateDraft(draftId, (entry) => ({
+        ...entry,
+        parsedReceipt: null,
+        parseError: message,
+        warnings: [],
+        parseStage: null,
+        parseProgress: null,
+        status: "failed",
+        statusMessage: message,
+      }))
+      setBulkImportError(message)
+      setBulkImportStatus("")
+      return false
+    }
+  }
+
+  const handleParseAll = async (modeOverride?: ReceiptOcrMode) => {
     if (bulkImportDrafts.length === 0) {
       setBulkImportError("Choose at least one file to parse.")
       return
     }
 
+    const ocrMode = modeOverride || bulkOcrMode
     setBulkImportError("")
-    setBulkImportStage("parsing")
-    const total = bulkImportDrafts.length
+
     let parsedCount = 0
     let failedCount = 0
 
-    for (let index = 0; index < total; index += 1) {
+    for (let index = 0; index < bulkImportDrafts.length; index += 1) {
       const draft = bulkImportDrafts[index]
-      setBulkImportStatus(`Parsing ${index + 1}/${total}: ${draft.file.name}`)
-
-      setBulkImportDrafts((prev) =>
-        prev.map((entry) =>
-          entry.id === draft.id
-            ? {
-                ...entry,
-                parseError: null,
-                parsedReceipt: null,
-                warnings: [],
-                parseStage: "uploading",
-                parseProgress: 0,
-                result: "pending",
-                resultMessage: "",
-              }
-            : entry
-        )
-      )
-
-      try {
-        const parsed = await importApi.receiptImage(draft.file, ({ stage, progress }) => {
-          setBulkImportDrafts((prev) =>
-            prev.map((entry) =>
-              entry.id === draft.id
-                ? {
-                    ...entry,
-                    parseStage: stage,
-                    parseProgress: progress ?? null,
-                  }
-                : entry
-            )
-          )
-        }, { bypassCompression: bulkBypassCompression, ocrMode: bulkOcrMode })
-
-        const taxFromPayload = parsed.tax || ""
-        let inferredTax = ""
-        if (!taxFromPayload && parsed.total && parsed.subtotal) {
-          const totalNumber = Number.parseFloat(parsed.total)
-          const subtotalNumber = Number.parseFloat(parsed.subtotal)
-          if (Number.isFinite(totalNumber) && Number.isFinite(subtotalNumber)) {
-            inferredTax = (totalNumber - subtotalNumber).toFixed(2)
-          }
-        }
-
-        setBulkImportDrafts((prev) =>
-          prev.map((entry) =>
-            entry.id === draft.id
-              ? {
-                  ...entry,
-                  parsedReceipt: parsed,
-                  parseError: null,
-                  warnings: parsed.warnings || [],
-                  vendorLabel: parsed.vendor_name?.trim() || "",
-                  vendorId: resolveBulkVendorIdFromParsed(parsed),
-                  receiptNumber: parsed.receipt_number || "",
-                  receiptDate: parsed.receipt_date || "1970-01-01",
-                  subtotal: parsed.subtotal || "",
-                  taxAmount: taxFromPayload || inferredTax,
-                  paymentMethod: parsed.payment_method || "",
-                  notes: "",
-                  parseStage: null,
-                  parseProgress: null,
-                }
-              : entry
-          )
-        )
-
-        parsedCount += 1
-      } catch (err) {
-        failedCount += 1
-        const message = err instanceof Error ? err.message : "Failed to parse receipt image"
-        setBulkImportDrafts((prev) =>
-          prev.map((entry) =>
-            entry.id === draft.id
-              ? {
-                  ...entry,
-                  parsedReceipt: null,
-                  parseError: message,
-                  warnings: [],
-                  parseStage: null,
-                  parseProgress: null,
-                  result: "failed",
-                  resultMessage: message,
-                }
-              : entry
-          )
-        )
-      }
+      setBulkImportStatus(`Parsing ${index + 1}/${bulkImportDrafts.length}: ${draft.file.name}`)
+      const success = await parseDraft(draft.id, ocrMode)
+      if (success) parsedCount += 1
+      else failedCount += 1
     }
 
-    setBulkImportStage("review")
     setBulkImportStatus(
-      `Parsed ${parsedCount}/${total} files${failedCount > 0 ? ` (${failedCount} failed)` : ""}. Review and create.`
+      `Parsed ${parsedCount}/${bulkImportDrafts.length} files${failedCount > 0 ? ` (${failedCount} failed)` : ""}. Select each file to verify full details and finish import.`
     )
   }
 
-  const handleBulkCreateAll = async () => {
-    const selectedDrafts = bulkImportDrafts.filter((draft) => draft.selected)
-    if (selectedDrafts.length === 0) {
-      setBulkImportError("Select at least one parsed file to import.")
+  const handleFinishImport = async () => {
+    if (!activeDraft) {
+      setBulkImportError("Select a file first.")
+      return
+    }
+
+    if (activeDraft.parseStage) {
+      setBulkImportError(`Please wait: ${activeDraft.file.name} is still parsing.`)
+      return
+    }
+
+    if (importingDraftId && importingDraftId !== activeDraft.id) {
+      const importing = bulkImportDrafts.find((entry) => entry.id === importingDraftId)
+      setBulkImportError(
+        importing
+          ? `Please wait: ${importing.file.name} is currently importing.`
+          : "Another receipt is currently importing."
+      )
+      return
+    }
+
+    const validation = getBulkDraftValidationMessage(activeDraft)
+    if (!validation.ready) {
+      setBulkImportError(validation.message)
+      return
+    }
+
+    if (!activeDraft.parsedReceipt) {
+      setBulkImportError("Parsed receipt data is missing.")
       return
     }
 
     setBulkImportError("")
-    setBulkImportStage("creating")
-    setBulkImportDrafts((prev) =>
-      prev.map((draft) =>
-        draft.selected
-          ? { ...draft, result: "pending", resultMessage: "" }
-          : { ...draft, result: "skipped", resultMessage: "Not selected." }
-      )
-    )
+    setImportingDraftId(activeDraft.id)
+    setBulkImportStatus(`Finishing import: ${activeDraft.file.name}`)
 
-    const total = selectedDrafts.length
-    const skippedCount = bulkImportDrafts.length - total
-    let successCount = 0
-    let failedCount = 0
+    let createdReceiptId: string | null = null
+    const learnedMappings: Array<{ sourceText: string; itemId: string }> = []
 
-    for (let index = 0; index < selectedDrafts.length; index += 1) {
-      const draft = selectedDrafts[index]
-      setBulkImportStatus(`Creating ${index + 1}/${total}: ${draft.file.name}`)
+    try {
+      const parsed = activeDraft.parsedReceipt
 
-      let createdReceiptId: string | null = null
+      const created = await receiptsApi.create({
+        vendor_id: activeDraft.vendorId,
+        source_vendor_alias: parsed.vendor_name?.trim() || undefined,
+        ...(activeDraft.receiptNumber.trim()
+          ? { receipt_number: activeDraft.receiptNumber.trim() }
+          : {}),
+        receipt_date: activeDraft.receiptDate,
+        subtotal: activeDraft.subtotal,
+        tax_amount: activeDraft.taxAmount || undefined,
+        payment_method: activeDraft.paymentMethod || undefined,
+        ingestion_metadata: {
+          source: "ocr",
+          auto_parsed: true,
+          parse_engine: parsed.parse_engine || "unknown",
+          ...(parsed.parse_version ? { parse_version: parsed.parse_version } : {}),
+          ...(parsed.fixture_used ? { fixture_used: parsed.fixture_used } : {}),
+          ...(typeof parsed.confidence_score === "number"
+            ? { confidence_score: parsed.confidence_score }
+            : {}),
+          ...(parsed.vendor_name?.trim() ? { raw_vendor_name: parsed.vendor_name.trim() } : {}),
+          ...(parsed.warnings.length ? { warnings: parsed.warnings } : {}),
+          ingested_at: new Date().toISOString(),
+          ingestion_version: "ocr-v1",
+        },
+        notes: activeDraft.notes || undefined,
+      })
+      createdReceiptId = created.id
 
-      try {
-        const validation = getBulkDraftValidationMessage(draft)
-        if (!validation.ready) {
-          throw new Error(validation.message)
+      for (let index = 0; index < parsed.line_items.length; index += 1) {
+        if (isDraftLineDeleted(activeDraft, index)) {
+          continue
         }
 
-        if (!draft.parsedReceipt) {
-          throw new Error("Parsed receipt data is missing.")
+        const line = parsed.line_items[index]
+        const description = resolveImportedDescription(activeDraft, index, line.description).trim()
+        const lineNotes = resolveImportedLineNotes(activeDraft, index, line.description).trim()
+        const itemId = resolveImportedItemId(activeDraft, line.description, index)
+        const qty = resolveImportedQty(activeDraft, index, line.quantity)
+        const unitCost = resolveImportedUnitCost(
+          activeDraft,
+          index,
+          line.unit_cost,
+          qty,
+          line.line_total
+        )
+
+        if (!description) {
+          throw new Error(`Line ${index + 1} description is required`)
+        }
+        if (!itemId) {
+          throw new Error(`Line ${index + 1} is not mapped to an item`)
+        }
+        if (qty <= 0) {
+          throw new Error(`Line ${index + 1} has invalid quantity`)
+        }
+        if (!unitCost || Number.parseFloat(unitCost) <= 0) {
+          throw new Error(`Line ${index + 1} has invalid unit cost`)
         }
 
-        const parsed = draft.parsedReceipt
-
-        const created = await receiptsApi.create({
-          vendor_id: draft.vendorId,
-          source_vendor_alias: parsed.vendor_name?.trim() || undefined,
-          ...(draft.receiptNumber.trim() ? { receipt_number: draft.receiptNumber.trim() } : {}),
-          receipt_date: draft.receiptDate,
-          subtotal: draft.subtotal,
-          tax_amount: draft.taxAmount || undefined,
-          payment_method: draft.paymentMethod || undefined,
-          ingestion_metadata: {
-            source: "ocr",
-            auto_parsed: true,
-            parse_engine: parsed.parse_engine || "unknown",
-            ...(parsed.parse_version ? { parse_version: parsed.parse_version } : {}),
-            ...(typeof parsed.confidence_score === "number"
-              ? { confidence_score: parsed.confidence_score }
-              : {}),
-            ...(parsed.vendor_name?.trim()
-              ? { raw_vendor_name: parsed.vendor_name.trim() }
-              : {}),
-            ...(parsed.warnings.length ? { warnings: parsed.warnings } : {}),
-            ingested_at: new Date().toISOString(),
-            ingestion_version: "ocr-v1",
-          },
-          notes: draft.notes || undefined,
-        })
-        createdReceiptId = created.id
-
-        for (let lineIndex = 0; lineIndex < parsed.line_items.length; lineIndex += 1) {
-          const line = parsed.line_items[lineIndex]
-          const itemId = getAutoMatchedItemId(line.description)
-          const qty = line.quantity
-          const unitCost = resolveParsedLineUnitCost(line)
-
-          if (!itemId) {
-            throw new Error(`Line ${lineIndex + 1} is not mapped to an item`)
-          }
-          if (!Number.isFinite(qty) || qty <= 0) {
-            throw new Error(`Line ${lineIndex + 1} has invalid quantity`)
-          }
-          if (!unitCost || Number.parseFloat(unitCost) <= 0) {
-            throw new Error(`Line ${lineIndex + 1} has invalid unit cost`)
-          }
-
-          await receiptsApi.lineItems.create(createdReceiptId, {
-            item_id: itemId,
-            quantity: qty,
-            unit_cost: unitCost,
-            notes: line.description,
-          })
-        }
-
-        await receiptsApi.uploadPdf(createdReceiptId, draft.file, {
-          bypassCompression: bulkBypassCompression,
+        await receiptsApi.lineItems.create(createdReceiptId, {
+          item_id: itemId,
+          quantity: qty,
+          unit_cost: unitCost,
+          notes: lineNotes || description,
         })
 
-        successCount += 1
-        setBulkImportDrafts((prev) =>
-          prev.map((entry) =>
-            entry.id === draft.id
-              ? {
-                  ...entry,
-                  result: "success",
-                  resultMessage: `Imported as ${createdReceiptId}.`,
-                }
-              : entry
-          )
-        )
-      } catch (err) {
-        failedCount += 1
-        const baseMessage = err instanceof Error ? err.message : "Failed to import receipt"
-        const message = createdReceiptId
-          ? `${baseMessage}. Receipt was created (${createdReceiptId}) but import did not fully complete.`
-          : baseMessage
-
-        setBulkImportDrafts((prev) =>
-          prev.map((entry) =>
-            entry.id === draft.id
-              ? {
-                  ...entry,
-                  result: "failed",
-                  resultMessage: message,
-                }
-              : entry
-          )
-        )
+        learnedMappings.push({
+          sourceText: description,
+          itemId,
+        })
       }
-    }
 
-    if (successCount > 0) {
+      const parsedLineCountForNumbering = parsed.line_items.reduce(
+        (count, _line, idx) => count + (isDraftLineDeleted(activeDraft, idx) ? 0 : 1),
+        0
+      )
+
+      for (let index = 0; index < activeDraft.manualLines.length; index += 1) {
+        const line = activeDraft.manualLines[index]
+        const manualLineNumber = parsedLineCountForNumbering + index + 1
+        const itemId = line.itemId
+        const qty = Number.parseInt(line.quantity, 10)
+        const unitCost = line.unitCost.trim()
+        const unitCostNumber = Number.parseFloat(unitCost)
+        const description = line.description.trim()
+
+        if (!description) {
+          throw new Error(`Line ${manualLineNumber} description is required`)
+        }
+        if (!itemId) {
+          throw new Error(`Line ${manualLineNumber} is not mapped to an item`)
+        }
+        if (!Number.isFinite(qty) || qty <= 0) {
+          throw new Error(`Line ${manualLineNumber} has invalid quantity`)
+        }
+        if (!Number.isFinite(unitCostNumber) || unitCostNumber <= 0) {
+          throw new Error(`Line ${manualLineNumber} has invalid unit cost`)
+        }
+
+        await receiptsApi.lineItems.create(createdReceiptId, {
+          item_id: itemId,
+          quantity: qty,
+          unit_cost: unitCostNumber.toFixed(2),
+          notes: description,
+        })
+
+        learnedMappings.push({
+          sourceText: description,
+          itemId,
+        })
+      }
+
+      await receiptsApi.uploadPdf(createdReceiptId, activeDraft.file, {
+        bypassCompression: bulkBypassCompression,
+      })
+
+      rememberVendorItemMappings(activeDraft.vendorId, learnedMappings)
+
+      updateDraft(activeDraft.id, (entry) => ({
+        ...entry,
+        status: "imported",
+        statusMessage: `Imported as ${createdReceiptId}.`,
+      }))
+
       queryClient.invalidateQueries({ queryKey: ["receipts"] })
-    }
 
-    setBulkImportStage("result")
-    setBulkImportStatus(
-      `Created ${successCount} receipt(s); ${failedCount} failed; ${skippedCount} skipped.`
-    )
+      const nextDraft = bulkImportDrafts.find(
+        (draft) => draft.id !== activeDraft.id && draft.status !== "imported"
+      )
+      if (nextDraft) {
+        setActiveDraftId(nextDraft.id)
+      }
+
+      setBulkImportStatus(`Imported ${activeDraft.file.name}.`)
+    } catch (err) {
+      const baseMessage = err instanceof Error ? err.message : "Failed to import receipt"
+      let message = baseMessage
+
+      if (createdReceiptId) {
+        try {
+          await receiptsApi.delete(createdReceiptId)
+          message = `${baseMessage}. Import was rolled back and temporary receipt (${createdReceiptId}) was deleted.`
+        } catch (cleanupErr) {
+          const cleanupMessage =
+            cleanupErr instanceof Error
+              ? cleanupErr.message
+              : "Failed to clean up created receipt"
+          message = `${baseMessage}. Receipt was created (${createdReceiptId}) but rollback failed: ${cleanupMessage}`
+        }
+
+        queryClient.invalidateQueries({ queryKey: ["receipts"] })
+      }
+
+      updateDraft(activeDraft.id, (entry) => ({
+        ...entry,
+        status: "failed",
+        statusMessage: message,
+      }))
+      setBulkImportError(message)
+      setBulkImportStatus("")
+    } finally {
+      setImportingDraftId(null)
+    }
+  }
+
+  const addManualImportLine = () => {
+    if (!activeDraft) return
+    updateDraft(activeDraft.id, (entry) => ({
+      ...entry,
+      manualLines: [...entry.manualLines, createManualImportLine()],
+    }))
+  }
+
+  const updateManualImportLine = (
+    draftId: string,
+    lineId: string,
+    updates: Partial<Omit<BulkImportManualLine, "id">>
+  ) => {
+    updateDraft(draftId, (entry) => ({
+      ...entry,
+      manualLines: entry.manualLines.map((line) =>
+        line.id === lineId ? { ...line, ...updates } : line
+      ),
+    }))
+  }
+
+  const removeManualImportLine = (draftId: string, lineId: string) => {
+    updateDraft(draftId, (entry) => ({
+      ...entry,
+      manualLines: entry.manualLines.filter((line) => line.id !== lineId),
+    }))
+  }
+
+  const removeParsedDraftLine = (draftId: string, index: number) => {
+    updateDraft(draftId, (entry) => {
+      const nextDescription = { ...entry.lineDescriptionOverrides }
+      delete nextDescription[index]
+
+      const nextItem = { ...entry.lineItemOverrides }
+      delete nextItem[index]
+
+      const nextQty = { ...entry.lineQtyOverrides }
+      delete nextQty[index]
+
+      const nextUnitCost = { ...entry.lineUnitCostOverrides }
+      delete nextUnitCost[index]
+
+      return {
+        ...entry,
+        deletedLineIndexes: {
+          ...entry.deletedLineIndexes,
+          [index]: true,
+        },
+        lineDescriptionOverrides: nextDescription,
+        lineItemOverrides: nextItem,
+        lineQtyOverrides: nextQty,
+        lineUnitCostOverrides: nextUnitCost,
+      }
+    })
+
+    setNewItemTarget((prev) => {
+      if (
+        prev?.draftId === draftId &&
+        prev.kind === "parsed" &&
+        prev.index === index
+      ) {
+        return null
+      }
+      return prev
+    })
   }
 
   useEffect(() => {
     if (!open || !autoParsePendingRef.current) return
-    if (bulkImportStage !== "upload") return
     if (bulkImportDrafts.length === 0) return
 
     autoParsePendingRef.current = false
-    void handleBulkParseAll()
-  }, [open, bulkImportDrafts, bulkImportStage])
+    void handleParseAll(autoParseModeRef.current)
+  }, [open, bulkImportDrafts])
 
-  const readySelectedCount = bulkImportDrafts.filter(
-    (draft) => draft.selected && getBulkDraftValidationMessage(draft).ready
-  ).length
+  const importedCount = bulkImportDrafts.filter((draft) => draft.status === "imported").length
+  const parsedCount = bulkImportDrafts.filter((draft) => draft.parsedReceipt).length
+  const parsingDrafts = bulkImportDrafts.filter((draft) => draft.parseStage !== null)
+  const isBusy =
+    importingDraftId !== null || parsingDrafts.length > 0
+
+  const importingDraft = importingDraftId
+    ? bulkImportDrafts.find((draft) => draft.id === importingDraftId) || null
+    : null
+
+  const importBusyReason = importingDraft
+    ? `Please wait: ${importingDraft.file.name} is currently importing.`
+    : null
+
+  const activeLineStats = activeDraft ? getDraftLineStats(activeDraft) : null
+  const activeValidation = activeDraft
+    ? getBulkDraftValidationMessage(activeDraft)
+    : { ready: false, message: "Select a file to review." }
+  const activeSubtotalDifference =
+    activeDraft && activeLineStats
+      ? getImportSubtotalDifference(activeDraft.subtotal, activeLineStats.lineSubtotal)
+      : null
+  const activeHasSubtotalMismatch =
+    Boolean(activeDraft) &&
+    Boolean(activeLineStats) &&
+    Boolean(activeLineStats && activeLineStats.total > 0 && activeLineStats.unresolved === 0) &&
+    activeSubtotalDifference !== null &&
+    !importSubtotalMatches(activeDraft?.subtotal || "", activeLineStats?.lineSubtotal || 0)
+
+  const activeDraftParsing = Boolean(activeDraft?.parseStage)
+  const otherParsingCount = parsingDrafts.filter((draft) => draft.id !== activeDraftId).length
+
+  const finishImportDisabledReason = (() => {
+    if (!activeDraft) {
+      return "Select a file first."
+    }
+    if (importingDraftId === activeDraft.id) {
+      return `Finishing import for ${activeDraft.file.name}...`
+    }
+    if (activeDraftParsing) {
+      return `Please wait: ${activeDraft.file.name} is still parsing.`
+    }
+    if (importBusyReason) {
+      return importBusyReason
+    }
+    if (activeDraft.status === "imported") {
+      return activeDraft.statusMessage || "This file has already been imported."
+    }
+    if (!activeValidation.ready) {
+      return activeValidation.message
+    }
+    return null
+  })()
+
+  const isFinishImportDisabled = finishImportDisabledReason !== null
 
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(nextOpen) => {
-        onOpenChange(nextOpen)
-        if (!nextOpen) resetBulkImportForm()
-      }}
-    >
-      <DialogContent className="w-[96vw] max-w-[1500px]">
-        <DialogHeader>
-          <DialogTitle>Import Receipts (OCR)</DialogTitle>
-        </DialogHeader>
+    <>
+      <Dialog
+        open={open}
+        onOpenChange={(nextOpen) => {
+          if (nextOpen) {
+            onOpenChange(true)
+            return
+          }
+          requestCloseDialog()
+        }}
+      >
+        <DialogContent className="w-[96vw] max-w-[1800px]">
+          <DialogHeader>
+            <DialogTitle>Bulk Import Receipts (Full Review Per File)</DialogTitle>
+          </DialogHeader>
 
-        <div className="space-y-4">
-          {bulkImportError && (
-            <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-md px-3 py-2">
-              {bulkImportError}
-            </div>
-          )}
-
-          {bulkImportStatus && (
-            <div className="text-xs text-muted-foreground">{bulkImportStatus}</div>
-          )}
-
-          {bulkImportStage === "upload" && (
-            <div className="space-y-4">
-              <div className="rounded-md border border-dashed bg-muted/10 px-4 py-5 space-y-3">
-                <input
-                  ref={bulkImportInputRef}
-                  type="file"
-                  multiple
-                  accept=".pdf,.png,.jpg,.jpeg,.webp"
-                  className="hidden"
-                  onChange={handleBulkImportFilesChange}
-                />
-                <div className="flex flex-wrap items-center gap-3">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => bulkImportInputRef.current?.click()}
-                  >
-                    Choose Files
-                  </Button>
-                  <span className="text-sm text-muted-foreground">
-                    Select multiple receipt PDFs/images. Each file will run through OCR parse before create.
-                  </span>
-                </div>
-
-                <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
-                  <input
-                    type="checkbox"
-                    checked={bulkBypassCompression}
-                    onChange={(e) => setBulkBypassCompression(e.target.checked)}
-                  />
-                  Bypass compression (upload original files)
-                </label>
-
-                <div className="space-y-1 max-w-sm">
-                  <Label className="text-xs">OCR mode</Label>
-                  <Select
-                    value={bulkOcrMode}
-                    onValueChange={(value) => setBulkOcrMode(value as ReceiptOcrMode)}
-                  >
-                    <SelectTrigger>
-                      <SelectValue placeholder="Select OCR mode" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="auto">Auto (PaddleOCR + PaddleOCR-VL fallback)</SelectItem>
-                      <SelectItem value="classic">PaddleOCR</SelectItem>
-                      <SelectItem value="vl">PaddleOCR-VL</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
+          <div className="space-y-4">
+            {bulkImportError && (
+              <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-md px-3 py-2">
+                {bulkImportError}
               </div>
+            )}
 
-              {bulkImportDrafts.length > 0 && (
-                <div className="border rounded-md max-h-56 overflow-y-auto divide-y">
-                  {bulkImportDrafts.map((draft) => (
-                    <div key={draft.id} className="px-3 py-2 text-sm">
-                      {draft.file.name}
-                    </div>
-                  ))}
-                </div>
-              )}
+            {bulkImportStatus && (
+              <div className="text-xs text-muted-foreground">{bulkImportStatus}</div>
+            )}
 
-              <div className="flex justify-end gap-2">
-                <Button variant="outline" onClick={() => onOpenChange(false)}>
-                  Cancel
-                </Button>
-                <Button
-                  onClick={handleBulkParseAll}
-                  disabled={bulkImportDrafts.length === 0}
-                >
-                  Parse {bulkImportDrafts.length || ""} File{bulkImportDrafts.length === 1 ? "" : "s"}
-                </Button>
-              </div>
-            </div>
-          )}
+            <input
+              ref={bulkImportInputRef}
+              type="file"
+              multiple
+              accept=".pdf,.png,.jpg,.jpeg,.webp"
+              className="hidden"
+              onChange={handleBulkImportFilesChange}
+            />
 
-          {(bulkImportStage === "parsing" ||
-            bulkImportStage === "review" ||
-            bulkImportStage === "creating" ||
-            bulkImportStage === "result") && (
-            <div className="space-y-4">
-              <div className="text-sm text-muted-foreground">
-                {bulkImportDrafts.length} file(s) in batch. {bulkImportDrafts.filter((d) => d.parsedReceipt).length} parsed.
-              </div>
-
-              <div className="max-h-[62vh] overflow-y-auto space-y-3 pr-1">
-                {bulkImportDrafts.map((draft) => {
-                  const lineStats = getBulkLineStats(draft)
-                  const validation = getBulkDraftValidationMessage(draft)
-                  const controlsDisabled =
-                    bulkImportStage === "creating" || bulkImportStage === "result"
-
-                  return (
-                    <div key={draft.id} className="border rounded-md p-3 space-y-3">
-                      <div className="flex flex-wrap items-start justify-between gap-2">
-                        <div>
-                          <div className="font-medium break-all">{draft.file.name}</div>
-                          <div className="text-xs text-muted-foreground">
-                            {draft.parseError
-                              ? "Parse failed"
-                              : draft.parsedReceipt
-                                ? "Parsed"
-                                : draft.parseStage === "uploading"
-                                  ? `Uploading${typeof draft.parseProgress === "number" ? ` ${draft.parseProgress}%` : "..."}`
-                                  : draft.parseStage === "processing"
-                                    ? "Parsing..."
-                                    : "Pending"}
-                          </div>
-                            {draft.parsedReceipt && (
-                              <div className="text-xs text-sky-700 mt-1">
-                                Final engine: {getOcrEngineDisplayName(draft.parsedReceipt.parse_engine)}
-                                {typeof draft.parsedReceipt.confidence_score === "number"
-                                  ? ` (score ${draft.parsedReceipt.confidence_score.toFixed(2)})`
-                                  : ""}
-                              </div>
-                            )}
-                        </div>
-
-                        <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
-                          <input
-                            type="checkbox"
-                            checked={draft.selected}
-                            disabled={controlsDisabled}
-                            onChange={(e) => {
-                              const checked = e.target.checked
-                              setBulkImportDrafts((prev) =>
-                                prev.map((entry) =>
-                                  entry.id === draft.id
-                                    ? { ...entry, selected: checked }
-                                    : entry
-                                )
-                              )
-                            }}
-                          />
-                          Import this file
-                        </label>
-                      </div>
-
-                      {draft.parseError && (
-                        <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-md px-2 py-1">
-                          {draft.parseError}
-                        </div>
-                      )}
-
-                      {draft.parsedReceipt && (
-                        <>
-                          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-                            <div className="space-y-1">
-                              <Label className="text-xs">Vendor *</Label>
-                              <Select
-                                value={draft.vendorId || "__none__"}
-                                onValueChange={(value) => {
-                                  setBulkImportDrafts((prev) =>
-                                    prev.map((entry) =>
-                                      entry.id === draft.id
-                                        ? {
-                                            ...entry,
-                                            vendorId: value === "__none__" ? "" : value,
-                                          }
-                                        : entry
-                                    )
-                                  )
-                                }}
-                                disabled={controlsDisabled}
-                              >
-                                <SelectTrigger>
-                                  <SelectValue placeholder="Select vendor" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                  <SelectItem value="__none__">Unmapped</SelectItem>
-                                  {vendors.map((vendor) => (
-                                    <SelectItem key={vendor.id} value={vendor.id}>
-                                      {vendor.name}
-                                    </SelectItem>
-                                  ))}
-                                </SelectContent>
-                              </Select>
-                              <p className="text-[11px] text-muted-foreground truncate">
-                                OCR label: {draft.vendorLabel || "-"}
-                              </p>
-                            </div>
-
-                            <div className="space-y-1">
-                              <Label className="text-xs">Receipt #</Label>
-                              <Input
-                                value={draft.receiptNumber}
-                                onChange={(e) => {
-                                  const value = e.target.value
-                                  setBulkImportDrafts((prev) =>
-                                    prev.map((entry) =>
-                                      entry.id === draft.id
-                                        ? { ...entry, receiptNumber: value }
-                                        : entry
-                                    )
-                                  )
-                                }}
-                                disabled={controlsDisabled}
-                              />
-                            </div>
-
-                            <div className="space-y-1">
-                              <Label className="text-xs">Receipt Date *</Label>
-                              <Input
-                                type="date"
-                                value={draft.receiptDate}
-                                onChange={(e) => {
-                                  const value = e.target.value
-                                  setBulkImportDrafts((prev) =>
-                                    prev.map((entry) =>
-                                      entry.id === draft.id
-                                        ? { ...entry, receiptDate: value }
-                                        : entry
-                                    )
-                                  )
-                                }}
-                                disabled={controlsDisabled}
-                              />
-                            </div>
-
-                            <div className="space-y-1">
-                              <Label className="text-xs">Subtotal *</Label>
-                              <Input
-                                value={draft.subtotal}
-                                onChange={(e) => {
-                                  const value = e.target.value
-                                  setBulkImportDrafts((prev) =>
-                                    prev.map((entry) =>
-                                      entry.id === draft.id
-                                        ? { ...entry, subtotal: value }
-                                        : entry
-                                    )
-                                  )
-                                }}
-                                disabled={controlsDisabled}
-                              />
-                            </div>
-
-                            <div className="space-y-1">
-                              <Label className="text-xs">Tax Amount</Label>
-                              <Input
-                                value={draft.taxAmount}
-                                onChange={(e) => {
-                                  const value = e.target.value
-                                  setBulkImportDrafts((prev) =>
-                                    prev.map((entry) =>
-                                      entry.id === draft.id
-                                        ? { ...entry, taxAmount: value }
-                                        : entry
-                                    )
-                                  )
-                                }}
-                                disabled={controlsDisabled}
-                              />
-                            </div>
-
-                            <div className="space-y-1">
-                              <Label className="text-xs">Payment Method</Label>
-                              <Input
-                                value={draft.paymentMethod}
-                                onChange={(e) => {
-                                  const value = e.target.value
-                                  setBulkImportDrafts((prev) =>
-                                    prev.map((entry) =>
-                                      entry.id === draft.id
-                                        ? { ...entry, paymentMethod: value }
-                                        : entry
-                                    )
-                                  )
-                                }}
-                                disabled={controlsDisabled}
-                              />
-                            </div>
-
-                            <div className="space-y-1 md:col-span-3">
-                              <Label className="text-xs">Notes</Label>
-                              <Input
-                                value={draft.notes}
-                                onChange={(e) => {
-                                  const value = e.target.value
-                                  setBulkImportDrafts((prev) =>
-                                    prev.map((entry) =>
-                                      entry.id === draft.id
-                                        ? { ...entry, notes: value }
-                                        : entry
-                                    )
-                                  )
-                                }}
-                                placeholder="Optional notes"
-                                disabled={controlsDisabled}
-                              />
-                            </div>
-                          </div>
-
-                          {draft.warnings.length > 0 && (
-                            <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2 py-1">
-                              <div className="font-medium mb-1">
-                                OCR warnings (final engine: {getOcrEngineDisplayName(draft.parsedReceipt?.parse_engine)})
-                              </div>
-                              {draft.warnings.join(" | ")}
-                            </div>
-                          )}
-
-                          <div
-                            className={`text-xs px-2 py-1 rounded-md ${
-                              validation.ready
-                                ? "text-green-700 bg-green-50"
-                                : "text-amber-700 bg-amber-50"
-                            }`}
-                          >
-                            Parsed lines: {lineStats.total}. Ready lines: {lineStats.total - lineStats.unresolved}. {validation.message}
-                          </div>
-                        </>
-                      )}
-
-                      {bulkImportStage === "result" && (
-                        <div
-                          className={`text-xs px-2 py-1 rounded-md ${
-                            draft.result === "success"
-                              ? "text-green-700 bg-green-50"
-                              : draft.result === "failed"
-                                ? "text-red-700 bg-red-50"
-                                : "text-muted-foreground bg-muted"
-                          }`}
-                        >
-                          {draft.result === "success"
-                            ? "Imported"
-                            : draft.result === "failed"
-                              ? "Failed"
-                              : draft.result === "skipped"
-                                ? "Skipped"
-                                : "Pending"}
-                          {draft.resultMessage ? `: ${draft.resultMessage}` : ""}
-                        </div>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
-
-              {(bulkImportStage === "review" || bulkImportStage === "creating") && (
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => setBulkImportStage("upload")}
-                    disabled={bulkImportStage === "creating"}
-                  >
-                    Choose Different Files
-                  </Button>
-                  <div className="flex gap-2">
+            {bulkImportDrafts.length === 0 ? (
+              <div className="space-y-4">
+                <div className="rounded-md border border-dashed bg-muted/10 px-4 py-5 space-y-3">
+                  <div className="flex flex-wrap items-center gap-3">
                     <Button
                       type="button"
                       variant="outline"
-                      onClick={() => onOpenChange(false)}
-                      disabled={bulkImportStage === "creating"}
+                      onClick={() => bulkImportInputRef.current?.click()}
                     >
-                      Cancel
+                      Choose Files
+                    </Button>
+                    <span className="text-sm text-muted-foreground">
+                      Load multiple receipt files, then review each one in full before finishing import.
+                    </span>
+                  </div>
+
+                  <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={bulkBypassCompression}
+                      onChange={(e) => setBulkBypassCompression(e.target.checked)}
+                    />
+                    Bypass compression (upload original file)
+                  </label>
+
+                  <div className="space-y-1 max-w-sm">
+                    <Label className="text-xs">OCR mode</Label>
+                    <Select
+                      value={bulkOcrMode}
+                      onValueChange={(value) => setBulkOcrMode(value as ReceiptOcrMode)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select OCR mode" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="auto">Auto (PaddleOCR-VL + PaddleOCR fallback)</SelectItem>
+                        <SelectItem value="classic">PaddleOCR</SelectItem>
+                        <SelectItem value="vl">PaddleOCR-VL</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+
+                <div className="flex justify-end gap-2">
+                  <Button variant="outline" onClick={requestCloseDialog}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm text-muted-foreground">
+                    {bulkImportDrafts.length} file(s) loaded. {parsedCount} parsed. {importedCount} imported.
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => bulkImportInputRef.current?.click()}
+                      disabled={isBusy}
+                    >
+                      Replace Files
                     </Button>
                     <Button
                       type="button"
-                      onClick={handleBulkCreateAll}
-                      disabled={bulkImportStage === "creating" || readySelectedCount === 0}
+                      variant="outline"
+                      onClick={() => {
+                        void handleParseAll()
+                      }}
+                      disabled={isBusy}
                     >
-                      {bulkImportStage === "creating"
-                        ? "Creating..."
-                        : `Create ${readySelectedCount} Receipt${readySelectedCount === 1 ? "" : "s"}`}
+                      Parse All
+                    </Button>
+                    <Button type="button" variant="outline" onClick={requestCloseDialog} disabled={isBusy}>
+                      Close
                     </Button>
                   </div>
                 </div>
-              )}
 
-              {bulkImportStage === "result" && (
-                <div className="flex justify-end gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={resetBulkImportForm}
-                  >
-                    Import More
-                  </Button>
-                  <Button type="button" onClick={() => onOpenChange(false)}>
-                    Done
-                  </Button>
+                <div className="grid grid-cols-1 gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
+                  <div className="border rounded-md p-2 max-h-[76vh] overflow-y-auto space-y-2">
+                    {bulkImportDrafts.map((draft) => {
+                      const isActive = draft.id === activeDraftId
+                      const lineStats = getDraftLineStats(draft)
+                      const validation = getBulkDraftValidationMessage(draft)
+
+                      return (
+                        <button
+                          key={draft.id}
+                          type="button"
+                          onClick={() => setActiveDraftId(draft.id)}
+                          className={`w-full text-left rounded-md border px-3 py-2 space-y-1 transition-colors ${
+                            isActive
+                              ? "border-primary bg-primary/5"
+                              : "border-border hover:bg-muted/30"
+                          }`}
+                        >
+                          <div className="font-medium text-sm break-all">{draft.file.name}</div>
+                          <div className="text-[11px] text-muted-foreground">
+                            {draft.status === "imported"
+                              ? "Imported"
+                              : draft.parseStage === "uploading"
+                                ? `Uploading${typeof draft.parseProgress === "number" ? ` ${draft.parseProgress}%` : "..."}`
+                                : draft.parseStage === "processing"
+                                  ? "Parsing..."
+                                  : draft.parseError
+                                    ? "Parse failed"
+                                    : draft.parsedReceipt
+                                      ? "Parsed"
+                                      : "Not parsed"}
+                          </div>
+                          {draft.parsedReceipt && (
+                            <div className="text-[11px] text-muted-foreground">
+                              {lineStats.total - lineStats.unresolved}/{lineStats.total} lines ready
+                            </div>
+                          )}
+                          {draft.status === "imported" ? (
+                            <div className="inline-flex items-center gap-1 text-[11px] text-green-700 bg-green-50 px-2 py-0.5 rounded-full">
+                              <CheckCircle2 className="h-3 w-3" />
+                              Imported
+                            </div>
+                          ) : !validation.ready ? (
+                            <div className="inline-flex items-center gap-1 text-[11px] text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full">
+                              <AlertCircle className="h-3 w-3" />
+                              Needs review
+                            </div>
+                          ) : (
+                            <div className="inline-flex items-center gap-1 text-[11px] text-green-700 bg-green-50 px-2 py-0.5 rounded-full">
+                              <CheckCircle2 className="h-3 w-3" />
+                              Ready
+                            </div>
+                          )}
+                        </button>
+                      )
+                    })}
+                  </div>
+
+                  <div className="min-w-0">
+                    {!activeDraft ? (
+                      <div className="rounded-md border bg-muted/10 px-4 py-6 text-sm text-muted-foreground">
+                        Select a file from the left to review and finish import.
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 gap-6 2xl:grid-cols-[minmax(0,1fr)_minmax(420px,560px)]">
+                        <div className="order-2 min-w-0 space-y-4 2xl:order-1">
+                          {activeDraft.parseError && (
+                            <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-md px-3 py-2">
+                              {activeDraft.parseError}
+                            </div>
+                          )}
+
+                          {!activeDraft.parsedReceipt && !activeDraft.parseError && activeDraft.parseStage && (
+                            <div className="rounded-md border bg-muted/20 px-4 py-8">
+                              <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
+                                <Loader2 className="h-5 w-5 animate-spin" />
+                                <div className="font-medium text-foreground">
+                                  {activeDraft.parseStage === "uploading"
+                                    ? "Uploading receipt"
+                                    : "Parsing receipt"}
+                                </div>
+                                {activeDraft.parseStage === "uploading" &&
+                                  typeof activeDraft.parseProgress === "number" && (
+                                    <div className="w-full max-w-sm space-y-1">
+                                      <div className="h-2 w-full overflow-hidden rounded bg-muted">
+                                        <div
+                                          className="h-full bg-primary transition-all"
+                                          style={{ width: `${activeDraft.parseProgress}%` }}
+                                        />
+                                      </div>
+                                      <div className="text-center text-xs">
+                                        {activeDraft.parseProgress}% uploaded
+                                      </div>
+                                    </div>
+                                  )}
+                              </div>
+                            </div>
+                          )}
+
+                          {!activeDraft.parsedReceipt && !activeDraft.parseError && !activeDraft.parseStage && (
+                            <div className="rounded-md border border-dashed bg-muted/10 px-4 py-5 text-sm text-muted-foreground space-y-3">
+                              <div>
+                                Parse this file first, then review all extracted fields and lines before finishing import.
+                              </div>
+                              <Button
+                                type="button"
+                                onClick={() => {
+                                  void parseDraft(activeDraft.id)
+                                }}
+                                disabled={isBusy}
+                              >
+                                Parse Selected File
+                              </Button>
+                            </div>
+                          )}
+
+                          {activeDraft.parsedReceipt && (
+                            <>
+                              <div className="rounded-md border bg-muted/20 px-3 py-3 text-sm space-y-3">
+                                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                                  <div className="space-y-1">
+                                    <div className="font-medium text-foreground">OCR vendor label</div>
+                                    <div className="text-muted-foreground">
+                                      {activeDraft.vendorLabel || activeDraft.parsedReceipt.vendor_name?.trim() || "-"}
+                                    </div>
+                                  </div>
+                                  <div className="space-y-1">
+                                    <Label className="text-xs font-medium">Mapped vendor</Label>
+                                    <Select
+                                      value={activeDraft.vendorId || "__none__"}
+                                      onValueChange={(value) =>
+                                        updateDraft(activeDraft.id, (entry) => ({
+                                          ...entry,
+                                          vendorId: value === "__none__" ? "" : value,
+                                        }))
+                                      }
+                                      disabled={isBusy}
+                                    >
+                                      <SelectTrigger>
+                                        <SelectValue placeholder="Select vendor" />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        <SelectItem value="__none__">Unmapped</SelectItem>
+                                        {vendors.map((vendor) => (
+                                          <SelectItem key={vendor.id} value={vendor.id}>
+                                            {vendor.name}
+                                          </SelectItem>
+                                        ))}
+                                      </SelectContent>
+                                    </Select>
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="text-sm text-sky-700 bg-sky-50 border border-sky-200 rounded-md px-3 py-2">
+                                <div className="font-medium mb-1">OCR result</div>
+                                <div>
+                                  Final engine: {getOcrEngineDisplayName(activeDraft.parsedReceipt.parse_engine)}
+                                </div>
+                                <div>
+                                  Fixture used: {getFixtureUsedDisplayName(activeDraft.parsedReceipt.fixture_used)}
+                                </div>
+                                {typeof activeDraft.parsedReceipt.confidence_score === "number" && (
+                                  <div>
+                                    Confidence score: {activeDraft.parsedReceipt.confidence_score.toFixed(2)}
+                                  </div>
+                                )}
+                                {activeDraft.parsedReceipt.parse_version && (
+                                  <div>Parse version: {activeDraft.parsedReceipt.parse_version}</div>
+                                )}
+                              </div>
+
+                              {activeDraft.warnings.length > 0 && (
+                                <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+                                  <div className="font-medium mb-1">
+                                    OCR warnings (final engine: {getOcrEngineDisplayName(activeDraft.parsedReceipt.parse_engine)})
+                                  </div>
+                                  <ul className="list-disc pl-5">
+                                    {activeDraft.warnings.map((warning, idx) => (
+                                      <li key={idx}>{warning}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+
+                              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                                <div className="space-y-2">
+                                  <Label>Receipt #</Label>
+                                  <Input
+                                    value={activeDraft.receiptNumber}
+                                    onChange={(e) =>
+                                      updateDraft(activeDraft.id, (entry) => ({
+                                        ...entry,
+                                        receiptNumber: e.target.value,
+                                      }))
+                                    }
+                                  />
+                                </div>
+                                <div className="space-y-2">
+                                  <Label>Receipt Date *</Label>
+                                  <Input
+                                    type="date"
+                                    value={activeDraft.receiptDate}
+                                    onChange={(e) =>
+                                      updateDraft(activeDraft.id, (entry) => ({
+                                        ...entry,
+                                        receiptDate: e.target.value,
+                                      }))
+                                    }
+                                  />
+                                </div>
+                                <div className="space-y-2">
+                                  <Label>Subtotal *</Label>
+                                  <Input
+                                    value={activeDraft.subtotal}
+                                    onChange={(e) =>
+                                      updateDraft(activeDraft.id, (entry) => ({
+                                        ...entry,
+                                        subtotal: e.target.value,
+                                      }))
+                                    }
+                                  />
+                                </div>
+                                <div className="space-y-2">
+                                  <Label>Tax Amount</Label>
+                                  <Input
+                                    value={activeDraft.taxAmount}
+                                    onChange={(e) =>
+                                      updateDraft(activeDraft.id, (entry) => ({
+                                        ...entry,
+                                        taxAmount: e.target.value,
+                                      }))
+                                    }
+                                  />
+                                </div>
+                                <div className="space-y-2">
+                                  <Label>Total</Label>
+                                  <Input
+                                    value={activeDraft.total}
+                                    onChange={(e) =>
+                                      updateDraft(activeDraft.id, (entry) => ({
+                                        ...entry,
+                                        total: e.target.value,
+                                      }))
+                                    }
+                                  />
+                                </div>
+                                <div className="space-y-2">
+                                  <Label>Payment Method</Label>
+                                  <Input
+                                    value={activeDraft.paymentMethod}
+                                    onChange={(e) =>
+                                      updateDraft(activeDraft.id, (entry) => ({
+                                        ...entry,
+                                        paymentMethod: e.target.value,
+                                      }))
+                                    }
+                                    placeholder="Not detected"
+                                  />
+                                </div>
+                              </div>
+
+                              <div className="space-y-2">
+                                <Label>Notes</Label>
+                                <Input
+                                  value={activeDraft.notes}
+                                  onChange={(e) =>
+                                    updateDraft(activeDraft.id, (entry) => ({
+                                      ...entry,
+                                      notes: e.target.value,
+                                    }))
+                                  }
+                                  placeholder="Optional notes"
+                                />
+                              </div>
+
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <Label className="text-sm font-medium">Receipt Lines</Label>
+                                <Button type="button" variant="outline" size="sm" onClick={addManualImportLine}>
+                                  <Plus className="h-4 w-4 mr-2" />
+                                  Add Line Item
+                                </Button>
+                              </div>
+
+                              <div className="border rounded-md overflow-hidden [&>div]:overflow-hidden">
+                                <Table className="table-fixed">
+                                  <TableHeader>
+                                    <TableRow>
+                                      <TableHead className="w-[28%]">Description</TableHead>
+                                      <TableHead className="w-[34%]">Map Item</TableHead>
+                                      <TableHead className="w-[10%] text-right">Qty</TableHead>
+                                      <TableHead className="w-[12%] text-right">Unit Cost</TableHead>
+                                      <TableHead className="w-[8%] text-center">Confidence</TableHead>
+                                      <TableHead className="w-[8%] text-center">Action</TableHead>
+                                    </TableRow>
+                                  </TableHeader>
+                                  <TableBody>
+                                    {activeDraft.parsedReceipt.line_items
+                                      .map((line, index) => ({ line, index }))
+                                      .filter(({ index }) => !isDraftLineDeleted(activeDraft, index))
+                                      .map(({ line, index }) => {
+                                      const selectedItemId =
+                                        resolveImportedItemId(activeDraft, line.description, index) ||
+                                        "__none__"
+                                      const descriptionValue = resolveImportedDescription(
+                                        activeDraft,
+                                        index,
+                                        line.description
+                                      )
+                                      const qtyValue =
+                                        activeDraft.lineQtyOverrides[index] ?? String(line.quantity)
+                                      const unitCostValue =
+                                        activeDraft.lineUnitCostOverrides[index] ??
+                                        (line.unit_cost || "")
+
+                                      return (
+                                        <TableRow key={`${index}-${line.description}`}>
+                                          <TableCell className="align-top">
+                                            <Input
+                                              value={descriptionValue}
+                                              onChange={(e) => {
+                                                const value = e.target.value
+                                                updateDraft(activeDraft.id, (entry) => {
+                                                  const next = { ...entry.lineDescriptionOverrides }
+                                                  if (value === line.description) {
+                                                    delete next[index]
+                                                  } else {
+                                                    next[index] = value
+                                                  }
+                                                  return {
+                                                    ...entry,
+                                                    lineDescriptionOverrides: next,
+                                                  }
+                                                })
+                                              }}
+                                              placeholder="Line description"
+                                            />
+                                          </TableCell>
+                                          <TableCell className="align-top">
+                                            <Select
+                                              value={selectedItemId}
+                                              onValueChange={(value) => {
+                                                if (value === "__create__") {
+                                                  setNewItemTarget({
+                                                    draftId: activeDraft.id,
+                                                    kind: "parsed",
+                                                    index,
+                                                  })
+                                                  return
+                                                }
+
+                                                updateDraft(activeDraft.id, (entry) => {
+                                                  const next = { ...entry.lineItemOverrides }
+                                                  if (value === "__none__") {
+                                                    delete next[index]
+                                                  } else {
+                                                    next[index] = value
+                                                  }
+                                                  return {
+                                                    ...entry,
+                                                    lineItemOverrides: next,
+                                                  }
+                                                })
+                                              }}
+                                            >
+                                              <SelectTrigger className="w-full min-w-0 h-auto min-h-9 whitespace-normal py-2 [&>span]:line-clamp-2 [&>span]:whitespace-normal [&>span]:break-all">
+                                                <SelectValue placeholder="Map item" />
+                                              </SelectTrigger>
+                                              <SelectContent className="max-w-[min(90vw,32rem)]">
+                                                <SelectItem value="__none__">Unmapped</SelectItem>
+                                                <SelectItem value="__create__">
+                                                  <span className="text-blue-600">+ Create New Item</span>
+                                                </SelectItem>
+                                                {items.map((item) => (
+                                                  <SelectItem key={item.id} value={item.id}>
+                                                    <span className="block whitespace-normal break-all leading-snug line-clamp-2">
+                                                      {truncateOptionLabel(item.name, 120)}
+                                                    </span>
+                                                  </SelectItem>
+                                                ))}
+                                              </SelectContent>
+                                            </Select>
+                                          </TableCell>
+                                          <TableCell className="align-top">
+                                            <Input
+                                              className="text-right"
+                                              type="number"
+                                              min={1}
+                                              value={qtyValue}
+                                              onChange={(e) =>
+                                                updateDraft(activeDraft.id, (entry) => ({
+                                                  ...entry,
+                                                  lineQtyOverrides: {
+                                                    ...entry.lineQtyOverrides,
+                                                    [index]: e.target.value,
+                                                  },
+                                                }))
+                                              }
+                                            />
+                                          </TableCell>
+                                          <TableCell className="align-top">
+                                            <Input
+                                              className="text-right"
+                                              type="number"
+                                              step="0.01"
+                                              min="0"
+                                              value={unitCostValue}
+                                              onChange={(e) =>
+                                                updateDraft(activeDraft.id, (entry) => ({
+                                                  ...entry,
+                                                  lineUnitCostOverrides: {
+                                                    ...entry.lineUnitCostOverrides,
+                                                    [index]: e.target.value,
+                                                  },
+                                                }))
+                                              }
+                                            />
+                                          </TableCell>
+                                          <TableCell className="align-top text-center text-xs text-muted-foreground">
+                                            {line.confidence !== null
+                                              ? `${Math.round(line.confidence * 100)}%`
+                                              : "-"}
+                                          </TableCell>
+                                          <TableCell className="align-top text-center">
+                                            <Button
+                                              type="button"
+                                              size="icon"
+                                              variant="ghost"
+                                              className="text-red-600"
+                                              onClick={() => removeParsedDraftLine(activeDraft.id, index)}
+                                              title="Remove parsed line"
+                                            >
+                                              <Trash2 className="h-4 w-4" />
+                                            </Button>
+                                          </TableCell>
+                                        </TableRow>
+                                      )
+                                    })}
+
+                                    {activeDraft.manualLines.map((line) => (
+                                      <TableRow key={line.id}>
+                                        <TableCell className="align-top">
+                                          <Input
+                                            value={line.description}
+                                            onChange={(e) =>
+                                              updateManualImportLine(activeDraft.id, line.id, {
+                                                description: e.target.value,
+                                              })
+                                            }
+                                            placeholder="Manual line description"
+                                          />
+                                        </TableCell>
+                                        <TableCell className="align-top">
+                                          <Select
+                                            value={line.itemId || "__none__"}
+                                            onValueChange={(value) => {
+                                              if (value === "__create__") {
+                                                setNewItemTarget({
+                                                  draftId: activeDraft.id,
+                                                  kind: "manual",
+                                                  lineId: line.id,
+                                                })
+                                                return
+                                              }
+                                              updateManualImportLine(activeDraft.id, line.id, {
+                                                itemId: value === "__none__" ? "" : value,
+                                              })
+                                            }}
+                                          >
+                                            <SelectTrigger className="w-full min-w-0 h-auto min-h-9 whitespace-normal py-2 [&>span]:line-clamp-2 [&>span]:whitespace-normal [&>span]:break-all">
+                                              <SelectValue placeholder="Map item" />
+                                            </SelectTrigger>
+                                            <SelectContent className="max-w-[min(90vw,32rem)]">
+                                              <SelectItem value="__none__">Unmapped</SelectItem>
+                                              <SelectItem value="__create__">
+                                                <span className="text-blue-600">+ Create New Item</span>
+                                              </SelectItem>
+                                              {items.map((item) => (
+                                                <SelectItem key={item.id} value={item.id}>
+                                                  <span className="block whitespace-normal break-all leading-snug line-clamp-2">
+                                                    {truncateOptionLabel(item.name, 120)}
+                                                  </span>
+                                                </SelectItem>
+                                              ))}
+                                            </SelectContent>
+                                          </Select>
+                                        </TableCell>
+                                        <TableCell className="align-top">
+                                          <Input
+                                            className="text-right"
+                                            type="number"
+                                            min={1}
+                                            value={line.quantity}
+                                            onChange={(e) =>
+                                              updateManualImportLine(activeDraft.id, line.id, {
+                                                quantity: e.target.value,
+                                              })
+                                            }
+                                          />
+                                        </TableCell>
+                                        <TableCell className="align-top">
+                                          <Input
+                                            className="text-right"
+                                            type="number"
+                                            step="0.01"
+                                            min="0"
+                                            value={line.unitCost}
+                                            onChange={(e) =>
+                                              updateManualImportLine(activeDraft.id, line.id, {
+                                                unitCost: e.target.value,
+                                              })
+                                            }
+                                          />
+                                        </TableCell>
+                                        <TableCell className="align-top text-center text-xs text-muted-foreground">
+                                          Manual
+                                        </TableCell>
+                                        <TableCell className="align-top text-center">
+                                          <Button
+                                            type="button"
+                                            size="icon"
+                                            variant="ghost"
+                                            className="text-red-600"
+                                            onClick={() =>
+                                              removeManualImportLine(activeDraft.id, line.id)
+                                            }
+                                            title="Remove line"
+                                          >
+                                            <Trash2 className="h-4 w-4" />
+                                          </Button>
+                                        </TableCell>
+                                      </TableRow>
+                                    ))}
+
+                                    {(activeLineStats?.total || 0) === 0 && (
+                                      <EmptyTableRow
+                                        colSpan={6}
+                                        message="No line items extracted yet. Add one manually or re-parse."
+                                      />
+                                    )}
+                                  </TableBody>
+                                </Table>
+                              </div>
+
+                              <div className="text-xs text-muted-foreground space-y-1">
+                                <p>
+                                  Line-item subtotal: {formatCurrency((activeLineStats?.lineSubtotal || 0).toFixed(2))}
+                                  {activeSubtotalDifference !== null && (
+                                    <>
+                                      {" "}
+                                      (difference vs receipt subtotal: {formatCurrency(activeSubtotalDifference.toFixed(2))})
+                                    </>
+                                  )}
+                                </p>
+                              </div>
+
+                              <div
+                                className={`text-xs px-3 py-2 rounded-md ${
+                                  activeDraft.status === "imported"
+                                    ? "text-green-700 bg-green-50"
+                                    : activeHasSubtotalMismatch || !activeValidation.ready
+                                      ? "text-amber-700 bg-amber-50"
+                                      : "text-muted-foreground bg-muted"
+                                }`}
+                              >
+                                {activeDraft.status === "imported"
+                                  ? activeDraft.statusMessage || "This file has already been imported."
+                                  : activeValidation.message}
+                              </div>
+
+                              <div className="flex flex-wrap justify-end gap-2">
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  onClick={() => {
+                                    void parseDraft(activeDraft.id)
+                                  }}
+                                  disabled={isBusy}
+                                >
+                                  Re-Parse Selected
+                                </Button>
+                                <Button
+                                  type="button"
+                                  onClick={handleFinishImport}
+                                  disabled={isFinishImportDisabled}
+                                  title={finishImportDisabledReason || "Finish Import"}
+                                >
+                                  {importingDraftId === activeDraft.id
+                                    ? "Finishing Import..."
+                                    : "Finish Import"}
+                                </Button>
+                              </div>
+
+                              {isFinishImportDisabled && (
+                                <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+                                  Finish Import is disabled: {finishImportDisabledReason}
+                                </div>
+                              )}
+
+                              {otherParsingCount > 0 && (
+                                <div className="text-xs text-sky-700 bg-sky-50 border border-sky-200 rounded-md px-3 py-2">
+                                  {otherParsingCount === 1
+                                    ? "1 other file is still parsing in the background. You can still finish this selected file."
+                                    : `${otherParsingCount} other files are still parsing in the background. You can still finish this selected file.`}
+                                </div>
+                              )}
+                            </>
+                          )}
+                        </div>
+
+                        <div className="order-1 space-y-4 2xl:order-2">
+                          <div className="space-y-2">
+                            <Label>Selected file</Label>
+                            <div className="rounded-md border bg-muted/10 p-3 space-y-3">
+                              <div className="text-sm break-all">{activeDraft.file.name}</div>
+
+                              <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                                <input
+                                  type="checkbox"
+                                  checked={bulkBypassCompression}
+                                  onChange={(e) => setBulkBypassCompression(e.target.checked)}
+                                  disabled={isBusy}
+                                />
+                                Bypass compression (upload original file)
+                              </label>
+
+                              <div className="space-y-1">
+                                <Label className="text-xs">OCR mode</Label>
+                                <Select
+                                  value={bulkOcrMode}
+                                  onValueChange={(value) => setBulkOcrMode(value as ReceiptOcrMode)}
+                                  disabled={isBusy}
+                                >
+                                  <SelectTrigger>
+                                    <SelectValue placeholder="Select OCR mode" />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="auto">
+                                      Auto (PaddleOCR-VL + PaddleOCR fallback)
+                                    </SelectItem>
+                                    <SelectItem value="classic">PaddleOCR</SelectItem>
+                                    <SelectItem value="vl">PaddleOCR-VL</SelectItem>
+                                  </SelectContent>
+                                </Select>
+                              </div>
+
+                              <Button
+                                type="button"
+                                variant="outline"
+                                onClick={() => {
+                                  void parseDraft(activeDraft.id)
+                                }}
+                                disabled={isBusy}
+                              >
+                                Parse Selected File
+                              </Button>
+                            </div>
+                          </div>
+
+                          {activeDraft.status === "failed" && activeDraft.statusMessage && (
+                            <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-md px-3 py-2">
+                              {activeDraft.statusMessage}
+                            </div>
+                          )}
+
+                          {activeDraft.status === "imported" && activeDraft.statusMessage && (
+                            <div className="text-xs text-green-700 bg-green-50 border border-green-200 rounded-md px-3 py-2">
+                              {activeDraft.statusMessage}
+                            </div>
+                          )}
+
+                          <div className="space-y-2">
+                            <Label>Document Preview</Label>
+                            <div className="rounded-md border bg-muted/20 p-2 min-h-[24rem]">
+                              {activePreviewUrl ? (
+                                activeDraft.file.type.startsWith("image/") ? (
+                                  <img
+                                    src={activePreviewUrl}
+                                    alt="Receipt preview"
+                                    className="max-h-[70vh] w-auto mx-auto rounded"
+                                  />
+                                ) : activeDraft.file.type === "application/pdf" ? (
+                                  <iframe
+                                    src={activePreviewUrl}
+                                    title="Receipt preview"
+                                    className="w-full h-[70vh] rounded border"
+                                  />
+                                ) : (
+                                  <div className="h-full flex items-center justify-center text-sm">
+                                    <a
+                                      href={activePreviewUrl}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="text-primary hover:underline"
+                                    >
+                                      Open preview in new tab
+                                    </a>
+                                  </div>
+                                )
+                              ) : (
+                                <div className="h-full min-h-[22rem] flex items-center justify-center text-sm text-muted-foreground">
+                                  Select a file to preview.
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
-              )}
-            </div>
-          )}
-        </div>
-      </DialogContent>
-    </Dialog>
+              </>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <ItemFormDialog
+        open={newItemTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setNewItemTarget(null)
+          }
+        }}
+        defaults={(() => {
+          if (!newItemTarget) return undefined
+          const targetDraft = bulkImportDrafts.find((entry) => entry.id === newItemTarget.draftId)
+          if (!targetDraft) return undefined
+
+          if (newItemTarget.kind === "parsed") {
+            const line = targetDraft.parsedReceipt?.line_items[newItemTarget.index]
+            if (!line) return undefined
+            return {
+              name: resolveImportedDescription(targetDraft, newItemTarget.index, line.description),
+            }
+          }
+
+          const line = targetDraft.manualLines.find(
+            (entry) => entry.id === newItemTarget.lineId
+          )
+          if (!line) return undefined
+          return { name: line.description }
+        })()}
+        onCreated={(newItemId) => {
+          if (!newItemTarget) return
+
+          if (newItemTarget.kind === "parsed") {
+            updateDraft(newItemTarget.draftId, (entry) => ({
+              ...entry,
+              lineItemOverrides: {
+                ...entry.lineItemOverrides,
+                [newItemTarget.index]: newItemId,
+              },
+            }))
+          } else {
+            updateManualImportLine(newItemTarget.draftId, newItemTarget.lineId, {
+              itemId: newItemId,
+            })
+          }
+
+          setNewItemTarget(null)
+        }}
+      />
+
+      <ConfirmCloseDialog
+        open={confirmCloseOpen}
+        onOpenChange={setConfirmCloseOpen}
+        onConfirm={closeDialogNow}
+      />
+    </>
   )
 }

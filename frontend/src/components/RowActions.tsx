@@ -4,9 +4,11 @@ import { Pencil, Trash2 } from "lucide-react"
 interface RowActionsProps {
   onEdit?: () => void
   onDelete?: () => void
+  deleteDisabled?: boolean
+  deleteTitle?: string
 }
 
-export function RowActions({ onEdit, onDelete }: RowActionsProps) {
+export function RowActions({ onEdit, onDelete, deleteDisabled = false, deleteTitle }: RowActionsProps) {
   return (
     <div className="flex gap-1">
       {onEdit && (
@@ -20,6 +22,8 @@ export function RowActions({ onEdit, onDelete }: RowActionsProps) {
           variant="ghost"
           className="text-red-600"
           onClick={onDelete}
+          disabled={deleteDisabled}
+          title={deleteTitle}
         >
           <Trash2 className="h-4 w-4" />
         </Button>
