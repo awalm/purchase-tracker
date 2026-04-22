@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react"
+import React, { useEffect, useState, useRef } from "react"
 import { useNavigate, useSearchParams } from "react-router-dom"
 import { useQueryClient } from "@tanstack/react-query"
 import { useInvoices, useCreateInvoice, useUpdateInvoice, useDeleteInvoice, useDestinations, useItems } from "@/hooks/useApi"
@@ -8,6 +8,7 @@ import {
   importApi,
   invoices as invoicesApi,
   type InvoicePdfCommitErrorResponse,
+  type InvoicePdfFieldError,
   type InvoicePdfLineFailure,
   type ParsedInvoice,
   type ReceiptOcrMode,
@@ -21,6 +22,7 @@ import { BulkReceiptImportDialog } from "@/components/BulkReceiptImportDialog"
 import { consumePendingBulkReceiptFiles } from "@/lib/bulkReceiptImportTransfer"
 import { ItemFormDialog } from "@/components/ItemFormDialog"
 import { ExportCsvButton } from "@/components/ExportCsvButton"
+import { ConfirmCloseDialog } from "@/components/ConfirmCloseDialog"
 import { RowActions } from "@/components/RowActions"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
 import {
@@ -45,7 +47,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Plus, Trash2, CheckCircle2, AlertCircle, Clock, Upload, FileText, FileDown, Loader2 } from "lucide-react"
+import { Plus, Trash2, CheckCircle2, AlertCircle, Clock, Upload, FileText, FileDown, Loader2, Scissors, X } from "lucide-react"
 import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
 
 interface Invoice {
@@ -56,6 +58,7 @@ interface Invoice {
   invoice_number: string
   order_number: string | null
   invoice_date: string
+  delivery_date: string | null
   subtotal: string
   tax_rate: string
   total: string
@@ -159,6 +162,7 @@ export default function InvoicesPage() {
   const [invoiceNumber, setInvoiceNumber] = useState("")
   const [orderNumber, setOrderNumber] = useState("")
   const [invoiceDate, setInvoiceDate] = useState(new Date().toISOString().split("T")[0])
+  const [deliveryDate, setDeliveryDate] = useState(new Date().toISOString().split("T")[0])
   const [subtotal, setSubtotal] = useState("")
   const [notes, setNotes] = useState("")
 
@@ -173,11 +177,17 @@ export default function InvoicesPage() {
   const [parsedInvoice, setParsedInvoice] = useState<ParsedInvoice | null>(null)
   const [pdfDestinationId, setPdfDestinationId] = useState("")
   const [pdfError, setPdfError] = useState("")
+  const [pdfFieldErrors, setPdfFieldErrors] = useState<InvoicePdfFieldError[]>([])
   const [pdfLineFailures, setPdfLineFailures] = useState<InvoicePdfLineFailure[]>([])
   // Per-line-item overrides: index → item_id (for unmatched items the user manually maps)
   const [lineItemOverrides, setLineItemOverrides] = useState<Record<number, string>>({})
   // "Create New Item" dialog state: which line item index is being created
   const [newItemForLineIdx, setNewItemForLineIdx] = useState<number | null>(null)
+  const [lineSplits, setLineSplits] = useState<Record<number, { item_id: string; qty: number; purchase_type: string }[]>>({})
+  const [linePurchaseTypes, setLinePurchaseTypes] = useState<Record<number, string>>({})
+  const [pdfInvoiceNumber, setPdfInvoiceNumber] = useState("")
+  const [pdfInvoiceDate, setPdfInvoiceDate] = useState("")
+  const [confirmPdfCloseOpen, setConfirmPdfCloseOpen] = useState(false)
 
   const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -185,13 +195,18 @@ export default function InvoicesPage() {
     setPdfFile(file)
     setPdfParsing(true)
     setPdfError("")
+    setPdfFieldErrors([])
     setPdfLineFailures([])
     setParsedInvoice(null)
     setLineItemOverrides({})
     setNewItemForLineIdx(null)
+    setLineSplits({})
+    setLinePurchaseTypes({})
     try {
       const result = await importApi.invoicePdf(file)
       setParsedInvoice(result)
+      setPdfInvoiceNumber(result.invoice_number || "")
+      setPdfInvoiceDate(result.invoice_date || "")
       // Default destination to BSC if available
       const bsc = destinations.find(d => d.code.toUpperCase() === "BSC")
       if (bsc) setPdfDestinationId(bsc.id)
@@ -209,6 +224,21 @@ export default function InvoicesPage() {
     return activeItems.find(ai => ai.name.toLowerCase() === li.description.toLowerCase()) ?? null
   }
 
+  // Check if a split line is fully resolved
+  const isSplitResolved = (li: ParsedInvoice["line_items"][0], idx: number): boolean => {
+    const splits = lineSplits[idx]
+    if (!splits || splits.length === 0) return false
+    const allHaveItems = splits.every(s => s.item_id && activeItems.some(ai => ai.id === s.item_id))
+    const qtySum = splits.reduce((sum, s) => sum + s.qty, 0)
+    return allHaveItems && qtySum === li.qty
+  }
+
+  // A line is resolved if it has a valid single-item mapping OR valid splits
+  const isLineResolved = (li: ParsedInvoice["line_items"][0], idx: number): boolean => {
+    if (lineSplits[idx]) return isSplitResolved(li, idx)
+    return resolveItem(li, idx) !== null
+  }
+
   // Compute select value for a line item dropdown
   const getLineItemSelectValue = (li: ParsedInvoice["line_items"][0], idx: number): string => {
     const overrideId = lineItemOverrides[idx]
@@ -218,7 +248,7 @@ export default function InvoicesPage() {
   }
 
   const unresolvedLineCount = parsedInvoice
-    ? parsedInvoice.line_items.filter((li, idx) => resolveItem(li, idx) === null).length
+    ? parsedInvoice.line_items.filter((li, idx) => !isLineResolved(li, idx)).length
     : 0
 
   const lineFailureByIndex = pdfLineFailures.reduce<Record<number, InvoicePdfLineFailure[]>>((acc, failure) => {
@@ -327,14 +357,29 @@ export default function InvoicesPage() {
     if (!parsedInvoice || !pdfDestinationId || !pdfFile) return
     setPdfCreating(true)
     setPdfError("")
+    setPdfFieldErrors([])
     setPdfLineFailures([])
     setPdfCreateStatus("Committing atomic import...")
 
     try {
-      const invoiceDate = parsedInvoice.invoice_date || ""
-      const invoiceNumber = parsedInvoice.invoice_number || ""
+      const invoiceDate = pdfInvoiceDate
+      const invoiceNumber = pdfInvoiceNumber
       const invoiceSubtotal = parsedInvoice.subtotal || ""
       const lineItems = parsedInvoice.line_items.map((li, idx) => {
+        const splits = lineSplits[idx]
+        const lineType = linePurchaseTypes[idx] || "unit"
+        if (splits && splits.length > 0) {
+          return {
+            line_index: idx,
+            description: li.description,
+            qty: li.qty,
+            invoice_unit_price: li.invoice_unit_price,
+            subtotal: li.subtotal,
+            item_id: null,
+            splits: splits.map(s => ({ item_id: s.item_id, qty: s.qty, purchase_type: s.purchase_type || lineType })),
+            purchase_type: lineType,
+          }
+        }
         const item = resolveItem(li, idx)
         return {
           line_index: idx,
@@ -343,6 +388,7 @@ export default function InvoicesPage() {
           invoice_unit_price: li.invoice_unit_price,
           subtotal: li.subtotal,
           item_id: item?.id ?? null,
+          purchase_type: lineType,
         }
       })
 
@@ -367,14 +413,20 @@ export default function InvoicesPage() {
       setParsedInvoice(null)
       setPdfDestinationId("")
       setPdfError("")
+      setPdfFieldErrors([])
       setPdfLineFailures([])
       setPdfFile(null)
       setLineItemOverrides({})
       setNewItemForLineIdx(null)
+      setLineSplits({})
+      setLinePurchaseTypes({})
+      setPdfInvoiceNumber("")
+      setPdfInvoiceDate("")
     } catch (err) {
       if (err instanceof ApiValidationError) {
         const details = err.details as InvoicePdfCommitErrorResponse
         setPdfError(err.message)
+        setPdfFieldErrors(details.invoice_level_errors || [])
         setPdfLineFailures(details.line_failures || [])
       } else {
         setPdfError(err instanceof Error ? err.message : "Failed to create invoice")
@@ -393,6 +445,7 @@ export default function InvoicesPage() {
         invoice_number: invoiceNumber,
         order_number: orderNumber || null,
         invoice_date: invoiceDate,
+        delivery_date: deliveryDate,
         subtotal,
         notes: notes || null,
       })
@@ -402,6 +455,7 @@ export default function InvoicesPage() {
         invoice_number: invoiceNumber,
         order_number: orderNumber || undefined,
         invoice_date: invoiceDate,
+        delivery_date: deliveryDate,
         subtotal,
         notes: notes || undefined,
       })
@@ -416,6 +470,7 @@ export default function InvoicesPage() {
     setInvoiceNumber("")
     setOrderNumber("")
     setInvoiceDate(new Date().toISOString().split("T")[0])
+    setDeliveryDate(new Date().toISOString().split("T")[0])
     setSubtotal("")
     setNotes("")
   }
@@ -426,6 +481,7 @@ export default function InvoicesPage() {
     setInvoiceNumber(invoice.invoice_number)
     setOrderNumber(invoice.order_number || "")
     setInvoiceDate(invoice.invoice_date)
+    setDeliveryDate(invoice.delivery_date || invoice.invoice_date)
     setSubtotal(invoice.subtotal)
     setNotes(invoice.notes || "")
     setIsOpen(true)
@@ -617,18 +673,48 @@ export default function InvoicesPage() {
             </Button>
           )}
           <Dialog open={pdfDialogOpen} onOpenChange={(open) => {
+            if (!open && parsedInvoice) {
+              setConfirmPdfCloseOpen(true)
+              return
+            }
             setPdfDialogOpen(open)
             if (!open) {
               setParsedInvoice(null)
               setPdfDestinationId("")
               setPdfError("")
+              setPdfFieldErrors([])
               setPdfLineFailures([])
               setPdfFile(null)
               setLineItemOverrides({})
               setNewItemForLineIdx(null)
+              setLineSplits({})
+              setLinePurchaseTypes({})
+              setPdfInvoiceNumber("")
+              setPdfInvoiceDate("")
               if (fileInputRef.current) fileInputRef.current.value = ""
             }
           }}>
+          <ConfirmCloseDialog
+            open={confirmPdfCloseOpen}
+            onOpenChange={setConfirmPdfCloseOpen}
+            onConfirm={() => {
+              setConfirmPdfCloseOpen(false)
+              setPdfDialogOpen(false)
+              setParsedInvoice(null)
+              setPdfDestinationId("")
+              setPdfError("")
+              setPdfFieldErrors([])
+              setPdfLineFailures([])
+              setPdfFile(null)
+              setLineItemOverrides({})
+              setNewItemForLineIdx(null)
+              setLineSplits({})
+              setLinePurchaseTypes({})
+              setPdfInvoiceNumber("")
+              setPdfInvoiceDate("")
+              if (fileInputRef.current) fileInputRef.current.value = ""
+            }}
+          />
             <DialogTrigger asChild>
               <Button variant="outline">
                 <Upload className="h-4 w-4 mr-2" />
@@ -669,8 +755,15 @@ export default function InvoicesPage() {
                 )}
 
                 {pdfError && (
-                  <div className="text-sm text-red-600 bg-red-50 p-3 rounded">
-                    {pdfError}
+                  <div className="text-sm text-red-600 bg-red-50 p-3 rounded space-y-1">
+                    <div>{pdfError}</div>
+                    {pdfFieldErrors.length > 0 && (
+                      <ul className="text-xs list-disc pl-4">
+                        {pdfFieldErrors.map((e, idx) => (
+                          <li key={idx}><span className="font-medium">{e.field}:</span> {e.message}</li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
                 )}
 
@@ -686,13 +779,23 @@ export default function InvoicesPage() {
                 {parsedInvoice && (
                   <div className="space-y-4">
                     <div className="bg-muted p-3 rounded-md space-y-2 text-sm">
-                      <div className="flex justify-between">
+                      <div className="flex justify-between items-center">
                         <span className="text-muted-foreground">Invoice #</span>
-                        <span className="font-mono font-medium">{parsedInvoice.invoice_number || "—"}</span>
+                        <Input
+                          className="w-40 h-7 text-sm font-mono font-medium text-right"
+                          value={pdfInvoiceNumber}
+                          onChange={(e) => setPdfInvoiceNumber(e.target.value)}
+                          placeholder="Enter invoice number"
+                        />
                       </div>
-                      <div className="flex justify-between">
+                      <div className="flex justify-between items-center">
                         <span className="text-muted-foreground">Date</span>
-                        <span>{parsedInvoice.invoice_date || "—"}</span>
+                        <Input
+                          type="date"
+                          className="w-40 h-7 text-sm text-right"
+                          value={pdfInvoiceDate}
+                          onChange={(e) => setPdfInvoiceDate(e.target.value)}
+                        />
                       </div>
                       {parsedInvoice.bill_to && (
                         <div className="flex justify-between">
@@ -719,7 +822,7 @@ export default function InvoicesPage() {
                     {parsedInvoice.line_items.length > 0 && (
                       <div>
                         <Label className="text-xs text-muted-foreground mb-1 block">
-                          Line Items ({parsedInvoice.line_items.filter((li, idx) => resolveItem(li, idx) !== null).length}/{parsedInvoice.line_items.length} matched)
+                          Line Items ({parsedInvoice.line_items.filter((li, idx) => isLineResolved(li, idx)).length}/{parsedInvoice.line_items.length} matched)
                         </Label>
                         <div className="border rounded-md overflow-hidden">
                           <Table>
@@ -737,60 +840,127 @@ export default function InvoicesPage() {
                                 const resolved = resolveItem(item, i)
                                 const selectValue = getLineItemSelectValue(item, i)
                                 const lineFailures = lineFailureByIndex[i] || []
+                                const splits = lineSplits[i]
+                                const inSplitMode = !!splits
+                                const lineResolved = isLineResolved(item, i)
                                 return (
-                                <TableRow key={i} className={lineFailures.length > 0 ? "bg-red-50" : (resolved ? "" : "bg-amber-50")}>
+                                <React.Fragment key={i}>
+                                <TableRow className={lineFailures.length > 0 ? "bg-red-50" : (lineResolved ? "" : "bg-amber-50")}>
                                   <TableCell className="text-xs px-1">
                                     {lineFailures.length > 0
                                       ? <AlertCircle className="h-3 w-3 text-red-600" />
-                                      : (resolved ? <CheckCircle2 className="h-3 w-3 text-green-600" /> : <AlertCircle className="h-3 w-3 text-amber-500" />)}
+                                      : (lineResolved ? <CheckCircle2 className="h-3 w-3 text-green-600" /> : <AlertCircle className="h-3 w-3 text-amber-500" />)}
                                   </TableCell>
                                   <TableCell className="text-xs">
                                     <div className="space-y-1">
-                                      <span>{item.description}</span>
+                                      <div className="flex items-center gap-1">
+                                        <span>{item.description}</span>
+                                        {!inSplitMode ? (
+                                          <button
+                                            type="button"
+                                            className="text-[10px] text-blue-600 hover:text-blue-800 hover:underline ml-1 whitespace-nowrap"
+                                            onClick={() => {
+                                              setLineSplits(prev => ({
+                                                ...prev,
+                                                [i]: [{ item_id: "", qty: item.qty, purchase_type: "unit" }],
+                                              }))
+                                              // Clear single-item override when entering split mode
+                                              setLineItemOverrides(prev => {
+                                                const next = { ...prev }
+                                                delete next[i]
+                                                return next
+                                              })
+                                            }}
+                                          >
+                                            <Scissors className="h-3 w-3 inline mr-0.5" />Split
+                                          </button>
+                                        ) : (
+                                          <button
+                                            type="button"
+                                            className="text-[10px] text-red-500 hover:text-red-700 hover:underline ml-1 whitespace-nowrap"
+                                            onClick={() => {
+                                              setLineSplits(prev => {
+                                                const next = { ...prev }
+                                                delete next[i]
+                                                return next
+                                              })
+                                            }}
+                                          >
+                                            <X className="h-3 w-3 inline mr-0.5" />Unsplit
+                                          </button>
+                                        )}
+                                      </div>
                                       {lineFailures.length > 0 && (
                                         <div className="text-[10px] text-red-600 font-medium">
                                           {lineFailures.map((f) => f.message).join(" • ")}
                                         </div>
                                       )}
-                                      {resolved && (
-                                        <div className="text-[10px] text-green-600 font-medium">→ {resolved.name}</div>
+                                      {!inSplitMode && (
+                                        <>
+                                          {resolved && (
+                                            <div className="text-[10px] text-green-600 font-medium">→ {resolved.name}</div>
+                                          )}
+                                          <Select
+                                            value={selectValue}
+                                            onValueChange={(v) => {
+                                              if (v === "__create__") {
+                                                setNewItemForLineIdx(i)
+                                                return
+                                              }
+                                              setLineItemOverrides(prev => {
+                                                const next = { ...prev }
+                                                if (v === "__none__") {
+                                                  delete next[i]
+                                                } else {
+                                                  const autoMatch = activeItems.find(ai => ai.name.toLowerCase() === item.description.toLowerCase())
+                                                  if (autoMatch && autoMatch.id === v) delete next[i]
+                                                  else next[i] = v
+                                                }
+                                                return next
+                                              })
+                                            }}
+                                          >
+                                            <SelectTrigger className="h-6 text-[11px]">
+                                              <SelectValue placeholder="Map to item…" />
+                                            </SelectTrigger>
+                                            <SelectContent>
+                                              <SelectItem value="__none__">
+                                                <span className="text-amber-600">— Unmapped (will fail)</span>
+                                              </SelectItem>
+                                              <SelectItem value="__create__">
+                                                <span className="text-blue-600">+ Create New Item</span>
+                                              </SelectItem>
+                                              {activeItems.map(ai => (
+                                                <SelectItem key={ai.id} value={ai.id}>
+                                                  {ai.name}
+                                                </SelectItem>
+                                              ))}
+                                            </SelectContent>
+                                          </Select>
+                                        </>
+                                      )}
+                                      {inSplitMode && (
+                                        <div className="text-[10px] text-blue-600 font-medium">
+                                          Split into {splits.length} item{splits.length > 1 ? "s" : ""}
+                                          {(() => {
+                                            const qtySum = splits.reduce((s, sp) => s + sp.qty, 0)
+                                            return qtySum !== item.qty
+                                              ? <span className="text-red-500 ml-1">(qty {qtySum}/{item.qty})</span>
+                                              : <span className="text-green-600 ml-1">(qty {qtySum}/{item.qty} ✓)</span>
+                                          })()}
+                                        </div>
                                       )}
                                       <Select
-                                        value={selectValue}
-                                        onValueChange={(v) => {
-                                          if (v === "__create__") {
-                                            setNewItemForLineIdx(i)
-                                            return
-                                          }
-                                          setLineItemOverrides(prev => {
-                                            const next = { ...prev }
-                                            if (v === "__none__") {
-                                              delete next[i]
-                                            } else {
-                                              // If choosing the auto-match item, remove override (let auto-match work)
-                                              const autoMatch = activeItems.find(ai => ai.name.toLowerCase() === item.description.toLowerCase())
-                                              if (autoMatch && autoMatch.id === v) delete next[i]
-                                              else next[i] = v
-                                            }
-                                            return next
-                                          })
-                                        }}
+                                        value={linePurchaseTypes[i] || "unit"}
+                                        onValueChange={(v) => setLinePurchaseTypes(prev => ({ ...prev, [i]: v }))}
                                       >
-                                        <SelectTrigger className="h-6 text-[11px]">
-                                          <SelectValue placeholder="Map to item…" />
+                                        <SelectTrigger className="h-5 text-[10px] w-24">
+                                          <SelectValue />
                                         </SelectTrigger>
                                         <SelectContent>
-                                          <SelectItem value="__none__">
-                                            <span className="text-amber-600">— Unmapped (will fail)</span>
-                                          </SelectItem>
-                                          <SelectItem value="__create__">
-                                            <span className="text-blue-600">+ Create New Item</span>
-                                          </SelectItem>
-                                          {activeItems.map(ai => (
-                                            <SelectItem key={ai.id} value={ai.id}>
-                                              {ai.name}
-                                            </SelectItem>
-                                          ))}
+                                          <SelectItem value="unit">Unit</SelectItem>
+                                          <SelectItem value="bonus">Bonus</SelectItem>
+                                          <SelectItem value="refund">Refund</SelectItem>
                                         </SelectContent>
                                       </Select>
                                     </div>
@@ -799,6 +969,105 @@ export default function InvoicesPage() {
                                   <TableCell className="text-xs text-right">{formatCurrency(item.invoice_unit_price)}</TableCell>
                                   <TableCell className="text-xs text-right">{formatCurrency(item.subtotal)}</TableCell>
                                 </TableRow>
+                                {inSplitMode && splits.map((split, si) => (
+                                  <TableRow key={`${i}-split-${si}`} className="bg-blue-50/50">
+                                    <TableCell className="text-xs px-1"></TableCell>
+                                    <TableCell className="text-xs pl-6">
+                                      <div className="flex items-center gap-1">
+                                        <span className="text-[10px] text-muted-foreground">↳</span>
+                                        <Select
+                                          value={split.item_id || "__none__"}
+                                          onValueChange={(v) => {
+                                            setLineSplits(prev => {
+                                              const next = { ...prev }
+                                              const arr = [...(next[i] || [])]
+                                              arr[si] = { ...arr[si], item_id: v === "__none__" ? "" : v }
+                                              next[i] = arr
+                                              return next
+                                            })
+                                          }}
+                                        >
+                                          <SelectTrigger className="h-6 text-[11px] flex-1">
+                                            <SelectValue placeholder="Map to item…" />
+                                          </SelectTrigger>
+                                          <SelectContent>
+                                            <SelectItem value="__none__">
+                                              <span className="text-amber-600">— Select item</span>
+                                            </SelectItem>
+                                            {activeItems.map(ai => (
+                                              <SelectItem key={ai.id} value={ai.id}>
+                                                {ai.name}
+                                              </SelectItem>
+                                            ))}
+                                          </SelectContent>
+                                        </Select>
+                                        {splits.length > 1 && (
+                                          <button
+                                            type="button"
+                                            className="text-red-400 hover:text-red-600"
+                                            onClick={() => {
+                                              setLineSplits(prev => {
+                                                const next = { ...prev }
+                                                const arr = [...(next[i] || [])]
+                                                arr.splice(si, 1)
+                                                next[i] = arr
+                                                return next
+                                              })
+                                            }}
+                                          >
+                                            <X className="h-3 w-3" />
+                                          </button>
+                                        )}
+                                      </div>
+                                    </TableCell>
+                                    <TableCell className="text-xs text-right">
+                                      <Input
+                                        type="number"
+                                        className="h-6 w-14 text-[11px] text-right p-1"
+                                        value={split.qty}
+                                        onChange={(e) => {
+                                          const val = parseInt(e.target.value) || 0
+                                          setLineSplits(prev => {
+                                            const next = { ...prev }
+                                            const arr = [...(next[i] || [])]
+                                            arr[si] = { ...arr[si], qty: val }
+                                            next[i] = arr
+                                            return next
+                                          })
+                                        }}
+                                      />
+                                    </TableCell>
+                                    <TableCell className="text-xs text-right text-muted-foreground">
+                                      {formatCurrency(item.invoice_unit_price)}
+                                    </TableCell>
+                                    <TableCell className="text-xs text-right text-muted-foreground">
+                                      {formatCurrency(String(parseFloat(item.invoice_unit_price) * split.qty))}
+                                    </TableCell>
+                                  </TableRow>
+                                ))}
+                                {inSplitMode && (
+                                  <TableRow className="bg-blue-50/50">
+                                    <TableCell className="text-xs px-1"></TableCell>
+                                    <TableCell colSpan={4} className="text-xs pl-6">
+                                      <button
+                                        type="button"
+                                        className="text-[10px] text-blue-600 hover:text-blue-800 hover:underline"
+                                        onClick={() => {
+                                          setLineSplits(prev => {
+                                            const next = { ...prev }
+                                            const arr = [...(next[i] || [])]
+                                            arr.push({ item_id: "", qty: 0, purchase_type: "unit" })
+                                            next[i] = arr
+                                            return next
+                                          })
+                                        }}
+                                      >
+                                        <Plus className="h-3 w-3 inline mr-0.5" />Add split row
+                                      </button>
+                                    </TableCell>
+                                  </TableRow>
+                                )}
+                                </React.Fragment>
                                 )
                               })}
                             </TableBody>
@@ -832,9 +1101,8 @@ export default function InvoicesPage() {
                       )}
                       {/* Summary of what will be created */}
                       {parsedInvoice.line_items.length > 0 && pdfDestinationId && (() => {
-                        const resolved = parsedInvoice.line_items.map((li, idx) => ({ li, item: resolveItem(li, idx), idx }))
-                        const matched = resolved.filter(r => r.item !== null).length
-                        const unresolved = resolved.filter(r => r.item === null).length
+                        const matched = parsedInvoice.line_items.filter((li, idx) => isLineResolved(li, idx)).length
+                        const unresolved = parsedInvoice.line_items.length - matched
                         return (
                           <div className={`text-xs px-3 py-2 rounded-md ${unresolved > 0 ? "text-amber-700 bg-amber-50" : "text-muted-foreground bg-muted"}`}>
                             {unresolved > 0
@@ -942,10 +1210,23 @@ export default function InvoicesPage() {
                     <DateInput
                       id="invoiceDate"
                       value={invoiceDate}
-                      onChange={setInvoiceDate}
+                      onChange={(v) => {
+                        setInvoiceDate(v)
+                        if (deliveryDate <= invoiceDate) setDeliveryDate(v)
+                      }}
                       required
                     />
                   </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="deliveryDate">Delivery Date</Label>
+                    <DateInput
+                      id="deliveryDate"
+                      value={deliveryDate}
+                      onChange={setDeliveryDate}
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label htmlFor="subtotal">Subtotal (pre-tax) *</Label>
                     <Input

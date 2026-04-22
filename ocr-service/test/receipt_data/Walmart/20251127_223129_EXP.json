@@ -1,0 +1,29 @@
+{
+  "source_file": "20251127_223129.jpg",
+  "content_type": "image/jpeg",
+  "expected": {
+    "vendor_name": "Walmart",
+    "receipt_number": "03740",
+    "receipt_date": "2025-11-27",
+    "subtotal": "1039.92",
+    "tax": "135.19",
+    "total": "1175.11",
+    "payment_method": "MASTERCARD (8653)",
+    "line_items_count": 1,
+    "line_items_expected": [
+      {
+        "description_contains": "p5 hw std fo",
+        "quantity": 2,
+        "unit_cost": "519.96",
+        "line_total": "1039.92"
+      }
+    ],
+    "raw_text_contains": [
+      "walmart",
+      "subtotal",
+      "hst",
+      "mastercard"
+    ],
+    "warnings_contains": []
+  }
+}

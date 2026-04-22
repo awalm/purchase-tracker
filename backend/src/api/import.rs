@@ -967,6 +967,9 @@ async fn import_purchases(
                     status,
                     delivery_date,
                     notes: row.notes.clone(),
+                    refunds_purchase_id: None,
+                    purchase_type: None,
+                    bonus_for_purchase_id: None,
                 };
 
                 match queries::create_purchase(&state.pool, create_purchase, user.user_id).await {
@@ -2371,37 +2374,7 @@ async fn commit_invoice_pdf(
     let mut resolved_lines: Vec<queries::AtomicInvoicePdfLine> = Vec::new();
 
     for li in &payload.line_items {
-        if li.item_id.is_none() {
-            line_failures.push(InvoiceImportLineFailure {
-                line_index: li.line_index,
-                code: "ITEM_UNRESOLVED".to_string(),
-                message: "No item mapping provided for line".to_string(),
-                description: Some(li.description.clone()),
-            });
-            continue;
-        }
-
-        let item_id = li.item_id.expect("checked is_some");
-        if !item_ids.contains(&item_id) {
-            line_failures.push(InvoiceImportLineFailure {
-                line_index: li.line_index,
-                code: "ITEM_NOT_FOUND".to_string(),
-                message: "Mapped item does not exist".to_string(),
-                description: Some(li.description.clone()),
-            });
-            continue;
-        }
-
-        if li.qty <= 0 {
-            line_failures.push(InvoiceImportLineFailure {
-                line_index: li.line_index,
-                code: "INVALID_QTY".to_string(),
-                message: format!("Quantity must be positive, got {}", li.qty),
-                description: Some(li.description.clone()),
-            });
-            continue;
-        }
-
+        // Parse invoice_unit_price early — needed for both paths
         let invoice_unit_price = match parse_decimal_input(&li.invoice_unit_price) {
             Ok(v) => v,
             Err(_) => {
@@ -2425,12 +2398,110 @@ async fn commit_invoice_pdf(
             continue;
         }
 
+        // ── Split mode: one parsed line → multiple purchases ──
+        if let Some(ref splits) = li.splits {
+            if splits.is_empty() {
+                line_failures.push(InvoiceImportLineFailure {
+                    line_index: li.line_index,
+                    code: "EMPTY_SPLITS".to_string(),
+                    message: "Splits array is empty".to_string(),
+                    description: Some(li.description.clone()),
+                });
+                continue;
+            }
+
+            let mut split_ok = true;
+            let mut split_qty_sum: i32 = 0;
+
+            for (si, split) in splits.iter().enumerate() {
+                if split.qty == 0 {
+                    line_failures.push(InvoiceImportLineFailure {
+                        line_index: li.line_index,
+                        code: "INVALID_SPLIT_QTY".to_string(),
+                        message: format!("Split #{} quantity must be non-zero", si + 1),
+                        description: Some(li.description.clone()),
+                    });
+                    split_ok = false;
+                }
+                if !item_ids.contains(&split.item_id) {
+                    line_failures.push(InvoiceImportLineFailure {
+                        line_index: li.line_index,
+                        code: "SPLIT_ITEM_NOT_FOUND".to_string(),
+                        message: format!("Split #{} item does not exist", si + 1),
+                        description: Some(li.description.clone()),
+                    });
+                    split_ok = false;
+                }
+                split_qty_sum += split.qty;
+            }
+
+            if split_qty_sum != li.qty {
+                line_failures.push(InvoiceImportLineFailure {
+                    line_index: li.line_index,
+                    code: "SPLIT_QTY_MISMATCH".to_string(),
+                    message: format!(
+                        "Split quantities sum to {} but line quantity is {}",
+                        split_qty_sum, li.qty
+                    ),
+                    description: Some(li.description.clone()),
+                });
+                split_ok = false;
+            }
+
+            if split_ok {
+                for split in splits {
+                    resolved_lines.push(queries::AtomicInvoicePdfLine {
+                        line_index: li.line_index,
+                        item_id: split.item_id,
+                        qty: split.qty,
+                        invoice_unit_price,
+                        description: li.description.clone(),
+                        purchase_type: split.purchase_type.clone().or_else(|| li.purchase_type.clone()),
+                    });
+                }
+            }
+            continue;
+        }
+
+        // ── Normal mode: one line → one purchase ──
+        if li.item_id.is_none() {
+            line_failures.push(InvoiceImportLineFailure {
+                line_index: li.line_index,
+                code: "ITEM_UNRESOLVED".to_string(),
+                message: "No item mapping provided for line".to_string(),
+                description: Some(li.description.clone()),
+            });
+            continue;
+        }
+
+        let item_id = li.item_id.expect("checked is_some");
+        if !item_ids.contains(&item_id) {
+            line_failures.push(InvoiceImportLineFailure {
+                line_index: li.line_index,
+                code: "ITEM_NOT_FOUND".to_string(),
+                message: "Mapped item does not exist".to_string(),
+                description: Some(li.description.clone()),
+            });
+            continue;
+        }
+
+        if li.qty == 0 {
+            line_failures.push(InvoiceImportLineFailure {
+                line_index: li.line_index,
+                code: "INVALID_QTY".to_string(),
+                message: format!("Quantity must be non-zero, got {}", li.qty),
+                description: Some(li.description.clone()),
+            });
+            continue;
+        }
+
         resolved_lines.push(queries::AtomicInvoicePdfLine {
             line_index: li.line_index,
             item_id,
             qty: li.qty,
             invoice_unit_price,
             description: li.description.clone(),
+            purchase_type: li.purchase_type.clone(),
         });
     }
 
@@ -2455,6 +2526,7 @@ async fn commit_invoice_pdf(
             destination_id: payload.destination_id,
             invoice_number: payload.invoice_number,
             invoice_date,
+            delivery_date: None,
             subtotal,
             tax_rate,
             notes: payload.notes,

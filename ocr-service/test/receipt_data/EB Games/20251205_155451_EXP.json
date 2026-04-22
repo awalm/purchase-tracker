@@ -1,0 +1,29 @@
+{
+  "source_file": "20251205_155451.jpg",
+  "content_type": "image/jpeg",
+  "expected": {
+    "vendor_name": "EB GAMES CANADA",
+    "receipt_number": null,
+    "receipt_date": "2025-12-05",
+    "subtotal": "519.99",
+    "tax": "519.99",
+    "total": "587.59",
+    "payment_method": null,
+    "line_items_count": 1,
+    "line_items_expected": [
+      {
+        "description_contains": "ps5 slim console",
+        "quantity": 1,
+        "unit_cost": "519.99",
+        "line_total": "519.99"
+      }
+    ],
+    "raw_text_contains": [
+      "eb games canada",
+      "ps5 slim console",
+      "subtotal",
+      "hst"
+    ],
+    "warnings_contains": []
+  }
+}

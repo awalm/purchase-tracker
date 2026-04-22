@@ -70,6 +70,7 @@ pub struct Invoice {
     pub invoice_number: String,
     pub order_number: Option<String>,
     pub invoice_date: NaiveDate,
+    pub delivery_date: Option<NaiveDate>,
     pub subtotal: Decimal,
     pub tax_rate: Decimal,
     pub total: Decimal,
@@ -141,6 +142,9 @@ pub struct Purchase {
     pub status: DeliveryStatus,
     pub delivery_date: Option<NaiveDate>,
     pub notes: Option<String>,
+    pub refunds_purchase_id: Option<Uuid>,
+    pub purchase_type: String,
+    pub bonus_for_purchase_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -246,6 +250,9 @@ pub struct PurchaseEconomics {
     pub invoice_number: Option<String>,
     pub allow_receipt_date_override: bool,
     pub notes: Option<String>,
+    pub refunds_purchase_id: Option<Uuid>,
+    pub purchase_type: Option<String>,
+    pub bonus_for_purchase_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -324,6 +331,7 @@ pub struct InvoiceWithDestination {
     pub invoice_number: String,
     pub order_number: Option<String>,
     pub invoice_date: NaiveDate,
+    pub delivery_date: Option<NaiveDate>,
     pub subtotal: Decimal,
     pub tax_rate: Decimal,
     pub total: Decimal,
@@ -389,6 +397,7 @@ pub struct CreateInvoice {
     pub invoice_number: String,
     pub order_number: Option<String>,
     pub invoice_date: NaiveDate,
+    pub delivery_date: Option<NaiveDate>,
     pub subtotal: Decimal,
     pub tax_rate: Option<Decimal>, // defaults to 13.00 if not provided
     pub reconciliation_state: Option<String>,
@@ -400,10 +409,18 @@ pub struct UpdateInvoice {
     pub invoice_number: Option<String>,
     pub order_number: Option<String>,
     pub invoice_date: Option<NaiveDate>,
+    pub delivery_date: Option<NaiveDate>,
     pub subtotal: Option<Decimal>,
     pub tax_rate: Option<Decimal>,
     pub reconciliation_state: Option<String>,
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateInvoiceFromPdfLineItemSplit {
+    pub item_id: Uuid,
+    pub qty: i32,
+    pub purchase_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,6 +431,9 @@ pub struct CreateInvoiceFromPdfLineItem {
     pub invoice_unit_price: String,
     pub subtotal: String,
     pub item_id: Option<Uuid>,
+    #[serde(default)]
+    pub splits: Option<Vec<CreateInvoiceFromPdfLineItemSplit>>,
+    pub purchase_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,6 +525,9 @@ pub struct CreatePurchase {
     pub status: Option<DeliveryStatus>,
     pub delivery_date: Option<NaiveDate>,
     pub notes: Option<String>,
+    pub refunds_purchase_id: Option<Uuid>,
+    pub purchase_type: Option<String>,
+    pub bonus_for_purchase_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,6 +548,13 @@ pub struct UpdatePurchase {
     pub status: Option<DeliveryStatus>,
     pub delivery_date: Option<NaiveDate>,
     pub notes: Option<String>,
+    pub refunds_purchase_id: Option<Uuid>,
+    #[serde(default)]
+    pub clear_refunds_purchase: bool, // true → set refunds_purchase_id to NULL
+    pub purchase_type: Option<String>,
+    pub bonus_for_purchase_id: Option<Uuid>,
+    #[serde(default)]
+    pub clear_bonus_for_purchase: bool, // true → set bonus_for_purchase_id to NULL
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -742,6 +772,7 @@ mod tests {
                 invoice_number: "INV-RT".to_string(),
                 order_number: Some("ORD-RT".to_string()),
                 invoice_date: NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+                delivery_date: None,
                 subtotal: dec!(999.99),
                 tax_rate: None,
                 reconciliation_state: None,
@@ -792,6 +823,7 @@ mod tests {
                 invoice_number: "INV-100".to_string(),
                 order_number: Some("ORD-50".to_string()),
                 invoice_date: NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+                delivery_date: Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()),
                 subtotal: dec!(4424.78),
                 tax_rate: dec!(13.00),
                 total: dec!(5000.00),
@@ -1032,6 +1064,9 @@ mod tests {
                     status: DeliveryStatus::Pending,
                     delivery_date: None,
                     notes: None,
+                    refunds_purchase_id: None,
+                    purchase_type: "unit".to_string(),
+                    bonus_for_purchase_id: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 },
@@ -1047,6 +1082,9 @@ mod tests {
                     status: DeliveryStatus::Pending,
                     delivery_date: None,
                     notes: Some("Refund - 1 unit returned".to_string()),
+                    refunds_purchase_id: None,
+                    purchase_type: "refund".to_string(),
+                    bonus_for_purchase_id: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 },
@@ -1143,6 +1181,9 @@ mod tests {
                 invoice_number: None,
                 allow_receipt_date_override: false,
                 notes: None,
+                refunds_purchase_id: None,
+                purchase_type: None,
+                bonus_for_purchase_id: None,
             };
 
             assert_eq!(econ.quantity, -1);
@@ -1178,6 +1219,9 @@ mod tests {
                 invoice_number: None,
                 allow_receipt_date_override: false,
                 notes: None,
+                refunds_purchase_id: None,
+                purchase_type: None,
+                bonus_for_purchase_id: None,
             };
 
             let refund = PurchaseEconomics {
@@ -1204,6 +1248,9 @@ mod tests {
                 invoice_number: None,
                 allow_receipt_date_override: false,
                 notes: None,
+                refunds_purchase_id: None,
+                purchase_type: None,
+                bonus_for_purchase_id: None,
             };
 
             let items = vec![sale, refund];
@@ -1489,6 +1536,9 @@ mod tests {
                 invoice_number: None,
                 allow_receipt_date_override: false,
                 notes: None,
+                refunds_purchase_id: None,
+                purchase_type: None,
+                bonus_for_purchase_id: None,
             }
         }
 
@@ -1519,6 +1569,9 @@ mod tests {
                 invoice_number: None,
                 allow_receipt_date_override: false,
                 notes: None,
+                refunds_purchase_id: None,
+                purchase_type: None,
+                bonus_for_purchase_id: None,
             }
         }
 
@@ -1624,6 +1677,195 @@ mod tests {
                 parsed["vendor_name"].is_null(),
                 "vendor_name should serialize as null when no receipt linked"
             );
+        }
+
+        /// Expose helper for cross-module comparison tests.
+        pub fn tests_make_zero_cost(qty: i32, invoice_unit_price: Decimal) -> PurchaseEconomics {
+            make_zero_cost_economics(qty, invoice_unit_price)
+        }
+    }
+
+    mod bonus_economics_tests {
+        use super::*;
+
+        /// Helper: builds a PurchaseEconomics matching the DB logic for bonus
+        /// purchases (purchase_type = 'bonus', purchase_cost = 0).
+        /// Bonuses must always be attributed to a parent purchase; their
+        /// commission is credited to the parent (this row shows $0).
+        fn make_bonus_economics(qty: i32, invoice_unit_price: Decimal) -> PurchaseEconomics {
+            PurchaseEconomics {
+                purchase_id: Uuid::new_v4(),
+                purchase_date: Utc::now(),
+                item_id: Uuid::new_v4(),
+                item_name: "Widget".to_string(),
+                vendor_name: Some("Amazon".to_string()),
+                destination_code: Some("BSC".to_string()),
+                quantity: qty,
+                purchase_cost: dec!(0),
+                // Bonus: total_cost = 0 (cost is genuinely zero)
+                total_cost: Some(dec!(0)),
+                invoice_unit_price: Some(invoice_unit_price),
+                total_selling: Some(Decimal::from(qty) * invoice_unit_price),
+                // Attributed bonus: commission credited to parent, this row shows 0
+                unit_commission: Some(dec!(0)),
+                total_commission: Some(dec!(0)),
+                // Bonus: tax_paid = 0 (no purchase cost)
+                tax_paid: Some(dec!(0)),
+                // Attributed bonus: tax_owed = 0 (credited to parent)
+                tax_owed: Some(dec!(0)),
+                status: DeliveryStatus::Pending,
+                delivery_date: None,
+                invoice_id: None,
+                receipt_id: None,
+                receipt_number: None,
+                invoice_number: None,
+                allow_receipt_date_override: false,
+                notes: None,
+                refunds_purchase_id: None,
+                purchase_type: Some("bonus".to_string()),
+                bonus_for_purchase_id: Some(Uuid::new_v4()),
+            }
+        }
+
+        #[test]
+        fn bonus_total_cost_is_zero() {
+            let econ = make_bonus_economics(3, dec!(25.00));
+            assert_eq!(econ.purchase_cost, dec!(0));
+            assert_eq!(
+                econ.total_cost,
+                Some(dec!(0)),
+                "Bonus total_cost must be 0 (cost is genuinely zero)"
+            );
+        }
+
+        #[test]
+        fn bonus_commission_is_zero_credited_to_parent() {
+            let econ = make_bonus_economics(3, dec!(25.00));
+            assert_eq!(
+                econ.unit_commission,
+                Some(dec!(0)),
+                "Bonus unit_commission = 0 (credited to parent)"
+            );
+            assert_eq!(
+                econ.total_commission,
+                Some(dec!(0)),
+                "Bonus total_commission = 0 (credited to parent)"
+            );
+        }
+
+        #[test]
+        fn bonus_tax_paid_is_zero() {
+            let econ = make_bonus_economics(2, dec!(50.00));
+            assert_eq!(
+                econ.tax_paid,
+                Some(dec!(0)),
+                "Bonus tax_paid must be 0 (no purchase cost)"
+            );
+        }
+
+        #[test]
+        fn bonus_tax_owed_is_zero() {
+            let econ = make_bonus_economics(2, dec!(50.00));
+            assert_eq!(
+                econ.tax_owed,
+                Some(dec!(0)),
+                "Bonus tax_owed = 0 (credited to parent)"
+            );
+        }
+
+        #[test]
+        fn bonus_single_unit() {
+            let econ = make_bonus_economics(1, dec!(99.99));
+            assert_eq!(econ.total_cost, Some(dec!(0)));
+            assert_eq!(econ.total_selling, Some(dec!(99.99)));
+            assert_eq!(econ.unit_commission, Some(dec!(0)));
+            assert_eq!(econ.total_commission, Some(dec!(0)));
+            assert_eq!(econ.tax_paid, Some(dec!(0)));
+            assert_eq!(
+                econ.tax_owed,
+                Some(dec!(0)),
+                "tax_owed = 0 (credited to parent)"
+            );
+        }
+
+        #[test]
+        fn bonus_vs_zero_cost_both_show_zero_commission() {
+            let bonus = make_bonus_economics(1, dec!(100.00));
+            let zero_cost = super::zero_cost_economics_tests::tests_make_zero_cost(1, dec!(100.00));
+
+            // Bonus (attributed): commission = 0 (credited to parent)
+            assert_eq!(bonus.total_commission, Some(dec!(0)));
+            // Zero cost (unknown): commission = 0 (can't compute)
+            assert_eq!(zero_cost.total_commission, Some(dec!(0)));
+            // Difference: bonus has parent link, zero-cost doesn't
+            assert!(bonus.bonus_for_purchase_id.is_some());
+            assert!(zero_cost.bonus_for_purchase_id.is_none());
+        }
+
+        #[test]
+        fn bonus_purchase_type_is_set() {
+            let econ = make_bonus_economics(1, dec!(10.00));
+            assert_eq!(
+                econ.purchase_type,
+                Some("bonus".to_string()),
+                "purchase_type must be 'bonus'"
+            );
+        }
+
+        #[test]
+        fn bonus_has_parent_link() {
+            let econ = make_bonus_economics(1, dec!(10.00));
+            assert!(
+                econ.bonus_for_purchase_id.is_some(),
+                "Bonus must have bonus_for_purchase_id set"
+            );
+        }
+
+        /// Simulates the parent purchase economics after receiving a bonus boost.
+        /// Parent: 10 units at $5 cost, $8 invoice price
+        /// Bonus: 2 units at $8 invoice price (attributed)
+        /// Expected: parent's total_commission = 10 * (8-5) + 2*8 = 30 + 16 = 46
+        #[test]
+        fn parent_boosted_by_attributed_bonus() {
+            let bonus_selling = Decimal::from(2) * dec!(8.00); // 16.00
+            let own_commission = Decimal::from(10) * (dec!(8.00) - dec!(5.00)); // 30.00
+            let boosted_commission = own_commission + bonus_selling; // 46.00
+
+            let parent = PurchaseEconomics {
+                purchase_id: Uuid::new_v4(),
+                purchase_date: Utc::now(),
+                item_id: Uuid::new_v4(),
+                item_name: "Widget".to_string(),
+                vendor_name: Some("Amazon".to_string()),
+                destination_code: Some("BSC".to_string()),
+                quantity: 10,
+                purchase_cost: dec!(5.00),
+                total_cost: Some(dec!(50.00)),
+                invoice_unit_price: Some(dec!(8.00)),
+                // total_selling boosted: 10*8 + 16 = 96
+                total_selling: Some(Decimal::from(10) * dec!(8.00) + bonus_selling),
+                // unit_commission boosted: (8-5) + 16/10 = 4.60
+                unit_commission: Some(dec!(3.00) + bonus_selling / Decimal::from(10)),
+                total_commission: Some(boosted_commission),
+                tax_paid: Some(Decimal::from(10) * dec!(5.00) * dec!(0.13)),
+                tax_owed: Some(boosted_commission * dec!(0.13)),
+                status: DeliveryStatus::Pending,
+                delivery_date: None,
+                invoice_id: None,
+                receipt_id: None,
+                receipt_number: None,
+                invoice_number: None,
+                allow_receipt_date_override: false,
+                notes: None,
+                refunds_purchase_id: None,
+                purchase_type: Some("unit".to_string()),
+                bonus_for_purchase_id: None,
+            };
+
+            assert_eq!(parent.total_commission, Some(dec!(46.00)));
+            assert_eq!(parent.unit_commission, Some(dec!(4.60)));
+            assert_eq!(parent.total_selling, Some(dec!(96.00)));
+            assert_eq!(parent.tax_owed, Some(dec!(5.98)));
         }
     }
 }

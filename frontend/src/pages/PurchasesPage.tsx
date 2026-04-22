@@ -10,6 +10,7 @@ import {
   useDestinations,
   useInvoices,
   useReceipts,
+  useItemPurchases,
 } from "@/hooks/useApi"
 import { importApi, type PurchasePreview, type PreviewRow } from "@/api"
 import { Button } from "@/components/ui/button"
@@ -107,6 +108,20 @@ export default function PurchasesPage() {
   const [invoiceId, setInvoiceId] = useState("")
   const [receiptId, setReceiptId] = useState("")
   const [notes, setNotes] = useState("")
+  const [refundsPurchaseId, setRefundsPurchaseId] = useState("")
+  const [purchaseType, setPurchaseType] = useState("unit")
+  const [bonusForPurchaseId, setBonusForPurchaseId] = useState("")
+
+  const parsedQty = parseInt(quantity)
+  const isRefund = !Number.isNaN(parsedQty) && parsedQty < 0
+  const isBonus = purchaseType === "bonus"
+  const { data: itemPurchases = [] } = useItemPurchases(itemId)
+  const refundCandidates = itemPurchases.filter(
+    (p) => p.quantity > 0 && p.purchase_id !== editingPurchaseId
+  )
+  const bonusCandidates = itemPurchases.filter(
+    (p) => p.quantity > 0 && p.purchase_type !== "bonus" && p.purchase_id !== editingPurchaseId
+  )
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -122,6 +137,11 @@ export default function PurchasesPage() {
         receipt_id: receiptId || undefined,
         clear_receipt: !receiptId,
         notes: notes || undefined,
+        refunds_purchase_id: refundsPurchaseId || undefined,
+        clear_refunds_purchase: !refundsPurchaseId,
+        purchase_type: purchaseType,
+        bonus_for_purchase_id: bonusForPurchaseId || undefined,
+        clear_bonus_for_purchase: !bonusForPurchaseId,
       })
     } else {
       await createPurchase.mutateAsync({
@@ -132,6 +152,9 @@ export default function PurchasesPage() {
         invoice_id: invoiceId || undefined,
         receipt_id: receiptId || undefined,
         notes: notes || undefined,
+        refunds_purchase_id: refundsPurchaseId || undefined,
+        purchase_type: purchaseType,
+        bonus_for_purchase_id: bonusForPurchaseId || undefined,
       })
     }
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
@@ -149,6 +172,9 @@ export default function PurchasesPage() {
     setInvoiceId("")
     setReceiptId("")
     setNotes("")
+    setRefundsPurchaseId("")
+    setPurchaseType("unit")
+    setBonusForPurchaseId("")
   }
 
   const handleEdit = (p: typeof purchases[0]) => {
@@ -162,6 +188,9 @@ export default function PurchasesPage() {
     setInvoiceId(p.invoice_id || "")
     setReceiptId(p.receipt_id || "")
     setNotes("")
+    setRefundsPurchaseId(p.refunds_purchase_id || "")
+    setPurchaseType(p.purchase_type || "unit")
+    setBonusForPurchaseId(p.bonus_for_purchase_id || "")
     setIsOpen(true)
   }
 
@@ -211,6 +240,7 @@ export default function PurchasesPage() {
               { header: "Status", accessor: (p) => p.status },
               { header: "Delivery Date", accessor: (p) => p.delivery_date },
               { header: "Notes", accessor: (p) => p.notes },
+              { header: "Type", accessor: (p) => p.purchase_type },
             ]}
             data={purchases}
           />
@@ -349,6 +379,19 @@ export default function PurchasesPage() {
                 </Select>
               </div>
               <div className="space-y-2">
+                <Label>Purchase Type</Label>
+                <Select value={purchaseType} onValueChange={setPurchaseType}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="unit">Unit (physical item)</SelectItem>
+                    <SelectItem value="bonus">Bonus (promo freebie)</SelectItem>
+                    <SelectItem value="refund">Refund (credit/return)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
                 <Label htmlFor="notes">Notes</Label>
                 <Input
                   id="notes"
@@ -357,6 +400,53 @@ export default function PurchasesPage() {
                   placeholder="Any notes..."
                 />
               </div>
+              {isRefund && (
+                <div className="space-y-2">
+                  <Label htmlFor="refundsPurchase">Refunds Purchase</Label>
+                  <Select
+                    value={refundsPurchaseId || "__none__"}
+                    onValueChange={(v) => setRefundsPurchaseId(v === "__none__" ? "" : v)}
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="Link to original purchase" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">None</SelectItem>
+                      {refundCandidates.map((p) => (
+                        <SelectItem key={p.purchase_id} value={p.purchase_id}>
+                          {p.item_name} × {p.quantity} — {p.invoice_number || p.receipt_number || "unlinked"}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    Link this credit to the original purchase being refunded.
+                  </p>
+                </div>
+              )}
+              {isBonus && (
+                <div className="space-y-2">
+                  <Label htmlFor="bonusForPurchase">Attribute Bonus To</Label>
+                  <Select
+                    value={bonusForPurchaseId || "__none__"}
+                    onValueChange={(v) => setBonusForPurchaseId(v === "__none__" ? "" : v)}
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="Link to parent purchase" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {bonusCandidates.map((p) => (
+                        <SelectItem key={p.purchase_id} value={p.purchase_id}>
+                          {p.item_name} × {p.quantity} — {p.invoice_number || p.receipt_number || "unlinked"}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    Link this bonus to a parent purchase to boost its commission.
+                  </p>
+                </div>
+              )}
               <div className="flex justify-end gap-2">
                 <Button type="button" variant="outline" onClick={() => setIsOpen(false)}>
                   Cancel
@@ -454,6 +544,11 @@ export default function PurchasesPage() {
                     <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
                       {p.item_name}
                     </Link>
+                    {p.purchase_type && p.purchase_type !== "unit" && (
+                      <span className={`ml-1 text-[10px] px-1 py-0.5 rounded ${p.purchase_type === "bonus" ? "bg-blue-100 text-blue-700" : "bg-orange-100 text-orange-700"}`}>
+                        {p.purchase_type}
+                      </span>
+                    )}
                   </TableCell>
                   <TableCell>{p.vendor_name || "-"}</TableCell>
                   <TableCell>{p.destination_code || "-"}</TableCell>

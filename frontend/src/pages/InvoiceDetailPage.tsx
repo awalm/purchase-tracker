@@ -12,6 +12,7 @@ import {
   useReceipts,
   useVendors,
   useCreateReceipt,
+  useItemPurchases,
 } from "@/hooks/useApi"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -41,9 +42,10 @@ import {
 } from "@/components/ui/select"
 import { ExportCsvButton } from "@/components/ExportCsvButton"
 import { StatusSelect } from "@/components/StatusSelect"
+import { DateInput } from "@/components/ui/date-input"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
 import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
-import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, FileDown, Upload, Loader2, ChevronDown, ChevronRight } from "lucide-react"
+import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, FileDown, Upload, Loader2, ChevronDown, ChevronRight, Check, X } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
 import { assessPurchaseReconciliation } from "@/lib/purchaseReconciliation"
 import { getOrLoadReceiptLineItems, invalidateReceiptLineItemsCache } from "@/lib/receiptLineItemsCache"
@@ -86,6 +88,8 @@ export default function InvoiceDetailPage() {
   const [reconciliationActionNotice, setReconciliationActionNotice] = useState("")
   const [deletePurchaseDialogOpen, setDeletePurchaseDialogOpen] = useState(false)
   const [purchasePendingDeleteId, setPurchasePendingDeleteId] = useState<string | null>(null)
+  const [editingDeliveryDate, setEditingDeliveryDate] = useState(false)
+  const [deliveryDateDraft, setDeliveryDateDraft] = useState("")
 
   const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -104,6 +108,20 @@ export default function InvoiceDetailPage() {
       if (fileInputRef.current) {
         fileInputRef.current.value = ""
       }
+    }
+  }
+
+  const handleSaveDeliveryDate = async () => {
+    if (!id || !invoice) return
+    try {
+      await invoicesApi.update(id, { delivery_date: deliveryDateDraft })
+      queryClient.invalidateQueries({ queryKey: ["invoices", id] })
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      setEditingDeliveryDate(false)
+    } catch (err) {
+      setReconciliationActionError(
+        err instanceof Error ? err.message : "Failed to update delivery date"
+      )
     }
   }
 
@@ -208,6 +226,23 @@ export default function InvoiceDetailPage() {
   const [invoiceUnitPrice, setInvoiceUnitPrice] = useState("")
   const [destinationId, setDestinationId] = useState("")
   const [notes, setNotes] = useState("")
+  const [refundsPurchaseId, setRefundsPurchaseId] = useState("")
+  const [bonusForPurchaseId, setBonusForPurchaseId] = useState("")
+
+  // Candidate purchases for the "Refunds Purchase" selector (same item, positive qty)
+  const parsedQty = parseInt(quantity)
+  const isRefund = !Number.isNaN(parsedQty) && parsedQty < 0
+  const { data: itemPurchases = [] } = useItemPurchases(itemId)
+  const refundCandidates = itemPurchases.filter(
+    (p) => p.quantity > 0 && p.purchase_id !== editingPurchaseId
+  )
+  const bonusCandidates = itemPurchases.filter(
+    (p) => p.quantity > 0 && p.purchase_type !== "bonus" && p.purchase_id !== editingPurchaseId
+  )
+  const editingPurchaseType = editingPurchaseId
+    ? purchases.find((p) => p.purchase_id === editingPurchaseId)?.purchase_type
+    : undefined
+  const isBonus = editingPurchaseType === "bonus"
 
   // Receipt-link dialog (focused, not the full edit form)
   const [linkDialogOpen, setLinkDialogOpen] = useState(false)
@@ -288,8 +323,9 @@ export default function InvoiceDetailPage() {
     overrideEnabled: boolean
   ) => {
     if (overrideEnabled) return true
-    if (!invoice?.invoice_date || !receiptDate) return true
-    return receiptDate.slice(0, 10) <= invoice.invoice_date
+    const cutoffDate = invoice?.delivery_date || invoice?.invoice_date
+    if (!cutoffDate || !receiptDate) return true
+    return receiptDate.slice(0, 10) <= cutoffDate
   }
 
   useEffect(() => {
@@ -427,7 +463,7 @@ export default function InvoiceDetailPage() {
 
     if (receiptDateOutOfRange) {
       setAllocationWarning(
-        `Receipt date ${formatDate(selectedReceipt?.receipt_date)} is after invoice date ${formatDate(invoice?.invoice_date)}. Enable override to proceed.`
+        `Receipt date ${formatDate(selectedReceipt?.receipt_date)} is after delivery date ${formatDate(invoice?.delivery_date || invoice?.invoice_date)}. Enable override to proceed.`
       )
     }
 
@@ -458,7 +494,7 @@ export default function InvoiceDetailPage() {
 
     if (receiptDateOutOfRange) {
       setAllocationWarning(
-        `Receipt date ${formatDate(selectedReceipt?.receipt_date)} is after invoice date ${formatDate(invoice?.invoice_date)}. Enable override to proceed.`
+        `Receipt date ${formatDate(selectedReceipt?.receipt_date)} is after delivery date ${formatDate(invoice?.delivery_date || invoice?.invoice_date)}. Enable override to proceed.`
       )
       return
     }
@@ -499,7 +535,7 @@ export default function InvoiceDetailPage() {
           setAllocationWarning("No receipts currently have allocatable line items for this product.")
         } else {
           setAllocationWarning(
-            `No receipts on or before invoice date ${formatDate(invoice?.invoice_date)} have allocatable line items for this product. Enable override to include later receipts.`
+            `No receipts on or before delivery date ${formatDate(invoice?.delivery_date || invoice?.invoice_date)} have allocatable line items for this product. Enable override to include later receipts.`
           )
         }
         return
@@ -534,6 +570,7 @@ export default function InvoiceDetailPage() {
     editingAllocationId,
     receipts,
     allowReceiptDateOverride,
+    invoice?.delivery_date,
     invoice?.invoice_date,
   ])
 
@@ -616,7 +653,7 @@ export default function InvoiceDetailPage() {
     const selectedReceipt = receipts.find((row) => row.id === allocationReceiptId)
     if (!isReceiptDateEligibleForInvoice(selectedReceipt?.receipt_date, allowReceiptDateOverride)) {
       setAllocationError(
-        `Receipt date ${formatDate(selectedReceipt?.receipt_date)} is after invoice date ${formatDate(invoice?.invoice_date)}. Enable override to continue.`
+        `Receipt date ${formatDate(selectedReceipt?.receipt_date)} is after delivery date ${formatDate(invoice?.delivery_date || invoice?.invoice_date)}. Enable override to continue.`
       )
       return
     }
@@ -936,6 +973,10 @@ export default function InvoiceDetailPage() {
         destination_id: destinationId || undefined,
         invoice_id: id,
         notes: notes || undefined,
+        refunds_purchase_id: refundsPurchaseId || undefined,
+        clear_refunds_purchase: !refundsPurchaseId,
+        bonus_for_purchase_id: bonusForPurchaseId || undefined,
+        clear_bonus_for_purchase: !bonusForPurchaseId,
       })
     } else {
       await createPurchase.mutateAsync({
@@ -946,6 +987,8 @@ export default function InvoiceDetailPage() {
         destination_id: destinationId || undefined,
         invoice_id: id,
         notes: notes || undefined,
+        refunds_purchase_id: refundsPurchaseId || undefined,
+        bonus_for_purchase_id: bonusForPurchaseId || undefined,
       })
     }
     // Also invalidate the invoice detail to refresh counts
@@ -962,6 +1005,8 @@ export default function InvoiceDetailPage() {
     setInvoiceUnitPrice("")
     setDestinationId("")
     setNotes("")
+    setRefundsPurchaseId("")
+    setBonusForPurchaseId("")
   }
 
   const handleItemChange = (selectedId: string) => {
@@ -992,6 +1037,8 @@ export default function InvoiceDetailPage() {
     const matchedDest = destinations.find((d) => d.code === p.destination_code)
     setDestinationId(matchedDest?.id || "")
     setNotes(p.notes || "")
+    setRefundsPurchaseId(p.refunds_purchase_id || "")
+    setBonusForPurchaseId(p.bonus_for_purchase_id || "")
     setIsOpen(true)
   }
 
@@ -1064,7 +1111,7 @@ export default function InvoiceDetailPage() {
         quantity: purchase.quantity,
         purchase_cost: purchase.purchase_cost,
         receipt_id: purchase.receipt_id,
-        invoice_date: invoice.invoice_date,
+        invoice_date: invoice.delivery_date || invoice.invoice_date,
         invoice_id: purchase.invoice_id,
         invoice_unit_price: purchase.invoice_unit_price,
         destination_code: purchase.destination_code,
@@ -1206,6 +1253,41 @@ export default function InvoiceDetailPage() {
             {invoice.destination_code} - {invoice.destination_name} · {formatDate(invoice.invoice_date)}
             {invoice.order_number && ` · Order: ${invoice.order_number}`}
           </p>
+          <div className="flex items-center gap-1 text-sm text-muted-foreground mt-0.5">
+            <span>Delivery:</span>
+            {editingDeliveryDate ? (
+              <span className="flex items-center gap-1">
+                <DateInput
+                  value={deliveryDateDraft}
+                  onChange={setDeliveryDateDraft}
+                  className="h-7 w-36 text-sm"
+                />
+                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={handleSaveDeliveryDate}>
+                  <Check className="h-3 w-3" />
+                </Button>
+                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => setEditingDeliveryDate(false)}>
+                  <X className="h-3 w-3" />
+                </Button>
+              </span>
+            ) : (
+              <span className="flex items-center gap-1">
+                <span>{formatDate(invoice.delivery_date || invoice.invoice_date)}</span>
+                {!isFinalized && (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-5 w-5"
+                    onClick={() => {
+                      setDeliveryDateDraft(invoice.delivery_date || invoice.invoice_date)
+                      setEditingDeliveryDate(true)
+                    }}
+                  >
+                    <Pencil className="h-3 w-3" />
+                  </Button>
+                )}
+              </span>
+            )}
+          </div>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
           {/* Hidden file input for PDF upload */}
@@ -1570,6 +1652,53 @@ export default function InvoiceDetailPage() {
                       placeholder="Any notes..."
                     />
                   </div>
+                  {isRefund && (
+                    <div className="space-y-2">
+                      <Label htmlFor="refundsPurchase">Refunds Purchase</Label>
+                      <Select
+                        value={refundsPurchaseId || "__none__"}
+                        onValueChange={(v) => setRefundsPurchaseId(v === "__none__" ? "" : v)}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Link to original purchase" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="__none__">None</SelectItem>
+                          {refundCandidates.map((p) => (
+                            <SelectItem key={p.purchase_id} value={p.purchase_id}>
+                              {p.item_name} × {p.quantity} — {p.invoice_number || p.receipt_number || "unlinked"}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <p className="text-xs text-muted-foreground">
+                        Link this credit to the original purchase being refunded.
+                      </p>
+                    </div>
+                  )}
+                  {isBonus && (
+                    <div className="space-y-2">
+                      <Label htmlFor="bonusForPurchase">Attribute Bonus To</Label>
+                      <Select
+                        value={bonusForPurchaseId || "__none__"}
+                        onValueChange={(v) => setBonusForPurchaseId(v === "__none__" ? "" : v)}
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="Link to parent purchase" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {bonusCandidates.map((p) => (
+                            <SelectItem key={p.purchase_id} value={p.purchase_id}>
+                              {p.item_name} × {p.quantity} — {p.invoice_number || p.receipt_number || "unlinked"}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <p className="text-xs text-muted-foreground">
+                        Link this bonus to a parent purchase to boost its commission.
+                      </p>
+                    </div>
+                  )}
                   {/* Live reconciliation hint */}
                   {invoiceUnitPrice && quantity && (
                     <div className="text-sm bg-muted p-3 rounded-md space-y-1">
@@ -1638,7 +1767,9 @@ export default function InvoiceDetailPage() {
                           </Link>
                         </TableCell>
                         <TableCell>
-                          {allocs.length > 0 ? (
+                          {p.purchase_type === "bonus" ? (
+                            <span className="text-xs text-muted-foreground italic">bonus — no allocation</span>
+                          ) : allocs.length > 0 ? (
                             <div className="space-y-1">
                               <div className={`text-xs font-medium ${isPartiallyAllocated ? "text-amber-700" : "text-emerald-700"}`}>
                                 {allocated}/{p.quantity} allocated
@@ -1928,12 +2059,12 @@ export default function InvoiceDetailPage() {
                     className="mt-0.5"
                   />
                   <span>
-                    Allow receipts dated after invoice date ({formatDate(invoice?.invoice_date)}) for this line item.
+                    Allow receipts dated after delivery date ({formatDate(invoice?.delivery_date || invoice?.invoice_date)}) for this line item.
                   </span>
                 </label>
                 {!allowReceiptDateOverride && (
                   <p className="mt-1 text-xs text-muted-foreground">
-                    By default, only receipts on or before the invoice date are eligible.
+                    By default, only receipts on or before the delivery date are eligible.
                   </p>
                 )}
               </div>
@@ -2029,13 +2160,13 @@ export default function InvoiceDetailPage() {
                   <p className="text-xs text-amber-700">
                     {allowReceiptDateOverride
                       ? "No allocatable receipts found for this product."
-                      : `No allocatable receipts on or before invoice date ${formatDate(invoice?.invoice_date)}.`}
+                      : `No allocatable receipts on or before delivery date ${formatDate(invoice?.delivery_date || invoice?.invoice_date)}.`}
                   </p>
                 ) : (
                   <p className="text-xs text-muted-foreground">
                     {allowReceiptDateOverride
-                      ? "Showing receipts with allocatable line items for this product (including dates after invoice date)."
-                      : `Showing receipts with allocatable line items on or before invoice date ${formatDate(invoice?.invoice_date)}.`}
+                      ? "Showing receipts with allocatable line items for this product (including dates after delivery date)."
+                      : `Showing receipts with allocatable line items on or before delivery date ${formatDate(invoice?.delivery_date || invoice?.invoice_date)}.`}
                   </p>
                 )}
                 <div className="flex flex-wrap items-center gap-2 pt-1">

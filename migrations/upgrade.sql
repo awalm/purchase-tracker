@@ -154,6 +154,18 @@ EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
 -- ============================================
+-- INVOICE DELIVERY DATE
+-- ============================================
+-- delivery_date defaults to invoice_date for existing rows.
+-- Used as the receipt date cutoff for auto-allocation instead of invoice_date.
+ALTER TABLE invoices
+  ADD COLUMN IF NOT EXISTS delivery_date DATE;
+
+UPDATE invoices
+SET delivery_date = invoice_date
+WHERE delivery_date IS NULL;
+
+-- ============================================
 -- PURCHASE ALLOCATIONS (Phase 1)
 -- Keep invoice lines intact while allocating qty/cost to one or more receipts.
 -- ============================================
@@ -398,6 +410,18 @@ LEFT JOIN purchases p ON p.receipt_id = r.id
 GROUP BY r.id, r.receipt_number, v.name, r.receipt_date, r.subtotal;
 
 -- ============================================
+-- BONUS ATTRIBUTION
+-- ============================================
+-- A bonus purchase can optionally be attributed to a parent (unit) purchase.
+-- When set, the bonus's selling value boosts the parent's commission and the
+-- bonus row itself shows zero commission (no double-counting).
+ALTER TABLE purchases
+  ADD COLUMN IF NOT EXISTS bonus_for_purchase_id UUID REFERENCES purchases(id);
+
+CREATE INDEX IF NOT EXISTS idx_purchases_bonus_for_purchase
+  ON purchases(bonus_for_purchase_id) WHERE bonus_for_purchase_id IS NOT NULL;
+
+-- ============================================
 -- DESTINATION SUMMARY: Zero-cost guard logic
 -- ============================================
 -- When purchase_cost = 0, use invoice_unit_price as effective cost (break-even)
@@ -411,27 +435,43 @@ SELECT
     (SELECT COUNT(*) FROM purchases WHERE destination_id = d.id) AS total_purchases,
     (SELECT COALESCE(SUM(quantity), 0) FROM purchases WHERE destination_id = d.id) AS total_quantity,
     (SELECT COALESCE(SUM(
-        CASE WHEN purchase_cost = 0 AND invoice_unit_price IS NOT NULL
-          THEN quantity * invoice_unit_price
+        CASE WHEN purchase_type = 'bonus' THEN 0
+          WHEN purchase_cost = 0 AND invoice_unit_price IS NOT NULL
+            THEN quantity * invoice_unit_price
           ELSE quantity * purchase_cost
         END
     ), 0) FROM purchases WHERE destination_id = d.id) AS total_cost,
     (SELECT COALESCE(SUM(quantity * COALESCE(invoice_unit_price, purchase_cost)), 0) FROM purchases WHERE destination_id = d.id) AS total_revenue,
     (SELECT COALESCE(SUM(
-        CASE WHEN purchase_cost = 0 THEN 0
+        CASE WHEN bonus_for_purchase_id IS NOT NULL THEN 0
+          WHEN purchase_type = 'bonus'
+            THEN quantity * COALESCE(invoice_unit_price, 0)
+          WHEN purchase_cost = 0 THEN 0
           ELSE quantity * (COALESCE(invoice_unit_price, purchase_cost) - purchase_cost)
+               + COALESCE((SELECT SUM(b.quantity * COALESCE(b.invoice_unit_price, 0))
+                           FROM purchases b
+                           WHERE b.bonus_for_purchase_id = purchases.id
+                             AND b.purchase_type = 'bonus'), 0)
         END
     ), 0) FROM purchases WHERE destination_id = d.id) AS total_commission,
     (SELECT COALESCE(SUM(
-        CASE WHEN purchase_cost = 0 AND invoice_unit_price IS NOT NULL
-          THEN quantity * invoice_unit_price * 0.13
+        CASE WHEN purchase_type = 'bonus' THEN 0
+          WHEN purchase_cost = 0 AND invoice_unit_price IS NOT NULL
+            THEN quantity * invoice_unit_price * 0.13
           ELSE quantity * purchase_cost * 0.13
         END
     ), 0) FROM purchases WHERE destination_id = d.id) AS total_tax_paid,
     (SELECT COALESCE(SUM(
-        CASE WHEN purchase_cost = 0 THEN 0
+        CASE WHEN bonus_for_purchase_id IS NOT NULL THEN 0
+          WHEN purchase_type = 'bonus'
+            THEN quantity * COALESCE(invoice_unit_price, 0) * 0.13
+          WHEN purchase_cost = 0 THEN 0
           WHEN invoice_unit_price IS NOT NULL
-            THEN quantity * (invoice_unit_price - purchase_cost) * 0.13
+            THEN (quantity * (invoice_unit_price - purchase_cost)
+                 + COALESCE((SELECT SUM(b.quantity * COALESCE(b.invoice_unit_price, 0))
+                             FROM purchases b
+                             WHERE b.bonus_for_purchase_id = purchases.id
+                               AND b.purchase_type = 'bonus'), 0)) * 0.13
           ELSE 0
         END
     ), 0) FROM purchases WHERE destination_id = d.id) AS total_tax_owed
@@ -465,3 +505,98 @@ BEGIN
     CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_number_unique ON receipts(receipt_number);
   END IF;
 END $$;
+
+-- ============================================
+-- REFUND / CREDIT PURCHASE LINKING
+-- ============================================
+-- A credit purchase (negative qty) can reference the original purchase it refunds.
+ALTER TABLE purchases
+  ADD COLUMN IF NOT EXISTS refunds_purchase_id UUID REFERENCES purchases(id);
+
+CREATE INDEX IF NOT EXISTS idx_purchases_refunds_purchase
+  ON purchases(refunds_purchase_id) WHERE refunds_purchase_id IS NOT NULL;
+
+-- ============================================
+-- PURCHASE TYPE (unit / bonus / refund)
+-- ============================================
+-- unit   = standard physical purchase, counts toward inventory
+-- bonus  = promotional freebie, in economics but not unit counts
+-- refund = credit/return
+ALTER TABLE purchases
+  ADD COLUMN IF NOT EXISTS purchase_type TEXT NOT NULL DEFAULT 'unit';
+
+-- Recreate v_purchase_economics with purchase_type + bonus attribution
+CREATE OR REPLACE VIEW v_purchase_economics AS
+WITH bonus_sums AS (
+    SELECT bonus_for_purchase_id AS parent_id,
+           SUM(quantity * COALESCE(invoice_unit_price, 0)) AS bonus_selling
+    FROM purchases
+    WHERE purchase_type = 'bonus' AND bonus_for_purchase_id IS NOT NULL
+    GROUP BY bonus_for_purchase_id
+)
+SELECT 
+    p.id AS purchase_id,
+    COALESCE(inv.invoice_date::timestamptz, r.receipt_date::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS purchase_date,
+    p.item_id,
+    i.name AS item_name,
+    v.name AS vendor_name,
+    d.code AS destination_code,
+    p.quantity,
+    p.purchase_cost,
+    CASE WHEN p.purchase_type = 'bonus' THEN 0
+      WHEN p.purchase_cost = 0 AND p.invoice_unit_price IS NOT NULL
+        THEN p.quantity * p.invoice_unit_price
+      ELSE p.quantity * p.purchase_cost
+    END AS total_cost,
+    p.invoice_unit_price,
+    -- total_selling: own selling + attributed bonus selling (not for attributed bonuses)
+    CASE WHEN p.bonus_for_purchase_id IS NOT NULL
+        THEN p.quantity * p.invoice_unit_price
+      ELSE p.quantity * p.invoice_unit_price + COALESCE(bs.bonus_selling, 0)
+    END AS total_selling,
+    -- unit_commission: attributed bonus → 0; standalone bonus → full price; normal → own + bonus boost
+    CASE WHEN p.bonus_for_purchase_id IS NOT NULL THEN 0
+      WHEN p.purchase_type = 'bonus'
+        THEN COALESCE(p.invoice_unit_price, 0)
+      WHEN p.purchase_cost = 0 THEN 0
+      ELSE (p.invoice_unit_price - p.purchase_cost)
+           + COALESCE(bs.bonus_selling, 0) / NULLIF(p.quantity, 0)::numeric
+    END AS unit_commission,
+    -- total_commission: attributed bonus → 0; standalone bonus → full; normal → own + bonus
+    CASE WHEN p.bonus_for_purchase_id IS NOT NULL THEN 0
+      WHEN p.purchase_type = 'bonus'
+        THEN p.quantity * COALESCE(p.invoice_unit_price, 0)
+      WHEN p.purchase_cost = 0 THEN 0
+      ELSE p.quantity * (p.invoice_unit_price - p.purchase_cost)
+           + COALESCE(bs.bonus_selling, 0)
+    END AS total_commission,
+    CASE WHEN p.purchase_type = 'bonus' THEN 0
+      WHEN p.purchase_cost = 0 AND p.invoice_unit_price IS NOT NULL
+        THEN p.quantity * p.invoice_unit_price * 0.13
+      ELSE p.quantity * p.purchase_cost * 0.13
+    END AS tax_paid,
+    -- tax_owed: attributed bonus → 0; standalone bonus → on commission; normal → on commission + bonus
+    CASE WHEN p.bonus_for_purchase_id IS NOT NULL THEN 0
+      WHEN p.purchase_type = 'bonus'
+        THEN p.quantity * COALESCE(p.invoice_unit_price, 0) * 0.13
+      WHEN p.purchase_cost = 0 THEN 0
+      WHEN p.invoice_unit_price IS NOT NULL
+        THEN (p.quantity * (p.invoice_unit_price - p.purchase_cost)
+             + COALESCE(bs.bonus_selling, 0)) * 0.13
+      ELSE 0
+    END AS tax_owed,
+    p.status,
+    p.delivery_date,
+    p.invoice_id,
+    p.receipt_id,
+    r.receipt_number,
+    inv.invoice_number,
+    p.notes,
+    p.purchase_type
+FROM purchases p
+LEFT JOIN bonus_sums bs ON bs.parent_id = p.id
+JOIN items i ON i.id = p.item_id
+LEFT JOIN receipts r ON r.id = p.receipt_id
+LEFT JOIN vendors v ON v.id = r.vendor_id
+LEFT JOIN destinations d ON d.id = p.destination_id
+LEFT JOIN invoices inv ON inv.id = p.invoice_id;

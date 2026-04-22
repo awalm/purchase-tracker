@@ -1,0 +1,28 @@
+{
+  "source_file": "20251215_193822.jpg",
+  "content_type": "image/jpeg",
+  "expected": {
+    "receipt_number": "ARVA8050201",
+    "receipt_date": "2025-12-15",
+    "subtotal": "3.75",
+    "tax": "588.08",
+    "total": "591.83",
+    "payment_method": null,
+    "line_items_count": 1,
+    "line_items_expected": [
+      {
+        "description_contains": "playstation 5 console",
+        "quantity": 1,
+        "unit_cost": "1519.99",
+        "line_total": "1519.99"
+      }
+    ],
+    "raw_text_contains": [
+      "computers",
+      "playstation 5 console",
+      "subtotal",
+      "ehf"
+    ],
+    "warnings_contains": []
+  }
+}

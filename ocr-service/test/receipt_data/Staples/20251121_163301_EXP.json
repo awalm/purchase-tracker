@@ -1,0 +1,22 @@
+{
+  "source_file": "20251121_163301.jpg",
+  "content_type": "image/jpeg",
+  "expected": {
+    "receipt_number": null,
+    "receipt_date": "2025-11-21",
+    "subtotal": "449.99",
+    "tax": "13.00",
+    "total": "508.49",
+    "payment_method": "1003",
+    "line_items_count": 0,
+    "raw_text_contains": [
+      "staples canada",
+      "ps5 dig ed",
+      "449.99",
+      "subtotal"
+    ],
+    "warnings_contains": [
+      "No confident line items extracted; user confirmation required."
+    ]
+  }
+}

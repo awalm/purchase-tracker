@@ -191,6 +191,7 @@ export function useCreateInvoice() {
       invoice_number: string
       order_number?: string
       invoice_date: string
+      delivery_date?: string
       subtotal: string
       tax_rate?: string
       notes?: string
@@ -314,6 +315,9 @@ export function useCreatePurchase() {
       receipt_id?: string
       status?: string
       notes?: string
+      refunds_purchase_id?: string
+      purchase_type?: string
+      bonus_for_purchase_id?: string
     }) => purchases.create(data),
     onSuccess: () => {
       return Promise.all([

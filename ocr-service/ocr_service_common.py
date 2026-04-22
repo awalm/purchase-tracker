@@ -740,7 +740,15 @@ def _extract_last4_from_payment_line(text: str) -> str | None:
     for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            return m.group(1)
+            candidate = m.group(1)
+            start = m.start(1)
+            # Reject if the 4 digits look like a dollar amount ($1175.11)
+            if start > 0 and text[start - 1] == "$":
+                continue
+            end = m.end(1)
+            if end < len(text) and text[end] == ".":
+                continue
+            return candidate
     return None
 
 

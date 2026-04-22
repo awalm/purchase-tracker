@@ -14,10 +14,10 @@ Line-item parsing heuristic:
      Payment, TOTAL, Balance Due, Amount Due, Notes, Thank you).
   2. A valid line item must have:
        - A non-empty text description (not just numbers)
-       - An integer qty >= 1
+       - A non-zero integer qty (positive for purchases, negative for refunds/credits)
        - A positive unit_price
-       - A positive subtotal
-       - qty * unit_price ≈ subtotal  (within $0.02 per unit — rounding tolerance)
+       - A non-zero subtotal (sign matches qty)
+       - abs(qty) * unit_price ≈ abs(subtotal)  (within $0.02 per unit — rounding tolerance)
   3. Rows that are just "0.00" placeholders, or have no description,
      or fail the math check, are silently skipped.
 """
@@ -53,10 +53,10 @@ def _try_parse_line_item(cells: list) -> dict | None:
 
     Valid line items must have:
       - A non-empty text description
-      - An integer qty >= 1
-      - A positive unit_price
-      - A positive subtotal
-      - qty * unit_price must be close to subtotal (within $0.02 per unit)
+      - A non-zero integer qty (positive for purchases, negative for refunds)
+      - A non-zero unit_price (positive)
+      - A non-zero subtotal (sign matches qty sign)
+      - abs(qty) * unit_price must be close to abs(subtotal) (within $0.02 per unit)
 
     Returns dict or None if the row isn't a valid item.
     """
@@ -67,8 +67,15 @@ def _try_parse_line_item(cells: list) -> dict | None:
         return None
 
     try:
-        subtotal = float(non_empty[-1].replace(',', '').replace('$', ''))
-        unit_price = float(non_empty[-2].replace(',', '').replace('$', ''))
+        subtotal_raw = non_empty[-1].replace(',', '').replace('$', '').replace('(', '-').replace(')', '').strip()
+        price_raw = non_empty[-2].replace(',', '').replace('$', '').replace('(', '-').replace(')', '').strip()
+        # Strip trailing minus (some PDFs put the minus after, e.g. "525.00-")
+        if subtotal_raw.endswith('-') and not subtotal_raw.startswith('-'):
+            subtotal_raw = '-' + subtotal_raw[:-1]
+        if price_raw.endswith('-') and not price_raw.startswith('-'):
+            price_raw = '-' + price_raw[:-1]
+        subtotal = float(subtotal_raw)
+        unit_price = float(price_raw)
         qty = int(non_empty[-3])
     except (ValueError, IndexError):
         return None
@@ -77,14 +84,14 @@ def _try_parse_line_item(cells: list) -> dict | None:
 
     if not desc:
         return None
-    if qty < 1:
+    if qty == 0:
         return None
-    if unit_price <= 0 or subtotal <= 0:
+    if unit_price <= 0:
         return None
 
     # Math sanity: qty * unit_price should ≈ subtotal
     expected = qty * unit_price
-    if abs(expected - subtotal) > 0.02 * qty:
+    if abs(expected - subtotal) > 0.02 * abs(qty):
         return None
 
     return {

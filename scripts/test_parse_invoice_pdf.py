@@ -114,9 +114,39 @@ class TestTryParseLineItem:
         cells = ["Widget", "0", "100.00", "0.00"]
         assert _try_parse_line_item(cells) is None
 
-    def test_rejects_negative_qty(self):
+    def test_accepts_negative_qty_refund(self):
+        """Negative qty represents a refund/credit — should parse successfully."""
         cells = ["Widget", "-2", "100.00", "-200.00"]
-        assert _try_parse_line_item(cells) is None
+        item = _try_parse_line_item(cells)
+        assert item is not None
+        assert item["qty"] == -2
+        assert item["unit_price"] == "100.00"
+        assert item["subtotal"] == "-200.00"
+
+    def test_accepts_negative_qty_with_dollar_sign(self):
+        """Negative subtotal with $ sign: -$200.00"""
+        cells = ["Widget", "-1", "$525.00", "-$525.00"]
+        item = _try_parse_line_item(cells)
+        assert item is not None
+        assert item["qty"] == -1
+        assert item["unit_price"] == "525.00"
+        assert item["subtotal"] == "-525.00"
+
+    def test_accepts_negative_qty_trailing_minus(self):
+        """Some PDFs put minus after the number: 525.00-"""
+        cells = ["Widget", "-1", "525.00", "525.00-"]
+        item = _try_parse_line_item(cells)
+        assert item is not None
+        assert item["qty"] == -1
+        assert item["subtotal"] == "-525.00"
+
+    def test_accepts_negative_qty_parenthesized(self):
+        """Accounting-style negatives: (525.00)"""
+        cells = ["Widget", "-1", "525.00", "(525.00)"]
+        item = _try_parse_line_item(cells)
+        assert item is not None
+        assert item["qty"] == -1
+        assert item["subtotal"] == "-525.00"
 
     def test_rejects_negative_price(self):
         cells = ["Widget", "2", "-50.00", "-100.00"]

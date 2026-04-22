@@ -32,6 +32,7 @@ export interface Invoice {
   invoice_number: string;
   order_number: string | null;
   invoice_date: string;
+  delivery_date: string | null;
   subtotal: string;
   tax_rate: string;
   total: string;
@@ -61,6 +62,7 @@ export interface InvoiceWithDestination {
   invoice_number: string;
   order_number: string | null;
   invoice_date: string;
+  delivery_date: string | null;
   subtotal: string;
   tax_rate: string;
   total: string;
@@ -110,6 +112,9 @@ export interface Purchase {
   status: DeliveryStatus;
   delivery_date: string | null;
   notes: string | null;
+  refunds_purchase_id: string | null;
+  purchase_type: string;
+  bonus_for_purchase_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -148,6 +153,9 @@ export interface PurchaseEconomics {
   invoice_number: string | null;
   allow_receipt_date_override: boolean;
   notes: string | null;
+  refunds_purchase_id: string | null;
+  purchase_type: string | null;
+  bonus_for_purchase_id: string | null;
 }
 
 export interface VendorSummary {

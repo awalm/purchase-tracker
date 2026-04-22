@@ -271,6 +271,9 @@ export const items = {
       invoice_number: string | null;
       allow_receipt_date_override: boolean;
       notes: string | null;
+      refunds_purchase_id: string | null;
+      purchase_type: string | null;
+      bonus_for_purchase_id: string | null;
     }[]>(`/items/${id}/purchases`),
 };
 
@@ -285,6 +288,7 @@ export const invoices = {
       invoice_number: string;
       order_number: string | null;
       invoice_date: string;
+      delivery_date: string | null;
       subtotal: string;
       tax_rate: string;
       total: string;
@@ -308,6 +312,7 @@ export const invoices = {
       invoice_number: string;
       order_number: string | null;
       invoice_date: string;
+      delivery_date: string | null;
       subtotal: string;
       tax_rate: string;
       total: string;
@@ -347,12 +352,16 @@ export const invoices = {
       invoice_number: string | null;
       allow_receipt_date_override: boolean;
       notes: string | null;
+      refunds_purchase_id: string | null;
+      purchase_type: string | null;
+      bonus_for_purchase_id: string | null;
     }[]>(`/invoices/${id}/purchases`),
   create: (data: {
     destination_id: string;
     invoice_number: string;
     order_number?: string;
     invoice_date: string;
+    delivery_date?: string;
     subtotal: string;
     tax_rate?: string;
     reconciliation_state?: string;
@@ -577,6 +586,9 @@ export const receipts = {
       invoice_number: string | null;
       allow_receipt_date_override: boolean;
       notes: string | null;
+      refunds_purchase_id: string | null;
+      purchase_type: string | null;
+      bonus_for_purchase_id: string | null;
     }[]>(`/receipts/${id}/purchases`),
   lineItems: {
     list: (id: string) =>
@@ -684,6 +696,9 @@ export const purchases = {
       invoice_number: string | null;
       allow_receipt_date_override: boolean;
       notes: string | null;
+      refunds_purchase_id: string | null;
+      purchase_type: string | null;
+      bonus_for_purchase_id: string | null;
     }[]>(`/purchases/economics${query ? `?${query}` : ''}`);
   },
   create: (data: {
@@ -696,6 +711,9 @@ export const purchases = {
     receipt_id?: string;
     status?: string;
     notes?: string;
+    refunds_purchase_id?: string;
+    purchase_type?: string;
+    bonus_for_purchase_id?: string;
   }) =>
     request<{ id: string }>('/purchases', {
       method: 'POST',
@@ -1064,6 +1082,12 @@ export interface ReceiptImageParseProgress {
   progress: number | null;
 }
 
+export interface InvoicePdfCommitLineItemSplit {
+  item_id: string;
+  qty: number;
+  purchase_type?: string;
+}
+
 export interface InvoicePdfCommitLineInput {
   line_index: number;
   description: string;
@@ -1071,6 +1095,8 @@ export interface InvoicePdfCommitLineInput {
   invoice_unit_price: string;
   subtotal: string;
   item_id: string | null;
+  splits?: InvoicePdfCommitLineItemSplit[];
+  purchase_type?: string;
 }
 
 export interface InvoicePdfCommitPayload {

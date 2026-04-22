@@ -15,6 +15,7 @@ pub struct AtomicInvoicePdfLine {
     pub qty: i32,
     pub invoice_unit_price: Decimal,
     pub description: String,
+    pub purchase_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -22,6 +23,7 @@ pub struct AtomicInvoicePdfCreateInput {
     pub destination_id: Uuid,
     pub invoice_number: String,
     pub invoice_date: NaiveDate,
+    pub delivery_date: Option<NaiveDate>,
     pub subtotal: Decimal,
     pub tax_rate: Option<Decimal>,
     pub notes: Option<String>,
@@ -293,10 +295,10 @@ fn validate_receipt_date_for_invoice(
     Ok(())
 }
 
-fn no_eligible_receipts_before_invoice_warning(invoice_date: NaiveDate) -> String {
+fn no_eligible_receipts_before_invoice_warning(cutoff_date: NaiveDate) -> String {
     format!(
-        "No receipts on or before invoice date {} are available for allocation.",
-        invoice_date.format("%Y-%m-%d")
+        "No receipts on or before delivery date {} are available for allocation.",
+        cutoff_date.format("%Y-%m-%d")
     )
 }
 
@@ -970,7 +972,7 @@ pub async fn delete_item(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<bool,
 pub async fn get_all_invoices(pool: &PgPool) -> Result<Vec<Invoice>, sqlx::Error> {
     sqlx::query_as!(
         Invoice,
-        r#"SELECT id, destination_id, invoice_number, order_number, invoice_date, 
+        r#"SELECT id, destination_id, invoice_number, order_number, invoice_date, delivery_date,
                 subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at
            FROM invoices ORDER BY invoice_date DESC"#
     )
@@ -981,7 +983,7 @@ pub async fn get_all_invoices(pool: &PgPool) -> Result<Vec<Invoice>, sqlx::Error
 pub async fn get_invoice_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Invoice>, sqlx::Error> {
     sqlx::query_as!(
         Invoice,
-        r#"SELECT id, destination_id, invoice_number, order_number, invoice_date, 
+        r#"SELECT id, destination_id, invoice_number, order_number, invoice_date, delivery_date,
                   subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at
            FROM invoices WHERE id = $1"#,
         id
@@ -998,16 +1000,18 @@ pub async fn create_invoice(
     let tax_rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00
     let reconciliation_state = data.reconciliation_state.as_deref().unwrap_or("open");
     let total = data.subtotal * (Decimal::ONE + tax_rate / Decimal::new(100, 0));
+    let delivery_date = data.delivery_date.unwrap_or(data.invoice_date);
     let invoice = sqlx::query_as!(
         Invoice,
-        r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, subtotal, tax_rate, total, reconciliation_state, notes) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
-           RETURNING id, destination_id, invoice_number, order_number, invoice_date, 
+        r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, delivery_date, subtotal, tax_rate, total, reconciliation_state, notes) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) 
+           RETURNING id, destination_id, invoice_number, order_number, invoice_date, delivery_date,
                      subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at"#,
         data.destination_id,
         data.invoice_number,
         data.order_number,
         data.invoice_date,
+        delivery_date,
         data.subtotal,
         tax_rate,
         total,
@@ -1039,16 +1043,18 @@ pub async fn create_invoice_from_pdf_atomic(
 
     let tax_rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00
     let total = data.subtotal * (Decimal::ONE + tax_rate / Decimal::new(100, 0));
+    let delivery_date = data.delivery_date.unwrap_or(data.invoice_date);
 
     let invoice = sqlx::query_as!(
         Invoice,
-          r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, subtotal, tax_rate, total, reconciliation_state, notes, original_pdf, original_filename)
-              VALUES ($1, $2, NULL, $3, $4, $5, $6, 'open', $7, $8, $9)
-           RETURNING id, destination_id, invoice_number, order_number, invoice_date,
+          r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, delivery_date, subtotal, tax_rate, total, reconciliation_state, notes, original_pdf, original_filename)
+              VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, 'open', $8, $9, $10)
+           RETURNING id, destination_id, invoice_number, order_number, invoice_date, delivery_date,
                             subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at"#,
         data.destination_id,
         data.invoice_number,
         data.invoice_date,
+        delivery_date,
         data.subtotal,
         tax_rate,
         total,
@@ -1074,11 +1080,12 @@ pub async fn create_invoice_from_pdf_atomic(
     for line in data.lines {
         let purchase = sqlx::query_as!(
             Purchase,
-                r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price, destination_id, status, delivery_date, notes, created_at, updated_at)
-                    VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, NULL, NULL, $8::date::timestamptz, $8::date::timestamptz)
+                r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price, destination_id, status, delivery_date, notes, purchase_type, created_at, updated_at)
+                    VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, NULL, NULL, $9, $8::date::timestamptz, $8::date::timestamptz)
                RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price,
                          destination_id, status as "status: DeliveryStatus",
-                         delivery_date, notes, created_at, updated_at"#,
+                         delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id,
+                         created_at, updated_at"#,
             line.item_id,
             invoice.id,
             line.qty,
@@ -1087,6 +1094,7 @@ pub async fn create_invoice_from_pdf_atomic(
             Some(data.destination_id),
             DeliveryStatus::Delivered as DeliveryStatus,
             data.invoice_date,
+            line.purchase_type.as_deref().unwrap_or("unit"),
         )
         .fetch_one(&mut *tx)
         .await
@@ -1130,6 +1138,7 @@ pub async fn update_invoice(
         let has_non_state_changes = data.invoice_number.is_some()
             || data.order_number.is_some()
             || data.invoice_date.is_some()
+            || data.delivery_date.is_some()
             || data.subtotal.is_some()
             || data.tax_rate.is_some()
             || data.notes.is_some();
@@ -1153,18 +1162,20 @@ pub async fn update_invoice(
                 invoice_number = COALESCE($2, invoice_number),
                 order_number = COALESCE($3, order_number),
                 invoice_date = COALESCE($4, invoice_date),
-                subtotal = COALESCE($5, subtotal),
-                tax_rate = COALESCE($6, tax_rate),
-                total = COALESCE($5, subtotal) * (1 + COALESCE($6, tax_rate) / 100),
-                reconciliation_state = COALESCE($7, reconciliation_state),
-                notes = COALESCE($8, notes)
+                delivery_date = COALESCE($5, delivery_date),
+                subtotal = COALESCE($6, subtotal),
+                tax_rate = COALESCE($7, tax_rate),
+                total = COALESCE($6, subtotal) * (1 + COALESCE($7, tax_rate) / 100),
+                reconciliation_state = COALESCE($8, reconciliation_state),
+                notes = COALESCE($9, notes)
                WHERE id = $1 
-               RETURNING id, destination_id, invoice_number, order_number, invoice_date, 
+               RETURNING id, destination_id, invoice_number, order_number, invoice_date, delivery_date,
                          subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at"#,
             id,
             data.invoice_number,
             data.order_number,
             data.invoice_date,
+            data.delivery_date,
             data.subtotal,
             data.tax_rate,
             data.reconciliation_state,
@@ -1339,6 +1350,7 @@ pub async fn get_invoice_with_destination(
             inv.invoice_number,
             inv.order_number,
             inv.invoice_date,
+            inv.delivery_date,
             inv.subtotal,
             inv.tax_rate,
             inv.total,
@@ -1364,7 +1376,7 @@ pub async fn get_invoice_with_destination(
         LEFT JOIN purchases p ON p.invoice_id = inv.id
         WHERE inv.id = $1
         GROUP BY inv.id, inv.destination_id, d.code, d.name, inv.invoice_number, inv.order_number,
-                 inv.invoice_date, inv.subtotal, inv.tax_rate, inv.total, inv.reconciliation_state, inv.original_pdf, inv.notes, inv.created_at, inv.updated_at"#,
+                 inv.invoice_date, inv.delivery_date, inv.subtotal, inv.tax_rate, inv.total, inv.reconciliation_state, inv.original_pdf, inv.notes, inv.created_at, inv.updated_at"#,
         id
     )
     .fetch_optional(pool)
@@ -1408,6 +1420,7 @@ pub async fn get_invoices_with_destination(
             inv.invoice_number,
             inv.order_number,
             inv.invoice_date,
+            inv.delivery_date,
             inv.subtotal,
             inv.tax_rate,
             inv.total,
@@ -1432,7 +1445,7 @@ pub async fn get_invoices_with_destination(
         JOIN destinations d ON d.id = inv.destination_id
         LEFT JOIN purchases p ON p.invoice_id = inv.id
         GROUP BY inv.id, inv.destination_id, d.code, d.name, inv.invoice_number, inv.order_number,
-                 inv.invoice_date, inv.subtotal, inv.tax_rate, inv.total, inv.reconciliation_state, inv.original_pdf, inv.notes, inv.created_at, inv.updated_at
+                 inv.invoice_date, inv.delivery_date, inv.subtotal, inv.tax_rate, inv.total, inv.reconciliation_state, inv.original_pdf, inv.notes, inv.created_at, inv.updated_at
         ORDER BY inv.invoice_date DESC"#
     )
     .fetch_all(pool)
@@ -1454,6 +1467,13 @@ pub async fn get_purchases_by_invoice(
                FROM purchase_allocations pa
                GROUP BY pa.purchase_id
            ),
+           bonus_sums AS (
+               SELECT b.bonus_for_purchase_id AS parent_id,
+                      SUM(b.quantity * COALESCE(b.invoice_unit_price, 0)) AS bonus_selling
+               FROM purchases b
+               WHERE b.purchase_type = 'bonus' AND b.bonus_for_purchase_id IS NOT NULL
+               GROUP BY b.bonus_for_purchase_id
+           ),
            purchase_rows AS (
                SELECT
                    p.id AS purchase_id,
@@ -1467,6 +1487,9 @@ pub async fn get_purchases_by_invoice(
                    p.destination_id,
                    p.allow_receipt_date_override,
                    p.notes,
+                   p.refunds_purchase_id,
+                   p.purchase_type,
+                   p.bonus_for_purchase_id,
                    p.created_at,
                    CASE
                        WHEN alloc.allocated_qty = p.quantity
@@ -1474,9 +1497,11 @@ pub async fn get_purchases_by_invoice(
                             AND p.quantity > 0
                        THEN alloc.allocated_total_cost / p.quantity::numeric
                        ELSE p.purchase_cost
-                   END AS effective_purchase_cost
+                   END AS effective_purchase_cost,
+                   COALESCE(bs.bonus_selling, 0) AS bonus_selling
                FROM purchases p
                LEFT JOIN allocation_summary alloc ON alloc.purchase_id = p.id
+               LEFT JOIN bonus_sums bs ON bs.parent_id = p.id
                WHERE p.invoice_id = $1
            )
            SELECT
@@ -1490,19 +1515,34 @@ pub async fn get_purchases_by_invoice(
                pr.effective_purchase_cost AS "purchase_cost!",
                (pr.quantity * pr.effective_purchase_cost) AS total_cost,
                pr.invoice_unit_price,
-               (pr.quantity * pr.invoice_unit_price) AS total_selling,
+               CASE WHEN pr.bonus_for_purchase_id IS NOT NULL
+                   THEN (pr.quantity * pr.invoice_unit_price)
+                   ELSE (pr.quantity * pr.invoice_unit_price) + pr.bonus_selling
+               END AS total_selling,
                CASE
+                   WHEN pr.bonus_for_purchase_id IS NOT NULL THEN 0::numeric
+                   WHEN pr.purchase_type = 'bonus'
+                       THEN COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost
                    WHEN pr.effective_purchase_cost = 0 THEN NULL
                    ELSE (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost)
+                        + pr.bonus_selling / NULLIF(pr.quantity, 0)::numeric
                END AS unit_commission,
                CASE
+                   WHEN pr.bonus_for_purchase_id IS NOT NULL THEN 0::numeric
+                   WHEN pr.purchase_type = 'bonus'
+                       THEN (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
                    WHEN pr.effective_purchase_cost = 0 THEN NULL
                    ELSE (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
+                        + pr.bonus_selling
                END AS total_commission,
                (pr.quantity * pr.effective_purchase_cost * 0.13) AS tax_paid,
                CASE
+                   WHEN pr.bonus_for_purchase_id IS NOT NULL THEN 0::numeric
+                   WHEN pr.purchase_type = 'bonus'
+                       THEN (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) * 0.13)
                    WHEN pr.effective_purchase_cost = 0 THEN NULL
-                   ELSE (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) * 0.13)
+                   ELSE ((pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
+                        + pr.bonus_selling) * 0.13
                END AS tax_owed,
                pr.status AS "status!: DeliveryStatus",
                pr.delivery_date,
@@ -1511,7 +1551,10 @@ pub async fn get_purchases_by_invoice(
                r.receipt_number AS "receipt_number?",
                inv.invoice_number AS "invoice_number?",
                pr.allow_receipt_date_override AS "allow_receipt_date_override!",
-               pr.notes
+               pr.notes,
+               pr.refunds_purchase_id,
+               pr.purchase_type,
+               pr.bonus_for_purchase_id
            FROM purchase_rows pr
            LEFT JOIN items i ON i.id = pr.item_id
            LEFT JOIN receipts r ON r.id = pr.resolved_receipt_id
@@ -1537,7 +1580,7 @@ pub async fn get_all_purchases(
         Purchase,
         r#"SELECT p.id, p.item_id, p.invoice_id, p.receipt_id, p.quantity, p.purchase_cost, p.invoice_unit_price,
                   p.destination_id, p.status as "status: DeliveryStatus", 
-                  p.delivery_date, p.notes, p.created_at, p.updated_at
+                  p.delivery_date, p.notes, p.refunds_purchase_id, p.purchase_type, p.bonus_for_purchase_id, p.created_at, p.updated_at
            FROM purchases p
            LEFT JOIN receipts r ON r.id = p.receipt_id
            WHERE ($1::delivery_status IS NULL OR p.status = $1)
@@ -1565,7 +1608,7 @@ pub async fn get_purchase_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Purcha
         Purchase,
         r#"SELECT id, item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price,
                   destination_id, status as "status: DeliveryStatus", 
-                  delivery_date, notes, created_at, updated_at
+                  delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, created_at, updated_at
            FROM purchases WHERE id = $1"#,
         id
     )
@@ -1631,6 +1674,7 @@ pub async fn create_purchase_allocation(
                   p.id,
                   p.item_id,
                   p.quantity,
+                  p.purchase_type,
                   p.allow_receipt_date_override,
                 inv.invoice_date AS "invoice_date?"
               FROM purchases p
@@ -1641,6 +1685,18 @@ pub async fn create_purchase_allocation(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| PurchaseAllocationError::NotFound("Purchase not found".to_string()))?;
+
+    if purchase.purchase_type == "bonus" {
+        return Err(PurchaseAllocationError::Validation(
+            "Bonus purchases cannot be allocated to receipts".to_string(),
+        ));
+    }
+
+    if purchase.quantity < 0 {
+        return Err(PurchaseAllocationError::Validation(
+            "Cannot create allocations for refund purchases (negative quantity). Link via refunds_purchase_id instead.".to_string(),
+        ));
+    }
 
     let receipt_line = sqlx::query!(
           r#"SELECT
@@ -2213,8 +2269,9 @@ pub async fn auto_allocate_purchase(
               p.id,
               p.item_id,
               p.quantity,
+              p.purchase_type,
               p.allow_receipt_date_override,
-                  inv.invoice_date AS "invoice_date?"
+                  COALESCE(inv.delivery_date, inv.invoice_date) AS "invoice_date?"
            FROM purchases p
            LEFT JOIN invoices inv ON inv.id = p.invoice_id
            WHERE p.id = $1"#,
@@ -2223,6 +2280,12 @@ pub async fn auto_allocate_purchase(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| PurchaseAllocationError::NotFound("Purchase not found".to_string()))?;
+
+    if purchase.purchase_type == "bonus" {
+        return Err(PurchaseAllocationError::Validation(
+            "Bonus purchases cannot be allocated to receipts".to_string(),
+        ));
+    }
 
     let effective_allow_receipt_date_override =
         allow_receipt_date_override || purchase.allow_receipt_date_override;
@@ -2407,10 +2470,18 @@ pub async fn create_purchase(
         None
     };
 
+    let purchase_type = data.purchase_type.unwrap_or_else(|| "unit".to_string());
+
+    if purchase_type == "bonus" && data.bonus_for_purchase_id.is_none() {
+        return Err(purchase_link_required_error(
+            "Bonus purchases must be linked to a parent purchase.",
+        ));
+    }
+
     let purchase = sqlx::query_as!(
         Purchase,
-                    r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price, destination_id, status, delivery_date, notes, created_at, updated_at) 
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price, destination_id, status, delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, created_at, updated_at) 
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                                      COALESCE((SELECT invoice_date::timestamptz FROM invoices WHERE id = $2),
                                                         (SELECT receipt_date::timestamptz FROM receipts WHERE id = $3),
                                                         TIMESTAMPTZ '1970-01-01 00:00:00+00'),
@@ -2419,7 +2490,7 @@ pub async fn create_purchase(
                                                         TIMESTAMPTZ '1970-01-01 00:00:00+00')) 
               RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price,
                      destination_id, status as "status: DeliveryStatus", 
-                     delivery_date, notes, created_at, updated_at"#,
+                     delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, created_at, updated_at"#,
         data.item_id,
         data.invoice_id,
         data.receipt_id,
@@ -2429,7 +2500,10 @@ pub async fn create_purchase(
         data.destination_id,
         status as DeliveryStatus,
         data.delivery_date,
-        data.notes
+        data.notes,
+        data.refunds_purchase_id,
+        purchase_type,
+        data.bonus_for_purchase_id
     )
     .fetch_one(pool)
     .await?;
@@ -2527,6 +2601,23 @@ pub async fn update_purchase(
         let status = data.status.unwrap_or(old_purchase.status.clone());
         let delivery_date = data.delivery_date.or(old_purchase.delivery_date);
         let notes = data.notes.or(old_purchase.notes.clone());
+        let refunds_purchase_id = if data.clear_refunds_purchase {
+            None
+        } else {
+            data.refunds_purchase_id.or(old_purchase.refunds_purchase_id)
+        };
+        let purchase_type = data.purchase_type.unwrap_or_else(|| old_purchase.purchase_type.clone());
+        let bonus_for_purchase_id = if data.clear_bonus_for_purchase {
+            None
+        } else {
+            data.bonus_for_purchase_id.or(old_purchase.bonus_for_purchase_id)
+        };
+
+        if purchase_type == "bonus" && bonus_for_purchase_id.is_none() {
+            return Err(purchase_link_required_error(
+                "Bonus purchases must be linked to a parent purchase.",
+            ));
+        }
 
         let purchase = sqlx::query_as!(
             Purchase,
@@ -2540,11 +2631,14 @@ pub async fn update_purchase(
                 destination_id = $8,
                 status = $9,
                 delivery_date = $10,
-                notes = $11
+                notes = $11,
+                refunds_purchase_id = $12,
+                purchase_type = $13,
+                bonus_for_purchase_id = $14
                WHERE id = $1 
                RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price,
                          destination_id, status as "status: DeliveryStatus", 
-                         delivery_date, notes, created_at, updated_at"#,
+                         delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, created_at, updated_at"#,
             id,
             item_id,
             invoice_id,
@@ -2555,7 +2649,10 @@ pub async fn update_purchase(
             destination_id,
             status as DeliveryStatus,
             delivery_date,
-            notes
+            notes,
+            refunds_purchase_id,
+            purchase_type,
+            bonus_for_purchase_id
         )
         .fetch_optional(pool)
         .await?;
@@ -2601,7 +2698,7 @@ pub async fn update_purchase_status(
                WHERE id = $1 
                RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price,
                          destination_id, status as "status: DeliveryStatus", 
-                         delivery_date, notes, created_at, updated_at"#,
+                         delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, created_at, updated_at"#,
             id,
             status as DeliveryStatus
         )
@@ -2690,7 +2787,10 @@ pub async fn get_purchase_economics(
             pe.receipt_number,
             pe.invoice_number,
             p.allow_receipt_date_override AS "allow_receipt_date_override!",
-            pe.notes
+            pe.notes,
+            p.refunds_purchase_id,
+            pe.purchase_type,
+            p.bonus_for_purchase_id
         FROM v_purchase_economics pe
         JOIN purchases p ON p.id = pe.purchase_id
         LEFT JOIN receipts r ON r.id = p.receipt_id
@@ -3295,6 +3395,9 @@ pub async fn get_purchases_by_receipt(
                    inv.invoice_number,
                    p.allow_receipt_date_override,
                    p.notes,
+                   p.refunds_purchase_id,
+                   p.purchase_type,
+                   p.bonus_for_purchase_id,
                    p.created_at AS sort_created_at
                FROM purchase_allocations pa
                JOIN purchases p ON p.id = pa.purchase_id
@@ -3336,6 +3439,9 @@ pub async fn get_purchases_by_receipt(
                    inv.invoice_number,
                    p.allow_receipt_date_override,
                    p.notes,
+                   p.refunds_purchase_id,
+                   p.purchase_type,
+                   p.bonus_for_purchase_id,
                    p.created_at AS sort_created_at
                FROM purchases p
                JOIN receipts r ON r.id = p.receipt_id
@@ -3374,7 +3480,10 @@ pub async fn get_purchases_by_receipt(
                c.receipt_number AS "receipt_number?",
                c.invoice_number AS "invoice_number?",
                c.allow_receipt_date_override AS "allow_receipt_date_override!",
-               c.notes
+               c.notes,
+               c.refunds_purchase_id,
+               c.purchase_type,
+               c.bonus_for_purchase_id
            FROM (
                SELECT * FROM allocation_rows
                UNION ALL
@@ -3403,6 +3512,13 @@ pub async fn get_purchases_by_item(
                FROM purchase_allocations pa
                GROUP BY pa.purchase_id
            ),
+           bonus_sums AS (
+               SELECT b.bonus_for_purchase_id AS parent_id,
+                      SUM(b.quantity * COALESCE(b.invoice_unit_price, 0)) AS bonus_selling
+               FROM purchases b
+               WHERE b.purchase_type = 'bonus' AND b.bonus_for_purchase_id IS NOT NULL
+               GROUP BY b.bonus_for_purchase_id
+           ),
            purchase_rows AS (
                SELECT
                    p.id AS purchase_id,
@@ -3416,6 +3532,9 @@ pub async fn get_purchases_by_item(
                    p.destination_id,
                    p.allow_receipt_date_override,
                    p.notes,
+                   p.refunds_purchase_id,
+                   p.purchase_type,
+                   p.bonus_for_purchase_id,
                    p.created_at,
                    CASE
                        WHEN alloc.allocated_qty = p.quantity
@@ -3423,9 +3542,11 @@ pub async fn get_purchases_by_item(
                             AND p.quantity > 0
                        THEN alloc.allocated_total_cost / p.quantity::numeric
                        ELSE p.purchase_cost
-                   END AS effective_purchase_cost
+                   END AS effective_purchase_cost,
+                   COALESCE(bs.bonus_selling, 0) AS bonus_selling
                FROM purchases p
                LEFT JOIN allocation_summary alloc ON alloc.purchase_id = p.id
+               LEFT JOIN bonus_sums bs ON bs.parent_id = p.id
                              WHERE p.item_id = $1
                                  AND (
                                          p.invoice_id IS NOT NULL
@@ -3444,19 +3565,34 @@ pub async fn get_purchases_by_item(
                pr.effective_purchase_cost AS "purchase_cost!",
                (pr.quantity * pr.effective_purchase_cost) AS total_cost,
                pr.invoice_unit_price,
-               (pr.quantity * pr.invoice_unit_price) AS total_selling,
+               CASE WHEN pr.bonus_for_purchase_id IS NOT NULL
+                   THEN (pr.quantity * pr.invoice_unit_price)
+                   ELSE (pr.quantity * pr.invoice_unit_price) + pr.bonus_selling
+               END AS total_selling,
                CASE
+                   WHEN pr.bonus_for_purchase_id IS NOT NULL THEN 0::numeric
+                   WHEN pr.purchase_type = 'bonus'
+                       THEN COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost
                    WHEN pr.effective_purchase_cost = 0 THEN NULL
                    ELSE (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost)
+                        + pr.bonus_selling / NULLIF(pr.quantity, 0)::numeric
                END AS unit_commission,
                CASE
+                   WHEN pr.bonus_for_purchase_id IS NOT NULL THEN 0::numeric
+                   WHEN pr.purchase_type = 'bonus'
+                       THEN (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
                    WHEN pr.effective_purchase_cost = 0 THEN NULL
                    ELSE (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
+                        + pr.bonus_selling
                END AS total_commission,
                (pr.quantity * pr.effective_purchase_cost * 0.13) AS tax_paid,
                CASE
+                   WHEN pr.bonus_for_purchase_id IS NOT NULL THEN 0::numeric
+                   WHEN pr.purchase_type = 'bonus'
+                       THEN (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) * 0.13)
                    WHEN pr.effective_purchase_cost = 0 THEN NULL
-                   ELSE (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) * 0.13)
+                   ELSE ((pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
+                        + pr.bonus_selling) * 0.13
                END AS tax_owed,
                pr.status AS "status!: DeliveryStatus",
                pr.delivery_date,
@@ -3465,7 +3601,10 @@ pub async fn get_purchases_by_item(
                r.receipt_number AS "receipt_number?",
                inv.invoice_number AS "invoice_number?",
                pr.allow_receipt_date_override AS "allow_receipt_date_override!",
-               pr.notes
+               pr.notes,
+               pr.refunds_purchase_id,
+               pr.purchase_type,
+               pr.bonus_for_purchase_id
            FROM purchase_rows pr
            LEFT JOIN items i ON i.id = pr.item_id
            LEFT JOIN receipts r ON r.id = pr.resolved_receipt_id
@@ -4776,6 +4915,11 @@ mod tests {
                 status: None,
                 delivery_date: None,
                 notes: Some("receipt-linked notes edit".to_string()),
+                refunds_purchase_id: None,
+                clear_refunds_purchase: false,
+                purchase_type: None,
+                bonus_for_purchase_id: None,
+                clear_bonus_for_purchase: false,
             },
             Uuid::new_v4(),
         )
@@ -5258,6 +5402,9 @@ mod tests {
                 status: Some(DeliveryStatus::Pending),
                 delivery_date: None,
                 notes: Some("invalid standalone purchase".to_string()),
+                refunds_purchase_id: None,
+                purchase_type: None,
+                bonus_for_purchase_id: None,
             },
             Uuid::new_v4(),
         )
@@ -5309,6 +5456,11 @@ mod tests {
                 status: None,
                 delivery_date: None,
                 notes: Some("attempt to orphan purchase".to_string()),
+                refunds_purchase_id: None,
+                clear_refunds_purchase: false,
+                purchase_type: None,
+                bonus_for_purchase_id: None,
+                clear_bonus_for_purchase: false,
             },
             Uuid::new_v4(),
         )
@@ -5352,6 +5504,7 @@ mod tests {
                 invoice_number: None,
                 order_number: None,
                 invoice_date: None,
+                delivery_date: None,
                 subtotal: Some(Decimal::new(13000, 2)),
                 tax_rate: None,
                 reconciliation_state: None,
@@ -5370,6 +5523,7 @@ mod tests {
                 invoice_number: None,
                 order_number: None,
                 invoice_date: None,
+                delivery_date: None,
                 subtotal: None,
                 tax_rate: None,
                 reconciliation_state: Some("reopened".to_string()),
@@ -5390,6 +5544,7 @@ mod tests {
                 invoice_number: None,
                 order_number: None,
                 invoice_date: None,
+                delivery_date: None,
                 subtotal: None,
                 tax_rate: None,
                 reconciliation_state: None,
@@ -5439,6 +5594,9 @@ mod tests {
                 status: Some(DeliveryStatus::Pending),
                 delivery_date: None,
                 notes: Some("should fail".to_string()),
+                refunds_purchase_id: None,
+                purchase_type: None,
+                bonus_for_purchase_id: None,
             },
             Uuid::new_v4(),
         )
@@ -5463,6 +5621,11 @@ mod tests {
                 status: None,
                 delivery_date: None,
                 notes: Some("edit should fail".to_string()),
+                refunds_purchase_id: None,
+                clear_refunds_purchase: false,
+                purchase_type: None,
+                bonus_for_purchase_id: None,
+                clear_bonus_for_purchase: false,
             },
             Uuid::new_v4(),
         )
@@ -5511,6 +5674,7 @@ mod tests {
                 invoice_number: None,
                 order_number: None,
                 invoice_date: None,
+                delivery_date: None,
                 subtotal: None,
                 tax_rate: None,
                 reconciliation_state: Some("reopened".to_string()),
@@ -5627,6 +5791,7 @@ mod tests {
                 invoice_number: None,
                 order_number: None,
                 invoice_date: None,
+                delivery_date: None,
                 subtotal: None,
                 tax_rate: None,
                 reconciliation_state: Some("locked".to_string()),
@@ -5714,6 +5879,7 @@ mod tests {
                 invoice_number: None,
                 order_number: None,
                 invoice_date: None,
+                delivery_date: None,
                 subtotal: None,
                 tax_rate: None,
                 reconciliation_state: Some("locked".to_string()),
@@ -5763,6 +5929,7 @@ mod tests {
                 quantity: 1,
                 unit_cost: Decimal::new(12345, 2),
                 notes: Some("should fail".to_string()),
+                parent_line_item_id: None,
             },
         )
         .await
