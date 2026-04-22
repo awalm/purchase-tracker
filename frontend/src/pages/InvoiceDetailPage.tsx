@@ -853,6 +853,19 @@ export default function InvoiceDetailPage() {
 
       if (
         linkingPurchaseId === purchase.purchase_id &&
+        result.remaining_qty === 0 &&
+        !result.warning
+      ) {
+        setLinkDialogOpen(false)
+        setShowNewReceipt(false)
+        setLinkingPurchase(null)
+        setLinkingPurchaseId(null)
+        setAllocations([])
+        setAllocatableReceiptIds([])
+        resetAllocationForm()
+        setReconciliationActionNotice(`All ${purchase.quantity} units of ${purchase.item_name} fully allocated.`)
+      } else if (
+        linkingPurchaseId === purchase.purchase_id &&
         (result.remaining_qty > 0 || Boolean(result.warning))
       ) {
         setAllocationWarning(notice)
@@ -1098,7 +1111,8 @@ export default function InvoiceDetailPage() {
   const hasAnyPrice = purchases.some((p) => p.invoice_unit_price !== null)
   const receiptedCount = purchases.filter((p) => {
     const allocs = getEffectiveAllocations(p)
-    return Boolean(p.receipt_id) || allocs.length > 0
+    const allocatedQty = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
+    return Boolean(p.receipt_id) || allocatedQty >= p.quantity
   }).length
 
   const lineItemAssessments = purchases.map((purchase) => {

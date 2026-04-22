@@ -441,6 +441,7 @@ pub struct CreateInvoiceFromPdfRequest {
     pub destination_id: Uuid,
     pub invoice_number: String,
     pub invoice_date: String,
+    pub delivery_date: Option<String>,
     pub subtotal: String,
     pub tax_rate: Option<String>,
     pub notes: Option<String>,

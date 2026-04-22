@@ -58,11 +58,15 @@ def parse_all_money(text: str) -> list[str]:
 def parse_amount_from_keyword_window(texts: list[str], keyword: str) -> str | None:
     candidate_values: list[float] = []
     for i, t in enumerate(texts):
-        if keyword not in t.lower():
+        low = t.lower()
+        if keyword not in low:
+            continue
+        # "total" keyword should not match "subtotal" lines
+        if keyword == "total" and "subtotal" in low:
             continue
 
         if keyword in ("tax", "subtotal"):
-            scan_order = [i, i - 1, i + 1, i + 2]
+            scan_order = [i, i + 1, i + 2, i - 1]
         else:  # total
             scan_order = [i, i + 1, i + 2, i + 3, i + 4, i + 5, i - 1]
 
@@ -718,6 +722,9 @@ def detect_vendor_name(texts: list[str]) -> str | None:
 def _extract_payment_brand(text: str) -> str | None:
     m = re.search(r"\b(amex|visa|mastercard|master|mc|debit|credit)\b", text, re.IGNORECASE)
     if not m:
+        # Check for "American Express" as a multi-word brand name
+        if re.search(r"american\s+express", text, re.IGNORECASE):
+            return "Amex"
         return None
 
     raw = m.group(1)
@@ -764,7 +771,7 @@ def extract_payment_method(texts: list[str]) -> str | None:
 
         brand = _extract_payment_brand(t)
         if not brand:
-            for j in range(max(0, i - 2), min(len(texts), i + 2)):
+            for j in range(max(0, i - 3), min(len(texts), i + 4)):
                 brand = _extract_payment_brand(texts[j])
                 if brand:
                     break
@@ -1808,7 +1815,16 @@ def extract_structured(lines: list[dict[str, Any]]) -> dict[str, Any]:
         if subtotal is None and "subtotal" in low:
             subtotal = parse_money(t)
         if tax is None and ("tax" in low or "hst" in low or "gst" in low):
-            tax = parse_money(t)
+            # Skip the rate line itself if it contains "%;" grab the amount from nearby lines
+            if "%" in t:
+                idx = texts.index(t)
+                for offset in [1, 2]:
+                    if idx + offset < len(texts):
+                        tax = parse_money(texts[idx + offset])
+                        if tax:
+                            break
+            else:
+                tax = parse_money(t)
         if receipt_date is None:
             receipt_date = parse_date(t)
 

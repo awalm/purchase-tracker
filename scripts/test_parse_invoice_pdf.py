@@ -11,7 +11,7 @@ import pytest
 
 # Make the scripts dir importable
 sys.path.insert(0, os.path.dirname(__file__))
-from parse_invoice_pdf import _is_stop_row, _try_parse_line_item, parse_invoice
+from parse_invoice_pdf import _is_stop_row, _try_parse_line_item, _expand_multiline_row, parse_invoice
 
 
 # ──────────────────────────────────────────────
@@ -288,3 +288,158 @@ class TestParseInvoicePdf:
     def test_notes_is_none_or_empty(self, parsed):
         """The remarks section in this PDF is empty."""
         assert parsed["notes"] is None or parsed["notes"] == ""
+
+
+# ──────────────────────────────────────────────
+#  _expand_multiline_row
+# ──────────────────────────────────────────────
+
+class TestExpandMultilineRow:
+    """Multi-line cell expansion tests (no PDF needed)."""
+
+    def test_single_line_passthrough(self):
+        cells = ["Widget", "3", "100.00", "300.00"]
+        rows = _expand_multiline_row(cells)
+        assert rows == [cells]
+
+    def test_two_items_packed(self):
+        cells = ["", "PS VR2\nPS5 Digital", "7\n1", "423.00\n453.00", "2961.00\n453.00", ""]
+        rows = _expand_multiline_row(cells)
+        assert len(rows) == 2
+        assert rows[0] == ["", "PS VR2", "7", "423.00", "2961.00", ""]
+        assert rows[1] == ["", "PS5 Digital", "1", "453.00", "453.00", ""]
+
+    def test_empty_cells_no_crash(self):
+        rows = _expand_multiline_row(["", "", ""])
+        assert rows == [["", "", ""]]
+
+    def test_expanded_rows_parse_as_items(self):
+        """Expanded multi-line rows should each parse as valid line items."""
+        cells = ["", "PS VR2\nPS5 Digital", "7\n1", "423.00\n453.00", "2961.00\n453.00", ""]
+        rows = _expand_multiline_row(cells)
+        items = [_try_parse_line_item(r) for r in rows]
+        assert items[0] is not None
+        assert items[0]["description"] == "PS VR2"
+        assert items[0]["qty"] == 7
+        assert items[1] is not None
+        assert items[1]["description"] == "PS5 Digital"
+        assert items[1]["qty"] == 1
+
+
+# ──────────────────────────────────────────────
+#  parse_invoice — Invoice #6 (multi-line cells, YYYY-MM-DD date)
+# ──────────────────────────────────────────────
+
+SAMPLE_PDF_6 = os.path.join(
+    os.path.dirname(__file__),
+    "..", "references", "Invoice # 6 - PAID - Invoice Template.pdf"
+)
+
+
+@pytest.mark.skipif(
+    not os.path.exists(SAMPLE_PDF_6),
+    reason="Invoice #6 PDF not found"
+)
+class TestParseInvoice6:
+    """Integration tests against Invoice #6 — multi-line cells + YYYY-MM-DD date."""
+
+    @pytest.fixture(scope="class")
+    def parsed(self):
+        return parse_invoice(SAMPLE_PDF_6)
+
+    def test_invoice_number(self, parsed):
+        assert parsed["invoice_number"] == "6"
+
+    def test_invoice_date(self, parsed):
+        assert parsed["invoice_date"] == "2025-11-25"
+
+    def test_bill_to_contains_company(self, parsed):
+        assert "BSC Canada" in parsed["bill_to"]
+
+    def test_bill_to_contains_name(self, parsed):
+        assert "Abid Manji" in parsed["bill_to"]
+
+    def test_seven_line_items(self, parsed):
+        """Must extract all 7 items including those packed in multi-line cells."""
+        assert len(parsed["line_items"]) == 7
+
+    def test_echo_dot_blue(self, parsed):
+        item = parsed["line_items"][0]
+        assert item["description"] == "Echo Dot Blue"
+        assert item["qty"] == 28
+        assert item["unit_price"] == "42.00"
+        assert item["subtotal"] == "1176.00"
+
+    def test_echo_dot_black(self, parsed):
+        item = parsed["line_items"][1]
+        assert item["description"] == "Echo Dot Black"
+        assert item["qty"] == 51
+        assert item["unit_price"] == "42.00"
+        assert item["subtotal"] == "2142.00"
+
+    def test_echo_dot_white(self, parsed):
+        item = parsed["line_items"][2]
+        assert item["description"] == "Echo Dot White"
+        assert item["qty"] == 14
+        assert item["unit_price"] == "42.00"
+        assert item["subtotal"] == "588.00"
+
+    def test_ps_vr2(self, parsed):
+        """PS VR2 packed in multi-line cell with PS5 Digital 825GB."""
+        item = parsed["line_items"][3]
+        assert item["description"] == "PS VR2"
+        assert item["qty"] == 7
+        assert item["unit_price"] == "423.00"
+        assert item["subtotal"] == "2961.00"
+
+    def test_ps5_digital_825gb(self, parsed):
+        """PS5 Digital 825GB packed in multi-line cell with PS VR2."""
+        item = parsed["line_items"][4]
+        assert item["description"] == "PS5 Digital 825GB"
+        assert item["qty"] == 1
+        assert item["unit_price"] == "453.00"
+        assert item["subtotal"] == "453.00"
+
+    def test_ps5_digital_cfi2015(self, parsed):
+        item = parsed["line_items"][5]
+        assert item["description"] == "PS5 Digital CFI-2015"
+        assert item["qty"] == 2
+        assert item["unit_price"] == "453.00"
+        assert item["subtotal"] == "906.00"
+
+    def test_ps5_disc_fortnite(self, parsed):
+        item = parsed["line_items"][6]
+        assert item["description"] == "PS5 Disc 1TB Fortnite"
+        assert item["qty"] == 4
+        assert item["unit_price"] == "530.00"
+        assert item["subtotal"] == "2120.00"
+
+    def test_no_zero_items(self, parsed):
+        for item in parsed["line_items"]:
+            assert float(item["subtotal"]) > 0
+            assert item["qty"] >= 1
+
+    def test_math_correct_for_all_items(self, parsed):
+        for item in parsed["line_items"]:
+            expected = item["qty"] * float(item["unit_price"])
+            assert abs(expected - float(item["subtotal"])) < 0.02
+
+    def test_subtotal(self, parsed):
+        assert parsed["subtotal"] == "10346.00"
+
+    def test_tax_rate(self, parsed):
+        assert parsed["tax_rate"] == "13.00"
+
+    def test_tax_amount(self, parsed):
+        assert parsed["tax_amount"] == "1344.98"
+
+    def test_total(self, parsed):
+        assert parsed["total"] == "11690.98"
+
+    def test_total_equals_subtotal_plus_tax(self, parsed):
+        expected = float(parsed["subtotal"]) + float(parsed["tax_amount"])
+        assert abs(expected - float(parsed["total"])) < 0.01
+
+    def test_line_items_sum_to_subtotal(self, parsed):
+        items_total = sum(float(item["subtotal"]) for item in parsed["line_items"])
+        assert abs(items_total - float(parsed["subtotal"])) < 0.01

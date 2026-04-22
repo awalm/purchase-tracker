@@ -49,6 +49,8 @@ import {
 } from "@/components/ui/select"
 import { Plus, Trash2, CheckCircle2, AlertCircle, Clock, Upload, FileText, FileDown, Loader2, Scissors, X } from "lucide-react"
 import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
+import { getAutoMatchedItemId } from "@/lib/receiptImportHelpers"
+import { rememberVendorItemMappings } from "@/lib/vendorItemMappingCache"
 
 interface Invoice {
   id: string
@@ -187,6 +189,7 @@ export default function InvoicesPage() {
   const [linePurchaseTypes, setLinePurchaseTypes] = useState<Record<number, string>>({})
   const [pdfInvoiceNumber, setPdfInvoiceNumber] = useState("")
   const [pdfInvoiceDate, setPdfInvoiceDate] = useState("")
+  const [pdfDeliveryDate, setPdfDeliveryDate] = useState("")
   const [confirmPdfCloseOpen, setConfirmPdfCloseOpen] = useState(false)
 
   const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -207,6 +210,7 @@ export default function InvoicesPage() {
       setParsedInvoice(result)
       setPdfInvoiceNumber(result.invoice_number || "")
       setPdfInvoiceDate(result.invoice_date || "")
+      setPdfDeliveryDate(result.invoice_date || "")
       // Default destination to BSC if available
       const bsc = destinations.find(d => d.code.toUpperCase() === "BSC")
       if (bsc) setPdfDestinationId(bsc.id)
@@ -217,11 +221,20 @@ export default function InvoicesPage() {
     }
   }
 
-  // Resolve item for a line item: override → name match → null
+  // Build auto-match context for invoice line items (uses "__invoice__" as scope key)
+  const invoiceAutoMatchCtx = React.useMemo(() => ({
+    vendorId: "__invoice__",
+    items: activeItems.map(ai => ({ id: ai.id, name: ai.name })),
+    itemIdSet: new Set(activeItems.map(ai => ai.id)),
+  }), [activeItems])
+
+  // Resolve item for a line item: override → learned cache → name/fuzzy match → null
   const resolveItem = (li: ParsedInvoice["line_items"][0], idx: number) => {
     const overrideId = lineItemOverrides[idx]
     if (overrideId) return activeItems.find(ai => ai.id === overrideId) ?? null
-    return activeItems.find(ai => ai.name.toLowerCase() === li.description.toLowerCase()) ?? null
+    const matchedId = getAutoMatchedItemId(invoiceAutoMatchCtx, li.description)
+    if (matchedId) return activeItems.find(ai => ai.id === matchedId) ?? null
+    return null
   }
 
   // Check if a split line is fully resolved
@@ -243,8 +256,8 @@ export default function InvoicesPage() {
   const getLineItemSelectValue = (li: ParsedInvoice["line_items"][0], idx: number): string => {
     const overrideId = lineItemOverrides[idx]
     if (overrideId) return overrideId
-    const autoMatch = activeItems.find(ai => ai.name.toLowerCase() === li.description.toLowerCase())
-    return autoMatch ? autoMatch.id : "__none__"
+    const matchedId = getAutoMatchedItemId(invoiceAutoMatchCtx, li.description)
+    return matchedId ?? "__none__"
   }
 
   const unresolvedLineCount = parsedInvoice
@@ -392,15 +405,31 @@ export default function InvoicesPage() {
         }
       })
 
-      await importApi.invoicePdfCommit(pdfFile, {
+      const commitResult = await importApi.invoicePdfCommit(pdfFile, {
         destination_id: pdfDestinationId,
         invoice_number: invoiceNumber,
         invoice_date: invoiceDate,
+        delivery_date: pdfDeliveryDate || undefined,
         subtotal: invoiceSubtotal,
         tax_rate: parsedInvoice.tax_rate || undefined,
         notes: parsedInvoice.notes || undefined,
         line_items: lineItems,
       })
+
+      // Persist learned mappings for future invoice imports
+      const learnedMappings: Array<{ sourceText: string; itemId: string }> = []
+      for (const li of lineItems) {
+        if (li.splits && li.splits.length > 0) {
+          for (const s of li.splits) {
+            if (s.item_id) learnedMappings.push({ sourceText: li.description, itemId: s.item_id })
+          }
+        } else if (li.item_id) {
+          learnedMappings.push({ sourceText: li.description, itemId: li.item_id })
+        }
+      }
+      if (learnedMappings.length > 0) {
+        rememberVendorItemMappings("__invoice__", learnedMappings)
+      }
 
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["invoices"] }),
@@ -422,6 +451,9 @@ export default function InvoicesPage() {
       setLinePurchaseTypes({})
       setPdfInvoiceNumber("")
       setPdfInvoiceDate("")
+      setPdfDeliveryDate("")
+
+      navigate(`/invoices/${commitResult.invoice_id}`)
     } catch (err) {
       if (err instanceof ApiValidationError) {
         const details = err.details as InvoicePdfCommitErrorResponse
@@ -691,6 +723,7 @@ export default function InvoicesPage() {
               setLinePurchaseTypes({})
               setPdfInvoiceNumber("")
               setPdfInvoiceDate("")
+              setPdfDeliveryDate("")
               if (fileInputRef.current) fileInputRef.current.value = ""
             }
           }}>
@@ -712,6 +745,7 @@ export default function InvoicesPage() {
               setLinePurchaseTypes({})
               setPdfInvoiceNumber("")
               setPdfInvoiceDate("")
+              setPdfDeliveryDate("")
               if (fileInputRef.current) fileInputRef.current.value = ""
             }}
           />
@@ -721,7 +755,7 @@ export default function InvoicesPage() {
                 Import from PDF
               </Button>
             </DialogTrigger>
-            <DialogContent className="max-w-lg">
+            <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>Import Invoice from PDF</DialogTitle>
               </DialogHeader>
@@ -794,7 +828,19 @@ export default function InvoicesPage() {
                           type="date"
                           className="w-40 h-7 text-sm text-right"
                           value={pdfInvoiceDate}
-                          onChange={(e) => setPdfInvoiceDate(e.target.value)}
+                          onChange={(e) => {
+                            setPdfInvoiceDate(e.target.value)
+                            if (pdfDeliveryDate <= pdfInvoiceDate) setPdfDeliveryDate(e.target.value)
+                          }}
+                        />
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-muted-foreground">Delivery Date</span>
+                        <Input
+                          type="date"
+                          className="w-40 h-7 text-sm text-right"
+                          value={pdfDeliveryDate}
+                          onChange={(e) => setPdfDeliveryDate(e.target.value)}
                         />
                       </div>
                       {parsedInvoice.bill_to && (
@@ -912,8 +958,8 @@ export default function InvoicesPage() {
                                                 if (v === "__none__") {
                                                   delete next[i]
                                                 } else {
-                                                  const autoMatch = activeItems.find(ai => ai.name.toLowerCase() === item.description.toLowerCase())
-                                                  if (autoMatch && autoMatch.id === v) delete next[i]
+                                                  const autoMatch = getAutoMatchedItemId(invoiceAutoMatchCtx, item.description)
+                                                  if (autoMatch && autoMatch === v) delete next[i]
                                                   else next[i] = v
                                                 }
                                                 return next

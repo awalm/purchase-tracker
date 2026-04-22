@@ -1103,6 +1103,7 @@ export interface InvoicePdfCommitPayload {
   destination_id: string;
   invoice_number: string;
   invoice_date: string;
+  delivery_date?: string;
   subtotal: string;
   tax_rate?: string;
   notes?: string;

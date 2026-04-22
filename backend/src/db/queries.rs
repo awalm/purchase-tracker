@@ -1365,11 +1365,7 @@ pub async fn get_invoice_with_destination(
             COALESCE((SELECT SUM(rp.quantity * (COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost) - rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS total_commission,
             COUNT(p.id) FILTER (
                 WHERE p.receipt_id IS NOT NULL
-                   OR EXISTS (
-                       SELECT 1
-                       FROM purchase_allocations pa
-                       WHERE pa.purchase_id = p.id
-                   )
+                   OR COALESCE((SELECT SUM(pa.allocated_qty) FROM purchase_allocations pa WHERE pa.purchase_id = p.id), 0) >= p.quantity
             ) AS receipted_count
         FROM invoices inv
         JOIN destinations d ON d.id = inv.destination_id
@@ -1435,11 +1431,7 @@ pub async fn get_invoices_with_destination(
             COALESCE((SELECT SUM(rp.quantity * (COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost) - rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0) AS total_commission,
             COUNT(p.id) FILTER (
                 WHERE p.receipt_id IS NOT NULL
-                   OR EXISTS (
-                       SELECT 1
-                       FROM purchase_allocations pa
-                       WHERE pa.purchase_id = p.id
-                   )
+                   OR COALESCE((SELECT SUM(pa.allocated_qty) FROM purchase_allocations pa WHERE pa.purchase_id = p.id), 0) >= p.quantity
             ) AS receipted_count
         FROM invoices inv
         JOIN destinations d ON d.id = inv.destination_id

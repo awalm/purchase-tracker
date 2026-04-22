@@ -48,6 +48,27 @@ def _is_stop_row(joined: str) -> bool:
     return any(kw in lower for kw in _STOP_KEYWORDS)
 
 
+def _expand_multiline_row(cells: list) -> list[list]:
+    """Expand a table row where cells contain newlines into multiple rows.
+
+    Some PDFs pack multiple items into a single table row using \\n within
+    cells.  E.g. ['PS VR2\\nPS5 Digital', '7\\n1', '423.00\\n453.00', ...]
+    becomes two separate rows.  If no cell has a newline, returns [cells].
+    """
+    max_lines = max((c.count('\n') + 1 for c in cells if c), default=1)
+    if max_lines <= 1:
+        return [cells]
+
+    rows = []
+    for i in range(max_lines):
+        row = []
+        for c in cells:
+            parts = c.split('\n')
+            row.append(parts[i].strip() if i < len(parts) else "")
+        rows.append(row)
+    return rows
+
+
 def _try_parse_line_item(cells: list) -> dict | None:
     """Try to parse a table row into a line item.
 
@@ -135,13 +156,18 @@ def parse_invoice(path: str) -> dict:
     if m:
         result["invoice_number"] = m.group(1)
 
-    # --- Extract invoice date (MM/DD/YYYY) ---
-    m = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', full_text)
+    # --- Extract invoice date ---
+    # Try YYYY-MM-DD first, then MM/DD/YYYY
+    m = re.search(r'(\d{4}-\d{2}-\d{2})', full_text)
     if m:
-        parts = m.group(1).split('/')
-        if len(parts) == 3:
-            mm, dd, yyyy = parts
-            result["invoice_date"] = f"{yyyy}-{mm.zfill(2)}-{dd.zfill(2)}"
+        result["invoice_date"] = m.group(1)
+    else:
+        m = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', full_text)
+        if m:
+            parts = m.group(1).split('/')
+            if len(parts) == 3:
+                mm, dd, yyyy = parts
+                result["invoice_date"] = f"{yyyy}-{mm.zfill(2)}-{dd.zfill(2)}"
 
     # --- Extract BILL TO block ---
     m = re.search(r'BILL\s+TO\s*\n(.*?)(?=DESCRIPTION)', full_text, re.DOTALL)
@@ -149,13 +175,14 @@ def parse_invoice(path: str) -> dict:
         result["bill_to"] = m.group(1).strip()
 
     # --- Extract line items from table rows ---
-    # ONLY between DESCRIPTION header and first stop sentinel.
+    # Parse between DESCRIPTION/QTY header rows and stop sentinels.
+    # Supports multi-page invoices that repeat the header row.
     in_items = False
     for row in all_table_rows:
         cells = [c.strip() if c else "" for c in row]
         joined = " ".join(cells).strip()
 
-        # Detect header row — start parsing after this
+        # Detect header row — start/resume parsing after this
         if "DESCRIPTION" in joined and "QTY" in joined:
             in_items = True
             continue
@@ -163,14 +190,18 @@ def parse_invoice(path: str) -> dict:
         if not in_items:
             continue
 
-        # Stop at sentinel rows
+        # Stop at sentinel rows but allow resuming at next header
         if _is_stop_row(joined):
-            break
+            in_items = False
+            continue
 
-        # Try to parse; skip rows that don't match
-        item = _try_parse_line_item(cells)
-        if item:
-            result["line_items"].append(item)
+        # Expand multi-line cells: some PDFs pack multiple items into
+        # a single table row using newlines within cells.
+        expanded_rows = _expand_multiline_row(cells)
+        for exp_cells in expanded_rows:
+            item = _try_parse_line_item(exp_cells)
+            if item:
+                result["line_items"].append(item)
 
     # --- Extract subtotal, tax, total from text ---
     m = re.search(r'SUBTOTAL\s+(\$?[\d,]+\.?\d*)', full_text)
@@ -197,7 +228,7 @@ def parse_invoice(path: str) -> dict:
                     break
 
     if not result["total"]:
-        m = re.search(r'TOTAL\s*[-–—]?\s*\$?\s*([\d,]+\.?\d*)', full_text)
+        m = re.search(r'(?<!SUB)TOTAL\s*[-–—]?\s*\$?\s*([\d,]+\.?\d*)', full_text)
         if m:
             result["total"] = m.group(1).replace(',', '')
 

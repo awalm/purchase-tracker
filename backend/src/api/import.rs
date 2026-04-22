@@ -2331,6 +2331,10 @@ async fn commit_invoice_pdf(
         }
     };
 
+    let delivery_date = payload.delivery_date.as_deref().and_then(|s| {
+        if s.is_empty() { None } else { NaiveDate::parse_from_str(s, "%Y-%m-%d").ok() }
+    });
+
     let subtotal = match parse_decimal_input(&payload.subtotal) {
         Ok(v) => Some(v),
         Err(_) => {
@@ -2526,7 +2530,7 @@ async fn commit_invoice_pdf(
             destination_id: payload.destination_id,
             invoice_number: payload.invoice_number,
             invoice_date,
-            delivery_date: None,
+            delivery_date,
             subtotal,
             tax_rate,
             notes: payload.notes,
