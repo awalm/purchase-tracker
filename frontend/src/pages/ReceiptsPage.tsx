@@ -53,7 +53,7 @@ import { ConfirmCloseDialog } from "@/components/ConfirmCloseDialog"
 import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
 import { ReceiptImportLineTable } from "@/components/ReceiptImportLineTable"
 import { Plus, Trash2, Pencil, FileText, Upload, CheckCircle2, AlertCircle, Clock, Loader2 } from "lucide-react"
-import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
+import { formatCurrency, formatDate } from "@/lib/utils"
 import {
   findExistingReceiptByNumber,
   getImportSubtotalDifference,
@@ -62,6 +62,7 @@ import {
 import {
   getReceiptItemsDisplayCount,
   getReceiptReconciliationBadgeState,
+  getStoredExpectedTaxRate,
 } from "@/lib/receiptSummary"
 import { rememberVendorItemMappings } from "@/lib/vendorItemMappingCache"
 import {
@@ -82,13 +83,40 @@ type ImportNewItemTarget =
   | { kind: "parsed"; index: number }
   | { kind: "manual"; lineId: string }
 
-function ReconciliationBadge({ receipt }: { receipt: Receipt }) {
-  const badgeState = getReceiptReconciliationBadgeState(receipt)
+function ReconciliationBadge({ receipt, expectedTaxRate }: { receipt: Receipt; expectedTaxRate: number }) {
+  const badgeState = getReceiptReconciliationBadgeState(receipt, expectedTaxRate)
 
   if (badgeState.kind === "reconciled") {
     return (
       <span className="inline-flex items-center gap-1 text-xs font-medium text-green-600 bg-green-50 px-2 py-1 rounded-full">
         <CheckCircle2 className="h-3 w-3" />
+        {badgeState.label}
+      </span>
+    )
+  }
+
+  if (badgeState.kind === "ready-to-reconcile") {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-medium text-blue-700 bg-blue-50 px-2 py-1 rounded-full">
+        <Clock className="h-3 w-3" />
+        {badgeState.label}
+      </span>
+    )
+  }
+
+  if (badgeState.kind === "tax-math-error") {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-medium text-red-700 bg-red-50 px-2 py-1 rounded-full">
+        <AlertCircle className="h-3 w-3" />
+        {badgeState.label}
+      </span>
+    )
+  }
+
+  if (badgeState.kind === "unexpected-tax-rate") {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-medium text-orange-700 bg-orange-50 px-2 py-1 rounded-full">
+        <AlertCircle className="h-3 w-3" />
         {badgeState.label}
       </span>
     )
@@ -133,6 +161,8 @@ export default function ReceiptsPage() {
   const [confirmReceiptCloseOpen, setConfirmReceiptCloseOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [vendorFilter, setVendorFilter] = useState<string>("")
+  const [statusFilter, setStatusFilter] = useState<string>("")
+  const expectedTaxRate = getStoredExpectedTaxRate()
 
   const [isImportOpen, setIsImportOpen] = useState(false)
   const [confirmImportCloseOpen, setConfirmImportCloseOpen] = useState(false)
@@ -192,9 +222,16 @@ export default function ReceiptsPage() {
     return () => URL.revokeObjectURL(url)
   }, [importFile])
 
-  const filteredReceipts = vendorFilter
-    ? allReceipts.filter((r) => r.vendor_id === vendorFilter)
-    : allReceipts
+  const filteredReceipts = useMemo(() => {
+    let result = allReceipts
+    if (vendorFilter) {
+      result = result.filter((r) => r.vendor_id === vendorFilter)
+    }
+    if (statusFilter) {
+      result = result.filter((r) => getReceiptReconciliationBadgeState(r, expectedTaxRate).kind === statusFilter)
+    }
+    return result
+  }, [allReceipts, vendorFilter, statusFilter, expectedTaxRate])
 
   const duplicateImportedReceipt = useMemo(() => {
     return findExistingReceiptByNumber(allReceipts, importReceiptNumber)
@@ -575,9 +612,11 @@ export default function ReceiptsPage() {
 
   const totalReceipts = filteredReceipts.length
   const totalSpent = filteredReceipts.reduce((sum, r) => sum + parseFloat(r.total || "0"), 0)
+  const taxMathErrorCount = filteredReceipts.filter(r => getReceiptReconciliationBadgeState(r, expectedTaxRate).kind === "tax-math-error").length
+  const unexpectedTaxRateCount = filteredReceipts.filter(r => getReceiptReconciliationBadgeState(r, expectedTaxRate).kind === "unexpected-tax-rate").length
   const unreconciledCount = filteredReceipts.filter(r => {
-    const badgeState = getReceiptReconciliationBadgeState(r)
-    return badgeState.kind === "no-linked-purchases" || badgeState.kind === "issues"
+    const badgeState = getReceiptReconciliationBadgeState(r, expectedTaxRate)
+    return badgeState.kind === "tax-math-error" || badgeState.kind === "unexpected-tax-rate" || badgeState.kind === "no-linked-purchases" || badgeState.kind === "issues"
   }).length
 
   if (isLoading) return <div className="text-muted-foreground">Loading...</div>
@@ -594,7 +633,7 @@ export default function ReceiptsPage() {
               { header: "Vendor", accessor: (r) => r.vendor_name },
               { header: "Date", accessor: (r) => r.receipt_date },
               { header: "Subtotal", accessor: (r) => r.subtotal },
-              { header: "Tax Rate", accessor: (r) => formatNumber(r.tax_rate) },
+              { header: "Tax Amount", accessor: (r) => r.tax_amount },
               { header: "Total", accessor: (r) => r.total },
               { header: "Receipt Line Count", accessor: (r) => r.receipt_line_item_count },
               { header: "Purchase Count", accessor: (r) => r.purchase_count },
@@ -935,7 +974,7 @@ export default function ReceiptsPage() {
                 initialValues={editingReceipt ? {
                   vendor_id: editingReceipt.vendor_id, receipt_number: editingReceipt.receipt_number,
                   receipt_date: editingReceipt.receipt_date, subtotal: editingReceipt.subtotal,
-                  tax_amount: (parseFloat(editingReceipt.total) - parseFloat(editingReceipt.subtotal)).toFixed(2),
+                  tax_amount: editingReceipt.tax_amount,
                   payment_method: editingReceipt.payment_method || "", notes: editingReceipt.notes || "",
                 } : undefined}
                 requireDocument={!editingId}
@@ -954,10 +993,12 @@ export default function ReceiptsPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-5 gap-4">
         <Card><CardContent className="pt-6"><div className="text-2xl font-bold">{totalReceipts}</div><p className="text-sm text-muted-foreground">Total Receipts</p></CardContent></Card>
         <Card><CardContent className="pt-6"><div className="text-2xl font-bold">{formatCurrency(totalSpent.toFixed(2))}</div><p className="text-sm text-muted-foreground">Total Spent (incl. tax)</p></CardContent></Card>
         <Card><CardContent className="pt-6"><div className={`text-2xl font-bold ${unreconciledCount > 0 ? "text-amber-600" : "text-green-600"}`}>{unreconciledCount}</div><p className="text-sm text-muted-foreground">Unreconciled</p></CardContent></Card>
+        <Card><CardContent className="pt-6"><div className={`text-2xl font-bold ${taxMathErrorCount > 0 ? "text-red-600" : "text-green-600"}`}>{taxMathErrorCount}</div><p className="text-sm text-muted-foreground">Tax Math Errors</p></CardContent></Card>
+        <Card><CardContent className="pt-6"><div className={`text-2xl font-bold ${unexpectedTaxRateCount > 0 ? "text-orange-600" : "text-green-600"}`}>{unexpectedTaxRateCount}</div><p className="text-sm text-muted-foreground">Unexpected Tax Rate</p></CardContent></Card>
       </div>
 
       <Card>
@@ -970,6 +1011,22 @@ export default function ReceiptsPage() {
                 <SelectContent>
                   <SelectItem value="all">All vendors</SelectItem>
                   {vendors.map((v) => (<SelectItem key={v.id} value={v.id}>{v.name}</SelectItem>))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="w-48">
+              <Label className="mb-2 block">Status</Label>
+              <Select value={statusFilter || "all"} onValueChange={(v) => setStatusFilter(v === "all" ? "" : v)}>
+                <SelectTrigger><SelectValue placeholder="All statuses" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All statuses</SelectItem>
+                  <SelectItem value="tax-math-error">Tax Math Errors</SelectItem>
+                  <SelectItem value="unexpected-tax-rate">Unexpected Tax Rate</SelectItem>
+                  <SelectItem value="ready-to-reconcile">Ready to Reconcile</SelectItem>
+                  <SelectItem value="issues">Issues</SelectItem>
+                  <SelectItem value="no-linked-purchases">No Linked Purchases</SelectItem>
+                  <SelectItem value="no-receipt-lines">No Receipt Lines</SelectItem>
+                  <SelectItem value="reconciled">Reconciled</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -992,7 +1049,6 @@ export default function ReceiptsPage() {
             </TableHeader>
             <TableBody>
               {filteredReceipts.map((r) => {
-                const taxAmount = parseFloat(r.total || "0") - parseFloat(r.subtotal || "0")
                 const source = r.ingestion_metadata?.source || "manual"
                 const isAutoParsed = r.ingestion_metadata?.auto_parsed === true
                 return (
@@ -1006,10 +1062,10 @@ export default function ReceiptsPage() {
                       </span>
                     </TableCell>
                     <TableCell className="text-right">{formatCurrency(r.subtotal)}</TableCell>
-                    <TableCell className="text-right text-muted-foreground">{formatCurrency(taxAmount.toFixed(2))}</TableCell>
+                    <TableCell className="text-right text-muted-foreground">{formatCurrency(r.tax_amount)}</TableCell>
                     <TableCell className="text-right font-medium">{formatCurrency(r.total)}</TableCell>
                     <TableCell className="text-right">{getReceiptItemsDisplayCount(r)}</TableCell>
-                    <TableCell><ReconciliationBadge receipt={r} /></TableCell>
+                    <TableCell><ReconciliationBadge receipt={r} expectedTaxRate={expectedTaxRate} /></TableCell>
                     <TableCell>
                       {r.has_pdf ? (<FileText className="h-4 w-4 text-blue-600" />) : (
                         <button onClick={(e) => { e.stopPropagation(); handleUploadPdf(r.id) }} className="text-muted-foreground hover:text-foreground"><Upload className="h-4 w-4" /></button>

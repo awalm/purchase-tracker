@@ -241,7 +241,10 @@ struct BackupReceipt {
     receipt_number: String,
     receipt_date: NaiveDate,
     subtotal: Decimal,
-    tax_rate: Decimal,
+    #[serde(default)]
+    tax_amount: Option<Decimal>,
+    #[serde(default)]
+    tax_rate: Option<Decimal>, // legacy backups only — used as fallback if tax_amount missing
     payment_method: Option<String>,
     ingestion_metadata: Option<serde_json::Value>,
     notes: Option<String>,
@@ -440,7 +443,8 @@ async fn build_invoice_backup_zip(
             receipt_number: receipt.receipt_number,
             receipt_date: receipt.receipt_date,
             subtotal: receipt.subtotal,
-            tax_rate: receipt.tax_rate,
+            tax_amount: Some(receipt.tax_amount),
+            tax_rate: None,
             payment_method: receipt.payment_method,
             ingestion_metadata: receipt.ingestion_metadata,
             notes: receipt.notes,
@@ -894,6 +898,7 @@ async fn import_backup_zip_payload(
             invoice_date: bundle.invoice.invoice_date,
             delivery_date: bundle.invoice.delivery_date,
             subtotal: bundle.invoice.subtotal,
+            tax_amount: Some(bundle.invoice.subtotal * bundle.invoice.tax_rate / Decimal::new(100, 0)),
             tax_rate: Some(bundle.invoice.tax_rate),
             reconciliation_state: Some(bundle.invoice.reconciliation_state.clone()),
             notes: bundle.invoice.notes.clone(),
@@ -968,8 +973,10 @@ async fn import_backup_zip_payload(
                     receipt_number: candidate_number,
                     receipt_date: receipt.receipt_date,
                     subtotal: receipt.subtotal,
-                    tax_amount: None,
-                    tax_rate: Some(receipt.tax_rate),
+                    tax_amount: receipt.tax_amount.or_else(|| {
+                        receipt.tax_rate.map(|rate| receipt.subtotal * rate / Decimal::new(100, 0))
+                    }),
+                    tax_rate: receipt.tax_rate,
                     payment_method: receipt.payment_method.clone(),
                     ingestion_metadata: receipt.ingestion_metadata.clone(),
                     notes: receipt.notes.clone(),

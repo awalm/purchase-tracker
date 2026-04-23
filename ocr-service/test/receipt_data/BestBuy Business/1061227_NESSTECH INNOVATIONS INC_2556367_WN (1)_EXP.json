@@ -1,0 +1,33 @@
+{
+  "source_file": "1061227_NESSTECH INNOVATIONS INC_2556367_WN (1).PDF",
+  "content_type": "application/pdf",
+  "expected": {
+    "vendor_name": "Best Buy Business",
+    "receipt_number": "184319",
+    "receipt_date": "2025-11-26",
+    "subtotal": "239.94",
+    "tax": "31.19",
+    "total": "271.13",
+    "payment_method": null,
+    "line_items_count": 3,
+    "line_items_expected": [
+      {
+        "description_contains": "glacier white",
+        "quantity": 2,
+        "unit_cost": "39.99"
+      },
+      {
+        "description_contains": "charcoal",
+        "quantity": 2,
+        "unit_cost": "39.99"
+      },
+      {
+        "description_contains": "deep sea blue",
+        "quantity": 2,
+        "unit_cost": "39.99"
+      }
+    ],
+    "raw_text_contains": ["best buy", "invoice", "total"],
+    "warnings_contains": []
+  }
+}

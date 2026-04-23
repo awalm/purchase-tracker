@@ -390,6 +390,7 @@ export default function ItemDetailPage() {
                     requireAllocations: true,
                     allocationCount: allocs.length,
                     allocatedQty: totalAllocated,
+                    invoiceLocked: p.invoice_reconciliation_state === "locked",
                   })
 
                   return (
@@ -459,6 +460,10 @@ export default function ItemDetailPage() {
                       {reconciliation.isReconciled ? (
                         <span className="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">
                           Reconciled
+                        </span>
+                      ) : reconciliation.isReadyToReconcile ? (
+                        <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700">
+                          Ready to reconcile
                         </span>
                       ) : (
                         <div className="space-y-1">

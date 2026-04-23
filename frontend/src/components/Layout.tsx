@@ -9,6 +9,7 @@ import {
   ShoppingCart,
   Receipt,
   LogOut,
+  Settings,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -21,6 +22,7 @@ const navItems = [
   { to: "/items", icon: Package, label: "Items" },
   { to: "/vendors", icon: Store, label: "Vendors" },
   { to: "/destinations", icon: MapPin, label: "Destinations" },
+  { to: "/options", icon: Settings, label: "Options" },
 ]
 
 export function Layout({ children }: { children: React.ReactNode }) {

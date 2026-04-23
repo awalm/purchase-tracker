@@ -2532,6 +2532,7 @@ async fn commit_invoice_pdf(
             invoice_date,
             delivery_date,
             subtotal,
+            tax_amount: None,
             tax_rate,
             notes: payload.notes,
             pdf_data,

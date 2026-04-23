@@ -47,7 +47,7 @@ export interface Receipt {
   receipt_number: string;
   receipt_date: string;
   subtotal: string;
-  tax_rate: string;
+  tax_amount: string;
   total: string;
   notes: string | null;
   created_at: string;
@@ -84,7 +84,7 @@ export interface ReceiptWithVendor {
   receipt_number: string;
   receipt_date: string;
   subtotal: string;
-  tax_rate: string;
+  tax_amount: string;
   total: string;
   has_pdf: boolean | null;
   notes: string | null;
@@ -96,6 +96,7 @@ export interface ReceiptWithVendor {
   total_selling: string | null;
   total_commission: string | null;
   invoiced_count: number | null;
+  locked_purchase_count: number | null;
 }
 
 export type DeliveryStatus = 'pending' | 'in_transit' | 'delivered' | 'returned' | 'damaged' | 'lost';

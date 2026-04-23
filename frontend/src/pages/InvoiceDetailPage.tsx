@@ -84,6 +84,7 @@ export default function InvoiceDetailPage() {
   const [isImportingBackup, setIsImportingBackup] = useState(false)
   const [isSavingReconciliationState, setIsSavingReconciliationState] = useState(false)
   const [finalizeDialogOpen, setFinalizeDialogOpen] = useState(false)
+  const [finalizeDialogError, setFinalizeDialogError] = useState("")
   const [reconciliationActionError, setReconciliationActionError] = useState("")
   const [reconciliationActionNotice, setReconciliationActionNotice] = useState("")
   const [deletePurchaseDialogOpen, setDeletePurchaseDialogOpen] = useState(false)
@@ -129,13 +130,30 @@ export default function InvoiceDetailPage() {
     if (!id || !invoice || invoiceLocked || !canFinalize) return
 
     setReconciliationActionError("")
+    setFinalizeDialogError("")
     setFinalizeDialogOpen(true)
+  }
+
+  const formatFinalizeErrorMessage = (err: unknown): string => {
+    if (err instanceof ApiError) {
+      if (err.status === 422) {
+        return `Finalize blocked: ${err.message}`
+      }
+      return `Finalize failed (${err.status}): ${err.message}`
+    }
+
+    if (err instanceof Error) {
+      return `Finalize failed: ${err.message}`
+    }
+
+    return "Finalize failed due to an unexpected error."
   }
 
   const confirmFinalizeInvoice = async () => {
     if (!id || !invoice || invoiceLocked || !canFinalize) return
 
     setIsSavingReconciliationState(true)
+    setFinalizeDialogError("")
     try {
       await invoicesApi.update(id, { reconciliation_state: "locked" })
       setFinalizeDialogOpen(false)
@@ -143,9 +161,11 @@ export default function InvoiceDetailPage() {
       queryClient.invalidateQueries({ queryKey: ["invoices"] })
       queryClient.invalidateQueries({ queryKey: ["reports"] })
     } catch (err) {
-      setReconciliationActionError(
-        err instanceof Error ? err.message : "Failed to finalize invoice"
-      )
+      const message = formatFinalizeErrorMessage(err)
+      setFinalizeDialogError(message)
+      setReconciliationActionError(message)
+      queryClient.invalidateQueries({ queryKey: ["invoices", id] })
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
     } finally {
       setIsSavingReconciliationState(false)
     }
@@ -1134,12 +1154,13 @@ export default function InvoiceDetailPage() {
         allocatedQty,
         allocationReceiptDates: allocs.map((allocation) => allocation.receipt_date),
         allowReceiptDateOverride: Boolean(purchase.allow_receipt_date_override),
+        invoiceLocked: invoice.reconciliation_state === "locked",
       }),
     }
   })
 
   const unreconciledLineItems = lineItemAssessments.filter(
-    ({ assessment }) => !assessment.isReconciled
+    ({ assessment }) => !assessment.isReconciled && !assessment.isReadyToReconcile
   )
   const unreconciledLineItemCount = unreconciledLineItems.length
 
@@ -1169,7 +1190,15 @@ export default function InvoiceDetailPage() {
 
   return (
     <div className="space-y-6">
-      <Dialog open={finalizeDialogOpen} onOpenChange={setFinalizeDialogOpen}>
+      <Dialog
+        open={finalizeDialogOpen}
+        onOpenChange={(open) => {
+          setFinalizeDialogOpen(open)
+          if (!open) {
+            setFinalizeDialogError("")
+          }
+        }}
+      >
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle>Finalize Invoice</DialogTitle>
@@ -1181,6 +1210,11 @@ export default function InvoiceDetailPage() {
             <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-emerald-800">
               All {totalPurchases} line items are reconciled and ready to finalize.
             </div>
+            {finalizeDialogError && (
+              <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-red-700">
+                {finalizeDialogError}
+              </div>
+            )}
           </div>
           <div className="flex justify-end gap-2">
             <Button

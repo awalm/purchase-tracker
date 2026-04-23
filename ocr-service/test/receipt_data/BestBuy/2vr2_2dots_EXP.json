@@ -1,0 +1,30 @@
+{
+  "source_file": "2vr2_2dots.jpg",
+  "content_type": "image/jpeg",
+  "expected": {
+    "vendor_name": "Best Buy",
+    "receipt_number": "S188-R41-T2452_20251125",
+    "receipt_date": "2025-11-25",
+    "subtotal": "919.96",
+    "tax": "119.59",
+    "total": "1039.55",
+    "payment_method": "1003",
+    "line_items_count": 2,
+    "line_items_expected": [
+      {
+        "description_contains": "ps5 ur2 headset",
+        "quantity": 2,
+        "unit_cost": "419.99",
+        "line_total": "839.98"
+      },
+      {
+        "description_contains": "echo dot 5th char",
+        "quantity": 2,
+        "unit_cost": "39.99",
+        "line_total": "79.98"
+      }
+    ],
+    "raw_text_contains": ["echo dot", "headset", "subtotal", "tax hst"],
+    "warnings_contains": []
+  }
+}

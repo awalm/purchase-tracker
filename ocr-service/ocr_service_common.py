@@ -1404,7 +1404,7 @@ def extract_amazon_line_items(lines: list[dict[str, Any]]) -> list[dict[str, Any
             previous_asin_index = idx
             continue
 
-        window_start = max(previous_asin_index + 1, idx - 18)
+        window_start = max(previous_asin_index + 1, idx - 60)
         previous_asin_index = idx
 
         quantity: int | None = None
@@ -1479,7 +1479,11 @@ def extract_amazon_line_items(lines: list[dict[str, Any]]) -> list[dict[str, Any
 
         if not description:
             best_candidate: tuple[int, int, str, int] | None = None
-            for cursor in range(qty_line_index - 1, window_start - 1, -1):
+            # Limit description search to 15 lines back from the qty line to
+            # avoid picking up distant address/URL lines with high alpha-word counts.
+            # The wider window_start is only needed for the qty/price lookup above.
+            desc_window_start = max(window_start, qty_line_index - 15)
+            for cursor in range(qty_line_index - 1, desc_window_start - 1, -1):
                 candidate_raw = lines[cursor]["text"].strip()
                 if not candidate_raw:
                     continue

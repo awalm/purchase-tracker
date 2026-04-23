@@ -13,10 +13,12 @@ export type PurchaseReconciliationInput = {
   allocatedQty?: number
   allocationReceiptDates?: Array<string | null | undefined>
   allowReceiptDateOverride?: boolean
+  invoiceLocked?: boolean
 }
 
 export type PurchaseReconciliationAssessment = {
   isReconciled: boolean
+  isReadyToReconcile: boolean
   reasons: string[]
 }
 
@@ -90,7 +92,8 @@ export function assessPurchaseReconciliation(
   }
 
   return {
-    isReconciled: reasons.length === 0,
+    isReconciled: reasons.length === 0 && input.invoiceLocked === true,
+    isReadyToReconcile: reasons.length === 0 && input.invoiceLocked !== true,
     reasons,
   }
 }

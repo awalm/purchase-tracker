@@ -1,0 +1,63 @@
+{
+  "source_file": "dots_with_eco_fee.pdf",
+  "content_type": "application/pdf",
+  "expected": {
+    "vendor_name": "Amazon",
+    "receipt_number": "CA53ENGC6ACCUI",
+    "receipt_date": "2025-11-22",
+    // 3 dots × 2 qty × $39.99 = $239.94, plus 3 eco fees × $2.70 = $8.10 → subtotal $248.04
+    "subtotal": "248.04",
+    "tax": "32.22",
+    "total": "280.26",
+    "payment_method": null,
+    // 3 line items: Echo Dot (Charcoal), Echo Dot (Glacier White), Echo Dot (Deep Sea Blue)
+    // Each has qty=2, unit_cost=$39.99.
+    // Eco fee = $2.70 for the pair → effective per-unit cost = $39.99 + $1.35 = $41.34
+    "line_items_count": 3,
+    "line_items_expected": [
+      {
+        "description_contains": "amazon echo dot",
+        "quantity": 2,
+        "unit_cost": "39.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "amazon echo dot",
+        "quantity": 2,
+        "unit_cost": "39.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "amazon echo dot",
+        "quantity": 2,
+        "unit_cost": "39.99",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      }
+    ],
+    "raw_text_contains": [
+      "amazon.ca",
+      "invoice",
+      "total payable",
+      "ca53engc6accui"
+    ],
+    "warnings_contains": []
+  }
+}

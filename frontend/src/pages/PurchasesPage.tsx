@@ -535,10 +535,11 @@ export default function PurchasesPage() {
                   invoice_id: p.invoice_id,
                   invoice_unit_price: p.invoice_unit_price,
                   destination_code: p.destination_code,
+                  invoiceLocked: p.invoice_reconciliation_state === "locked",
                 })
                 const isUnlinked = !p.receipt_id && !p.invoice_id
                 return (
-                <TableRow key={p.purchase_id} className={isUnlinked ? "bg-red-50" : (!reconciliation.isReconciled ? "bg-amber-50/40" : "")}>
+                <TableRow key={p.purchase_id} className={isUnlinked ? "bg-red-50" : (!reconciliation.isReconciled && !reconciliation.isReadyToReconcile ? "bg-amber-50/40" : "")}>
                   <TableCell>{formatDate(p.purchase_date)}</TableCell>
                   <TableCell className="font-medium">
                     <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
@@ -592,6 +593,10 @@ export default function PurchasesPage() {
                     {reconciliation.isReconciled ? (
                       <span className="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">
                         Reconciled
+                      </span>
+                    ) : reconciliation.isReadyToReconcile ? (
+                      <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700">
+                        Ready to reconcile
                       </span>
                     ) : (
                       <div className="space-y-1">

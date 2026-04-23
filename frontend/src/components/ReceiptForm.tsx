@@ -36,6 +36,7 @@ interface ReceiptFormProps {
   submitLabel: string
   submittingLabel?: string
   isSubmitting?: boolean
+  serverError?: string
   requireDocument?: boolean
   onSubmit: (data: ReceiptFormSubmitData) => Promise<void> | void
   onCancel: () => void
@@ -52,6 +53,7 @@ export function ReceiptForm({
   submitLabel,
   submittingLabel,
   isSubmitting = false,
+  serverError,
   requireDocument = false,
   onSubmit,
   onCancel,
@@ -71,6 +73,12 @@ export function ReceiptForm({
   const [notes, setNotes] = useState("")
   const [documentFile, setDocumentFile] = useState<File | null>(null)
   const [validationError, setValidationError] = useState("")
+
+  const parsedSubtotal = Number.parseFloat(subtotal || "0")
+  const parsedTaxAmount = Number.parseFloat(taxAmount || "0")
+  const computedTotal = Number.isFinite(parsedSubtotal) && Number.isFinite(parsedTaxAmount)
+    ? parsedSubtotal + parsedTaxAmount
+    : 0
 
   useEffect(() => {
     if (!open) return
@@ -224,6 +232,17 @@ export function ReceiptForm({
       </div>
 
       <div className="space-y-2">
+        <Label htmlFor="receipt-total">Total</Label>
+        <Input
+          id="receipt-total"
+          value={computedTotal.toFixed(2)}
+          readOnly
+          disabled
+        />
+        <p className="text-xs text-muted-foreground">Computed as Subtotal + Tax Amount.</p>
+      </div>
+
+      <div className="space-y-2">
         <Label htmlFor="payment-method">Payment Method</Label>
         <Input
           id="payment-method"
@@ -268,6 +287,11 @@ export function ReceiptForm({
       {validationError && (
         <div className="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700">
           {validationError}
+        </div>
+      )}
+      {serverError && (
+        <div className="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {serverError}
         </div>
       )}
 

@@ -1,0 +1,24 @@
+{
+  "source_file": "misparsed_id.jpg",
+  "content_type": "image/jpeg",
+  "expected": {
+    "vendor_name": "Best Buy",
+    "receipt_number": "S261-R40-T2222_20251119",
+    "receipt_date": "2025-11-19",
+    "subtotal": "119.97",
+    "tax": "15.60",
+    "total": "135.57",
+    "payment_method": "1003",
+    "line_items_count": 1,
+    "line_items_expected": [
+      {
+        "description_contains": "echo dot 5th char",
+        "quantity": 3,
+        "unit_cost": "39.99",
+        "line_total": "119.97"
+      }
+    ],
+    "raw_text_contains": ["echo", "subtotal", "tax hst", "1003"],
+    "warnings_contains": []
+  }
+}

@@ -592,7 +592,8 @@ SELECT
     r.receipt_number,
     inv.invoice_number,
     p.notes,
-    p.purchase_type
+    p.purchase_type,
+    inv.reconciliation_state AS invoice_reconciliation_state
 FROM purchases p
 LEFT JOIN bonus_sums bs ON bs.parent_id = p.id
 JOIN items i ON i.id = p.item_id
@@ -600,3 +601,69 @@ LEFT JOIN receipts r ON r.id = p.receipt_id
 LEFT JOIN vendors v ON v.id = r.vendor_id
 LEFT JOIN destinations d ON d.id = p.destination_id
 LEFT JOIN invoices inv ON inv.id = p.invoice_id;
+
+-- ================================================================
+-- Add tax_amount column to receipts (store dollar amount, not rate)
+-- ================================================================
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'receipts' AND column_name = 'tax_amount'
+  ) THEN
+    ALTER TABLE receipts ADD COLUMN tax_amount DECIMAL(12, 4);
+    UPDATE receipts SET tax_amount = total - subtotal;
+    ALTER TABLE receipts ALTER COLUMN tax_amount SET NOT NULL;
+    ALTER TABLE receipts ALTER COLUMN tax_amount SET DEFAULT 0;
+  END IF;
+END $$;
+
+-- Add CHECK constraint: subtotal + tax_amount ≈ total
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'chk_receipts_tax_amount_total'
+  ) THEN
+    ALTER TABLE receipts ADD CONSTRAINT chk_receipts_tax_amount_total
+      CHECK (ABS(subtotal + tax_amount - total) <= 0.02);
+  END IF;
+END $$;
+
+-- ================================================================
+-- Drop tax_rate from receipts (redundant — derived from tax_amount/subtotal)
+-- ================================================================
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'receipts' AND column_name = 'tax_rate'
+  ) THEN
+    ALTER TABLE receipts DROP COLUMN tax_rate;
+  END IF;
+END $$;
+
+-- ================================================================
+-- Add tax_amount to invoices and enforce subtotal + tax_amount = total
+-- ================================================================
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'invoices' AND column_name = 'tax_amount'
+  ) THEN
+    ALTER TABLE invoices ADD COLUMN tax_amount DECIMAL(12, 4);
+    UPDATE invoices SET tax_amount = total - subtotal;
+    ALTER TABLE invoices ALTER COLUMN tax_amount SET NOT NULL;
+    ALTER TABLE invoices ALTER COLUMN tax_amount SET DEFAULT 0;
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'chk_invoices_tax_amount_total'
+  ) THEN
+    ALTER TABLE invoices ADD CONSTRAINT chk_invoices_tax_amount_total
+      CHECK (ABS(subtotal + tax_amount - total) <= 0.02);
+  END IF;
+END $$;

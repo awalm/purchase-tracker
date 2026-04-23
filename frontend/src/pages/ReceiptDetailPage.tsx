@@ -11,6 +11,7 @@ import {
   useItems,
   useDestinations,
   useInvoices,
+  useVendors,
 } from "@/hooks/useApi"
 import { receipts as receiptsApi, purchases as purchasesApi, type ReceiptLineItem } from "@/api"
 import { Button } from "@/components/ui/button"
@@ -41,6 +42,7 @@ import {
 } from "@/components/ui/select"
 import { StatusSelect } from "@/components/StatusSelect"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
+import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
 import {
   ArrowLeft,
   Plus,
@@ -51,9 +53,13 @@ import {
   AlertCircle,
   CheckCircle2,
 } from "lucide-react"
-import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
+import { formatCurrency, formatDate } from "@/lib/utils"
 import { assessPurchaseReconciliation } from "@/lib/purchaseReconciliation"
 import { truncateOptionLabel } from "@/lib/receiptImportValidation"
+import {
+  getReceiptReconciliationBadgeState,
+  getStoredExpectedTaxRate,
+} from "@/lib/receiptSummary"
 
 const METADATA_AUDIT_PRIORITY_KEYS = [
   "source",
@@ -116,6 +122,7 @@ export default function ReceiptDetailPage() {
   const { data: items = [] } = useItems()
   const { data: destinations = [] } = useDestinations()
   const { data: invoices = [] } = useInvoices()
+  const { data: vendors = [] } = useVendors()
 
   const createPurchase = useCreatePurchase()
   const updateReceipt = useUpdateReceipt()
@@ -157,6 +164,8 @@ export default function ReceiptDetailPage() {
   const [destinationId, setDestinationId] = useState("")
   const [invoiceId, setInvoiceId] = useState("")
   const [purchaseNotes, setPurchaseNotes] = useState("")
+  const [receiptDialogOpen, setReceiptDialogOpen] = useState(false)
+  const [receiptEditError, setReceiptEditError] = useState("")
   const [isEditingMetadata, setIsEditingMetadata] = useState(false)
   const [metadataDraft, setMetadataDraft] = useState("")
   const [metadataError, setMetadataError] = useState("")
@@ -376,6 +385,30 @@ export default function ReceiptDetailPage() {
     setIsEditingMetadata(false)
   }
 
+  const handleReceiptHeaderSave = async (data: ReceiptFormSubmitData) => {
+    if (!id) return
+
+    try {
+      setReceiptEditError("")
+      await updateReceipt.mutateAsync({
+        id,
+        vendor_id: data.vendor_id,
+        receipt_number: data.receipt_number,
+        receipt_date: data.receipt_date,
+        subtotal: data.subtotal,
+        tax_amount: data.tax_amount,
+        payment_method: data.payment_method.trim() || undefined,
+        notes: data.notes || undefined,
+      })
+      await queryClient.invalidateQueries({ queryKey: ["receipts", id] })
+      await queryClient.invalidateQueries({ queryKey: ["receipts"] })
+      setReceiptDialogOpen(false)
+      setReceiptEditError("")
+    } catch (err) {
+      setReceiptEditError(err instanceof Error ? err.message : "Failed to save receipt")
+    }
+  }
+
   if (loadingReceipt)
     return <div className="text-muted-foreground">Loading...</div>
   if (!receipt) return <div className="text-red-600">Receipt not found</div>
@@ -390,11 +423,16 @@ export default function ReceiptDetailPage() {
     0
   )
   const unlinkedCount = purchases.filter((p) => !p.invoice_id).length
+  const lockedLinkedCount = purchases.filter(
+    (p) => p.invoice_reconciliation_state === "locked"
+  ).length
   const receiptSubtotal = parseFloat(receipt.subtotal)
   const costDifference = receiptSubtotal - totalCost
   const isCostMatched = Math.abs(costDifference) < 0.01
   const allInvoiced = purchases.length > 0 && unlinkedCount === 0
-  const fullyReconciled = isCostMatched && allInvoiced && purchases.length > 0
+  const allLocked = purchases.length > 0 && lockedLinkedCount === purchases.length
+  const readyToReconcile = isCostMatched && allInvoiced && purchases.length > 0 && !allLocked
+  const fullyReconciled = isCostMatched && allInvoiced && allLocked && purchases.length > 0
   const metadata = receipt.ingestion_metadata
   const metadataSource = metadata?.source || "manual"
   const metadataWarnings = metadata?.warnings || []
@@ -413,17 +451,56 @@ export default function ReceiptDetailPage() {
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div className="flex-1">
-          <h1 className="text-2xl font-bold">
-            Receipt {receipt.receipt_number}
-          </h1>
+          <div className="flex items-center gap-2">
+            <h1 className="text-2xl font-bold">
+              Receipt {receipt.receipt_number}
+            </h1>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Edit receipt"
+              title="Edit receipt"
+              onClick={() => {
+                setReceiptEditError("")
+                setReceiptDialogOpen(true)
+              }}
+            >
+              <Pencil className="h-4 w-4" />
+            </Button>
+          </div>
           <p className="text-muted-foreground">
             {receipt.vendor_name} • {formatDate(receipt.receipt_date)}
           </p>
-          <div className="flex gap-2 mt-2">
+          <div className="flex gap-2 mt-2 flex-wrap">
+            {(() => {
+              const taxBadge = getReceiptReconciliationBadgeState(receipt, getStoredExpectedTaxRate())
+              if (taxBadge.kind === "tax-math-error") {
+                return (
+                  <span className="flex items-center gap-1 text-red-700 bg-red-50 px-3 py-1.5 rounded-full text-sm font-medium">
+                    <AlertCircle className="h-4 w-4" />
+                    {taxBadge.label}
+                  </span>
+                )
+              }
+              if (taxBadge.kind === "unexpected-tax-rate") {
+                return (
+                  <span className="flex items-center gap-1 text-orange-700 bg-orange-50 px-3 py-1.5 rounded-full text-sm font-medium">
+                    <AlertCircle className="h-4 w-4" />
+                    {taxBadge.label}
+                  </span>
+                )
+              }
+              return null
+            })()}
             {fullyReconciled ? (
               <span className="flex items-center gap-1 text-green-600 bg-green-50 px-3 py-1.5 rounded-full text-sm font-medium">
                 <CheckCircle2 className="h-4 w-4" />
                 Reconciled
+              </span>
+            ) : readyToReconcile ? (
+              <span className="flex items-center gap-1 text-blue-700 bg-blue-50 px-3 py-1.5 rounded-full text-sm font-medium">
+                <CheckCircle2 className="h-4 w-4" />
+                Ready to reconcile ({lockedLinkedCount}/{purchases.length} finalized)
               </span>
             ) : (
               <>
@@ -494,7 +571,7 @@ export default function ReceiptDetailPage() {
               {formatCurrency(receipt.total)}
             </div>
             <p className="text-sm text-muted-foreground">
-              Receipt Total ({formatNumber(receipt.tax_rate)}% HST)
+              Receipt Total (tax: {formatCurrency(receipt.tax_amount)})
             </p>
           </CardContent>
         </Card>
@@ -653,6 +730,46 @@ export default function ReceiptDetailPage() {
 
             {!loadingMetadataAudit && !metadataAuditError && metadataAuditHistory.length > 0 && (
               <div className="space-y-2">
+                <Dialog
+                  open={receiptDialogOpen}
+                  onOpenChange={(open) => {
+                    setReceiptDialogOpen(open)
+                    if (!open) {
+                      setReceiptEditError("")
+                    }
+                  }}
+                >
+                  <DialogContent className="max-w-md">
+                    <DialogHeader>
+                      <DialogTitle>Edit Receipt</DialogTitle>
+                    </DialogHeader>
+                    {receipt && (
+                      <ReceiptForm
+                        open={receiptDialogOpen}
+                        vendors={vendors}
+                        initialValues={{
+                          vendor_id: receipt.vendor_id,
+                          receipt_number: receipt.receipt_number,
+                          receipt_date: receipt.receipt_date,
+                          subtotal: receipt.subtotal,
+                          tax_amount: receipt.tax_amount,
+                          payment_method: receipt.payment_method || "",
+                          notes: receipt.notes || "",
+                        }}
+                        submitLabel="Save Changes"
+                        submittingLabel="Saving..."
+                        isSubmitting={updateReceipt.isPending}
+                        serverError={receiptEditError}
+                        onSubmit={handleReceiptHeaderSave}
+                        onCancel={() => {
+                          setReceiptDialogOpen(false)
+                          setReceiptEditError("")
+                        }}
+                      />
+                    )}
+                  </DialogContent>
+                </Dialog>
+
                 {metadataAuditHistory.slice(0, 5).map((entry) => {
                   const changedKeys = getChangedMetadataKeys(
                     entry.old_ingestion_metadata,
@@ -1104,6 +1221,7 @@ export default function ReceiptDetailPage() {
                       invoice_id: p.invoice_id,
                       invoice_unit_price: p.invoice_unit_price,
                       destination_code: p.destination_code,
+                      invoiceLocked: p.invoice_reconciliation_state === "locked",
                     })
 
                     return (
@@ -1138,6 +1256,10 @@ export default function ReceiptDetailPage() {
                         {reconciliation.isReconciled ? (
                           <span className="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">
                             Reconciled
+                          </span>
+                        ) : reconciliation.isReadyToReconcile ? (
+                          <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700">
+                            Ready to reconcile
                           </span>
                         ) : (
                           <div className="space-y-1">

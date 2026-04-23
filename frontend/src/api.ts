@@ -274,6 +274,7 @@ export const items = {
       refunds_purchase_id: string | null;
       purchase_type: string | null;
       bonus_for_purchase_id: string | null;
+      invoice_reconciliation_state: string | null;
     }[]>(`/items/${id}/purchases`),
 };
 
@@ -355,6 +356,7 @@ export const invoices = {
       refunds_purchase_id: string | null;
       purchase_type: string | null;
       bonus_for_purchase_id: string | null;
+      invoice_reconciliation_state: string | null;
     }[]>(`/invoices/${id}/purchases`),
   create: (data: {
     destination_id: string;
@@ -523,7 +525,7 @@ export const receipts = {
       receipt_number: string;
       receipt_date: string;
       subtotal: string;
-      tax_rate: string;
+      tax_amount: string;
       total: string;
       payment_method: string | null;
       ingestion_metadata: ReceiptIngestionMetadata | null;
@@ -537,6 +539,7 @@ export const receipts = {
       total_selling: string | null;
       total_commission: string | null;
       invoiced_count: number | null;
+      locked_purchase_count: number | null;
     }[]>('/receipts'),
   get: (id: string) =>
     request<{
@@ -546,7 +549,7 @@ export const receipts = {
       receipt_number: string;
       receipt_date: string;
       subtotal: string;
-      tax_rate: string;
+      tax_amount: string;
       total: string;
       payment_method: string | null;
       ingestion_metadata: ReceiptIngestionMetadata | null;
@@ -560,6 +563,7 @@ export const receipts = {
       total_selling: string | null;
       total_commission: string | null;
       invoiced_count: number | null;
+      locked_purchase_count: number | null;
     }>(`/receipts/${id}`),
   purchases: (id: string) =>
     request<{
@@ -589,6 +593,7 @@ export const receipts = {
       refunds_purchase_id: string | null;
       purchase_type: string | null;
       bonus_for_purchase_id: string | null;
+      invoice_reconciliation_state: string | null;
     }[]>(`/receipts/${id}/purchases`),
   lineItems: {
     list: (id: string) =>
@@ -699,6 +704,7 @@ export const purchases = {
       refunds_purchase_id: string | null;
       purchase_type: string | null;
       bonus_for_purchase_id: string | null;
+      invoice_reconciliation_state: string | null;
     }[]>(`/purchases/economics${query ? `?${query}` : ''}`);
   },
   create: (data: {

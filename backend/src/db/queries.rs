@@ -25,6 +25,7 @@ pub struct AtomicInvoicePdfCreateInput {
     pub invoice_date: NaiveDate,
     pub delivery_date: Option<NaiveDate>,
     pub subtotal: Decimal,
+    pub tax_amount: Option<Decimal>,
     pub tax_rate: Option<Decimal>,
     pub notes: Option<String>,
     pub pdf_data: Vec<u8>,
@@ -997,14 +998,24 @@ pub async fn create_invoice(
     data: CreateInvoice,
     user_id: Uuid,
 ) -> Result<Invoice, sqlx::Error> {
-    let tax_rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00
+    let tax_amount = if let Some(amount) = data.tax_amount {
+        amount
+    } else {
+        let rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00 fallback
+        data.subtotal * rate / Decimal::new(100, 0)
+    };
     let reconciliation_state = data.reconciliation_state.as_deref().unwrap_or("open");
-    let total = data.subtotal * (Decimal::ONE + tax_rate / Decimal::new(100, 0));
+    let total = data.subtotal + tax_amount;
+    let tax_rate = if data.subtotal > Decimal::ZERO {
+        (tax_amount / data.subtotal) * Decimal::new(100, 0)
+    } else {
+        data.tax_rate.unwrap_or(Decimal::ZERO)
+    };
     let delivery_date = data.delivery_date.unwrap_or(data.invoice_date);
     let invoice = sqlx::query_as!(
         Invoice,
-        r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, delivery_date, subtotal, tax_rate, total, reconciliation_state, notes) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) 
+        r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, delivery_date, subtotal, tax_amount, tax_rate, total, reconciliation_state, notes) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) 
            RETURNING id, destination_id, invoice_number, order_number, invoice_date, delivery_date,
                      subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at"#,
         data.destination_id,
@@ -1013,6 +1024,7 @@ pub async fn create_invoice(
         data.invoice_date,
         delivery_date,
         data.subtotal,
+        tax_amount,
         tax_rate,
         total,
         reconciliation_state,
@@ -1041,14 +1053,24 @@ pub async fn create_invoice_from_pdf_atomic(
 ) -> Result<AtomicInvoicePdfCreateResult, AtomicInvoicePdfCreateError> {
     let mut tx = pool.begin().await?;
 
-    let tax_rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00
-    let total = data.subtotal * (Decimal::ONE + tax_rate / Decimal::new(100, 0));
+    let tax_amount = if let Some(amount) = data.tax_amount {
+        amount
+    } else {
+        let rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00 fallback
+        data.subtotal * rate / Decimal::new(100, 0)
+    };
+    let total = data.subtotal + tax_amount;
+    let tax_rate = if data.subtotal > Decimal::ZERO {
+        (tax_amount / data.subtotal) * Decimal::new(100, 0)
+    } else {
+        data.tax_rate.unwrap_or(Decimal::ZERO)
+    };
     let delivery_date = data.delivery_date.unwrap_or(data.invoice_date);
 
     let invoice = sqlx::query_as!(
         Invoice,
-          r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, delivery_date, subtotal, tax_rate, total, reconciliation_state, notes, original_pdf, original_filename)
-              VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, 'open', $8, $9, $10)
+          r#"INSERT INTO invoices (destination_id, invoice_number, order_number, invoice_date, delivery_date, subtotal, tax_amount, tax_rate, total, reconciliation_state, notes, original_pdf, original_filename)
+              VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, 'open', $9, $10, $11)
            RETURNING id, destination_id, invoice_number, order_number, invoice_date, delivery_date,
                             subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at"#,
         data.destination_id,
@@ -1056,6 +1078,7 @@ pub async fn create_invoice_from_pdf_atomic(
         data.invoice_date,
         delivery_date,
         data.subtotal,
+        tax_amount,
         tax_rate,
         total,
         data.notes,
@@ -1126,6 +1149,77 @@ pub async fn create_invoice_from_pdf_atomic(
     })
 }
 
+/// Expected tax rate for receipt health checks (13% HST).
+/// Keep in sync with frontend DEFAULT_EXPECTED_TAX_RATE.
+const EXPECTED_TAX_RATE: f64 = 0.13;
+/// Tolerance for tax rate comparison (0.05 percentage points, matching frontend).
+const TAX_RATE_TOLERANCE: f64 = 0.0005;
+/// Tolerance for tax math (subtotal + tax_amount ≈ total).
+const TAX_MATH_TOLERANCE: f64 = 0.02;
+
+/// Pure receipt health check — no DB required.
+/// Returns a list of error kinds (empty = healthy).
+/// Keep in sync with the SQL in receipt_has_errors / get_errored_receipts_for_invoice.
+pub fn check_receipt_health(subtotal: f64, tax_amount: f64, total: f64) -> Vec<&'static str> {
+    let mut errors = Vec::new();
+    if subtotal > 0.0 && total > 0.0 && (subtotal + tax_amount - total).abs() > TAX_MATH_TOLERANCE {
+        errors.push("tax-math-error");
+    }
+    if subtotal > 0.0 && (tax_amount / subtotal - EXPECTED_TAX_RATE).abs() > TAX_RATE_TOLERANCE {
+        errors.push("unexpected-tax-rate");
+    }
+    errors
+}
+
+/// Check if a single receipt has data integrity errors (tax math, unexpected rate, etc).
+/// This is the canonical receipt-level health check — used by invoice finalization
+/// and anywhere else that needs to know if a receipt is "clean".
+pub async fn receipt_has_errors(
+    pool: &PgPool,
+    receipt_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT (
+               ABS(subtotal + tax_amount - total) > 0.02
+               OR (subtotal > 0 AND ABS(tax_amount / subtotal - 0.13) > 0.0005)
+           ) AS "has_error!"
+           FROM receipts WHERE id = $1"#,
+        receipt_id
+    )
+    .fetch_optional(pool)
+    .await
+    .map(|opt| opt.unwrap_or(false))
+}
+
+/// Returns receipt numbers of all linked receipts that are in an error state.
+/// Checks both tax math errors AND unexpected tax rate.
+async fn get_errored_receipts_for_invoice(
+    pool: &PgPool,
+    invoice_id: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query_scalar!(
+        r#"SELECT DISTINCT r.receipt_number
+           FROM receipts r
+           WHERE (
+                 ABS(r.subtotal + r.tax_amount - r.total) > 0.02
+                 OR (r.subtotal > 0 AND ABS(r.tax_amount / r.subtotal - 0.13) > 0.0005)
+             )
+             AND (
+                 EXISTS (SELECT 1 FROM purchases p WHERE p.invoice_id = $1 AND p.receipt_id = r.id)
+                 OR EXISTS (
+                     SELECT 1 FROM purchase_allocations pa
+                     JOIN purchases p ON p.id = pa.purchase_id
+                     WHERE p.invoice_id = $1 AND pa.receipt_id = r.id
+                 )
+             )"#,
+        invoice_id
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
 pub async fn update_invoice(
     pool: &PgPool,
     id: Uuid,
@@ -1140,6 +1234,7 @@ pub async fn update_invoice(
             || data.invoice_date.is_some()
             || data.delivery_date.is_some()
             || data.subtotal.is_some()
+            || data.tax_amount.is_some()
             || data.tax_rate.is_some()
             || data.notes.is_some();
         let requested_state = data.reconciliation_state.as_deref();
@@ -1156,6 +1251,17 @@ pub async fn update_invoice(
             ));
         }
 
+        // Block locking if any linked receipts are in error state
+        if requested_state == Some("locked") {
+            let bad_receipts = get_errored_receipts_for_invoice(pool, id).await?;
+            if !bad_receipts.is_empty() {
+                return Err(locked_invoice_error(&format!(
+                    "Cannot finalize: linked receipt(s) have errors: {}. Fix receipt data first.",
+                    bad_receipts.join(", ")
+                )));
+            }
+        }
+
         let invoice = sqlx::query_as!(
             Invoice,
             r#"UPDATE invoices SET 
@@ -1164,10 +1270,36 @@ pub async fn update_invoice(
                 invoice_date = COALESCE($4, invoice_date),
                 delivery_date = COALESCE($5, delivery_date),
                 subtotal = COALESCE($6, subtotal),
-                tax_rate = COALESCE($7, tax_rate),
-                total = COALESCE($6, subtotal) * (1 + COALESCE($7, tax_rate) / 100),
-                reconciliation_state = COALESCE($8, reconciliation_state),
-                notes = COALESCE($9, notes)
+                tax_amount = COALESCE(
+                    $7,
+                    CASE
+                        WHEN $8::numeric IS NOT NULL THEN COALESCE($6, subtotal) * $8::numeric / 100
+                        ELSE tax_amount
+                    END
+                ),
+                tax_rate = COALESCE(
+                    $8::numeric,
+                    CASE
+                        WHEN COALESCE($6, subtotal) > 0 THEN
+                            COALESCE(
+                                $7,
+                                CASE
+                                    WHEN $8::numeric IS NOT NULL THEN COALESCE($6, subtotal) * $8::numeric / 100
+                                    ELSE tax_amount
+                                END
+                            ) / COALESCE($6, subtotal) * 100
+                        ELSE tax_rate
+                    END
+                ),
+                total = COALESCE($6, subtotal) + COALESCE(
+                    $7,
+                    CASE
+                        WHEN $8::numeric IS NOT NULL THEN COALESCE($6, subtotal) * $8::numeric / 100
+                        ELSE tax_amount
+                    END
+                ),
+                reconciliation_state = COALESCE($9, reconciliation_state),
+                notes = COALESCE($10, notes)
                WHERE id = $1 
                RETURNING id, destination_id, invoice_number, order_number, invoice_date, delivery_date,
                          subtotal, tax_rate, total, reconciliation_state, notes, created_at, updated_at"#,
@@ -1177,6 +1309,7 @@ pub async fn update_invoice(
             data.invoice_date,
             data.delivery_date,
             data.subtotal,
+            data.tax_amount,
             data.tax_rate,
             data.reconciliation_state,
             data.notes
@@ -1546,7 +1679,8 @@ pub async fn get_purchases_by_invoice(
                pr.notes,
                pr.refunds_purchase_id,
                pr.purchase_type,
-               pr.bonus_for_purchase_id
+               pr.bonus_for_purchase_id,
+               inv.reconciliation_state AS invoice_reconciliation_state
            FROM purchase_rows pr
            LEFT JOIN items i ON i.id = pr.item_id
            LEFT JOIN receipts r ON r.id = pr.resolved_receipt_id
@@ -2782,7 +2916,8 @@ pub async fn get_purchase_economics(
             pe.notes,
             p.refunds_purchase_id,
             pe.purchase_type,
-            p.bonus_for_purchase_id
+            p.bonus_for_purchase_id,
+            pe.invoice_reconciliation_state
         FROM v_purchase_economics pe
         JOIN purchases p ON p.id = pe.purchase_id
         LEFT JOIN receipts r ON r.id = p.receipt_id
@@ -2917,7 +3052,7 @@ pub async fn get_receipt_metadata_audit(
 pub async fn get_all_receipts(pool: &PgPool) -> Result<Vec<Receipt>, sqlx::Error> {
     sqlx::query_as!(
         Receipt,
-        r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
+        r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total,
                 payment_method,
           ingestion_metadata,
                   notes, created_at, updated_at
@@ -2930,7 +3065,7 @@ pub async fn get_all_receipts(pool: &PgPool) -> Result<Vec<Receipt>, sqlx::Error
 pub async fn get_receipt_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Receipt>, sqlx::Error> {
     sqlx::query_as!(
         Receipt,
-        r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
+        r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total,
                   payment_method,
                   ingestion_metadata,
                   notes, created_at, updated_at
@@ -2954,17 +3089,13 @@ pub async fn create_receipt(
         })
     }));
 
-    let (tax_rate, total) = if let Some(tax_amount) = data.tax_amount {
-        let rate = if data.subtotal == Decimal::ZERO {
-            Decimal::ZERO
-        } else {
-            (tax_amount * Decimal::new(100, 0)) / data.subtotal
-        };
-        (rate, data.subtotal + tax_amount)
+    let (tax_amount, total) = if let Some(tax_amount) = data.tax_amount {
+        (tax_amount, data.subtotal + tax_amount)
     } else {
         let rate = data.tax_rate.unwrap_or(Decimal::new(1300, 2)); // 13.00 fallback
-        let computed_total = data.subtotal * (Decimal::ONE + rate / Decimal::new(100, 0));
-        (rate, computed_total)
+        let computed_tax = data.subtotal * rate / Decimal::new(100, 0);
+        let computed_total = data.subtotal + computed_tax;
+        (computed_tax, computed_total)
     };
     let provided_number = data
         .receipt_number
@@ -2981,9 +3112,9 @@ pub async fn create_receipt(
 
     let receipt = sqlx::query_as!(
         Receipt,
-        r#"INSERT INTO receipts (vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total, payment_method, ingestion_metadata, notes)
+        r#"INSERT INTO receipts (vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total, payment_method, ingestion_metadata, notes)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-           RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
+           RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total,
                      payment_method,
                      ingestion_metadata,
                      notes, created_at, updated_at"#,
@@ -2991,7 +3122,7 @@ pub async fn create_receipt(
         receipt_number,
         data.receipt_date,
         data.subtotal,
-        tax_rate,
+        tax_amount,
         total,
         data.payment_method,
         ingestion_metadata,
@@ -3118,19 +3249,14 @@ pub async fn update_receipt(
             .ingestion_metadata
             .or_else(|| old_receipt.ingestion_metadata.clone());
 
-        let (tax_rate, total) = if let Some(tax_amount) = data.tax_amount {
-            let rate = if subtotal == Decimal::ZERO {
-                Decimal::ZERO
-            } else {
-                (tax_amount * Decimal::new(100, 0)) / subtotal
-            };
-            (rate, subtotal + tax_amount)
+        let (tax_amount, total) = if let Some(tax_amount) = data.tax_amount {
+            (tax_amount, subtotal + tax_amount)
+        } else if let Some(rate) = data.tax_rate {
+            let computed_tax = subtotal * rate / Decimal::new(100, 0);
+            (computed_tax, subtotal + computed_tax)
         } else {
-            let rate = data.tax_rate.unwrap_or(old_receipt.tax_rate);
-            (
-                rate,
-                subtotal * (Decimal::ONE + rate / Decimal::new(100, 0)),
-            )
+            // Neither tax_amount nor tax_rate provided — keep existing
+            (old_receipt.tax_amount, old_receipt.total)
         };
 
         let receipt = sqlx::query_as!(
@@ -3140,13 +3266,13 @@ pub async fn update_receipt(
                 receipt_number = $3,
                 receipt_date = $4,
                 subtotal = $5,
-                tax_rate = $6,
+                tax_amount = $6,
                 total = $7,
                 payment_method = $8,
                 ingestion_metadata = $9,
                 notes = $10
                WHERE id = $1 
-               RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total,
+               RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total,
                          payment_method,
                          ingestion_metadata,
                          notes, created_at, updated_at"#,
@@ -3155,7 +3281,7 @@ pub async fn update_receipt(
             receipt_number,
             receipt_date,
             subtotal,
-            tax_rate,
+            tax_amount,
             total,
             payment_method,
             ingestion_metadata,
@@ -3283,7 +3409,7 @@ pub async fn get_receipt_with_vendor(
             r.receipt_number,
             r.receipt_date,
             r.subtotal,
-            r.tax_rate,
+            r.tax_amount,
             r.total,
             r.payment_method,
             r.ingestion_metadata,
@@ -3299,13 +3425,15 @@ pub async fn get_receipt_with_vendor(
                             + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * COALESCE(p.invoice_unit_price, 0) ELSE 0 END), 0) AS total_selling,
                         COALESCE(SUM(pa.allocated_qty * (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost)), 0)
                             + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) ELSE 0 END), 0) AS total_commission,
-                        COUNT(DISTINCT p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count
+                        COUNT(DISTINCT p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count,
+                        COUNT(DISTINCT p.id) FILTER (WHERE inv.reconciliation_state = 'locked') AS locked_purchase_count
         FROM receipts r
         JOIN vendors v ON v.id = r.vendor_id
                 LEFT JOIN purchase_allocations pa ON pa.receipt_id = r.id
                 LEFT JOIN purchases p ON p.id = pa.purchase_id OR (pa.id IS NULL AND p.receipt_id = r.id)
+                    LEFT JOIN invoices inv ON inv.id = p.invoice_id
         WHERE r.id = $1
-           GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_rate, r.total,
+           GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_amount, r.total,
                              r.payment_method, r.ingestion_metadata,
                  r.original_pdf, r.notes, r.created_at, r.updated_at"#,
         id
@@ -3326,7 +3454,7 @@ pub async fn get_receipts_with_vendor(
             r.receipt_number,
             r.receipt_date,
             r.subtotal,
-            r.tax_rate,
+            r.tax_amount,
             r.total,
             r.payment_method,
             r.ingestion_metadata,
@@ -3342,12 +3470,14 @@ pub async fn get_receipts_with_vendor(
                             + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * COALESCE(p.invoice_unit_price, 0) ELSE 0 END), 0) AS total_selling,
                         COALESCE(SUM(pa.allocated_qty * (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost)), 0)
                             + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) ELSE 0 END), 0) AS total_commission,
-                        COUNT(DISTINCT p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count
+                        COUNT(DISTINCT p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count,
+                        COUNT(DISTINCT p.id) FILTER (WHERE inv.reconciliation_state = 'locked') AS locked_purchase_count
         FROM receipts r
         JOIN vendors v ON v.id = r.vendor_id
                 LEFT JOIN purchase_allocations pa ON pa.receipt_id = r.id
                 LEFT JOIN purchases p ON p.id = pa.purchase_id OR (pa.id IS NULL AND p.receipt_id = r.id)
-        GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_rate, r.total,
+                    LEFT JOIN invoices inv ON inv.id = p.invoice_id
+        GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_amount, r.total,
              r.payment_method, r.ingestion_metadata,
                  r.original_pdf, r.notes, r.created_at, r.updated_at
         ORDER BY r.receipt_date DESC"#
@@ -3390,6 +3520,7 @@ pub async fn get_purchases_by_receipt(
                    p.refunds_purchase_id,
                    p.purchase_type,
                    p.bonus_for_purchase_id,
+                   inv.reconciliation_state AS invoice_reconciliation_state,
                    p.created_at AS sort_created_at
                FROM purchase_allocations pa
                JOIN purchases p ON p.id = pa.purchase_id
@@ -3434,6 +3565,7 @@ pub async fn get_purchases_by_receipt(
                    p.refunds_purchase_id,
                    p.purchase_type,
                    p.bonus_for_purchase_id,
+                   inv.reconciliation_state AS invoice_reconciliation_state,
                    p.created_at AS sort_created_at
                FROM purchases p
                JOIN receipts r ON r.id = p.receipt_id
@@ -3475,7 +3607,8 @@ pub async fn get_purchases_by_receipt(
                c.notes,
                c.refunds_purchase_id,
                c.purchase_type,
-               c.bonus_for_purchase_id
+               c.bonus_for_purchase_id,
+               c.invoice_reconciliation_state
            FROM (
                SELECT * FROM allocation_rows
                UNION ALL
@@ -3596,7 +3729,8 @@ pub async fn get_purchases_by_item(
                pr.notes,
                pr.refunds_purchase_id,
                pr.purchase_type,
-               pr.bonus_for_purchase_id
+               pr.bonus_for_purchase_id,
+               inv.reconciliation_state AS invoice_reconciliation_state
            FROM purchase_rows pr
            LEFT JOIN items i ON i.id = pr.item_id
            LEFT JOIN receipts r ON r.id = pr.resolved_receipt_id
@@ -3896,7 +4030,7 @@ mod tests {
             .await?;
 
         sqlx::query(
-            r#"INSERT INTO receipts (id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total)
+            r#"INSERT INTO receipts (id, vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total)
                VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
         )
         .bind(receipt_id)
@@ -3957,7 +4091,7 @@ mod tests {
     ) -> Uuid {
         let receipt_id = Uuid::new_v4();
         sqlx::query(
-            r#"INSERT INTO receipts (id, vendor_id, receipt_number, receipt_date, subtotal, tax_rate, total)
+            r#"INSERT INTO receipts (id, vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total)
                VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
         )
         .bind(receipt_id)
@@ -3965,7 +4099,7 @@ mod tests {
         .bind(format!("R{}", &receipt_id.to_string()[..10]))
         .bind(receipt_date)
         .bind(subtotal)
-        .bind(Decimal::new(1300, 2))
+        .bind(subtotal * Decimal::new(13, 2))
         .bind(subtotal * Decimal::new(113, 2))
         .execute(pool)
         .await
@@ -5498,6 +5632,7 @@ mod tests {
                 invoice_date: None,
                 delivery_date: None,
                 subtotal: Some(Decimal::new(13000, 2)),
+                tax_amount: None,
                 tax_rate: None,
                 reconciliation_state: None,
                 notes: None,
@@ -5517,6 +5652,7 @@ mod tests {
                 invoice_date: None,
                 delivery_date: None,
                 subtotal: None,
+                tax_amount: None,
                 tax_rate: None,
                 reconciliation_state: Some("reopened".to_string()),
                 notes: None,
@@ -5538,6 +5674,7 @@ mod tests {
                 invoice_date: None,
                 delivery_date: None,
                 subtotal: None,
+                tax_amount: None,
                 tax_rate: None,
                 reconciliation_state: None,
                 notes: Some("edited after reopen".to_string()),
@@ -5668,6 +5805,7 @@ mod tests {
                 invoice_date: None,
                 delivery_date: None,
                 subtotal: None,
+                tax_amount: None,
                 tax_rate: None,
                 reconciliation_state: Some("reopened".to_string()),
                 notes: None,
@@ -5785,6 +5923,7 @@ mod tests {
                 invoice_date: None,
                 delivery_date: None,
                 subtotal: None,
+                tax_amount: None,
                 tax_rate: None,
                 reconciliation_state: Some("locked".to_string()),
                 notes: None,
@@ -5873,6 +6012,7 @@ mod tests {
                 invoice_date: None,
                 delivery_date: None,
                 subtotal: None,
+                tax_amount: None,
                 tax_rate: None,
                 reconciliation_state: Some("locked".to_string()),
                 notes: None,
@@ -5957,5 +6097,70 @@ mod tests {
             purchase_id,
         )
         .await;
+    }
+
+    // ── DB-free unit tests for check_receipt_health ──────────────────
+
+    #[test]
+    fn healthy_receipt_13pct() {
+        // $100 + $13 tax = $113, rate = 13% — no errors
+        let errors = check_receipt_health(100.0, 13.0, 113.0);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn tax_math_error_blocks() {
+        // $100 + $13 tax but total says $120 — math is off by $7
+        let errors = check_receipt_health(100.0, 13.0, 120.0);
+        assert!(errors.contains(&"tax-math-error"), "Expected tax-math-error, got: {:?}", errors);
+    }
+
+    #[test]
+    fn tax_math_within_tolerance_ok() {
+        // $100 + $13 = $113, total = $113.01 — only $0.01 off, within tolerance
+        let errors = check_receipt_health(100.0, 13.0, 113.01);
+        assert!(!errors.contains(&"tax-math-error"), "Should not flag tax-math-error for $0.01 diff");
+    }
+
+    #[test]
+    fn unexpected_tax_rate_blocks() {
+        // Staples receipt: $159.96 + $13.00 = $172.96 — math is correct
+        // but tax rate is 13.00/159.96 = 8.13%, not 13%
+        let errors = check_receipt_health(159.96, 13.0, 172.96);
+        assert!(!errors.contains(&"tax-math-error"), "Math is correct");
+        assert!(errors.contains(&"unexpected-tax-rate"),
+            "Rate is 8.13%% not 13%% — must be flagged. Got: {:?}", errors);
+    }
+
+    #[test]
+    fn correct_rate_not_flagged() {
+        // Exact 13% — should not flag unexpected rate
+        let errors = check_receipt_health(100.0, 13.0, 113.0);
+        assert!(!errors.contains(&"unexpected-tax-rate"),
+            "13%% rate should not be flagged. Got: {:?}", errors);
+    }
+
+    #[test]
+    fn slight_rounding_rate_not_flagged() {
+        // $99.99 subtotal, 13% tax = $12.9987 → rounded to $13.00
+        // Effective rate: 13.00/99.99 = 13.0013% — within tolerance
+        let errors = check_receipt_health(99.99, 13.0, 112.99);
+        assert!(!errors.contains(&"unexpected-tax-rate"),
+            "Slight rounding should not flag rate. Got: {:?}", errors);
+    }
+
+    #[test]
+    fn zero_subtotal_no_errors() {
+        // Edge case: zero subtotal should not divide-by-zero or flag
+        let errors = check_receipt_health(0.0, 0.0, 0.0);
+        assert!(errors.is_empty(), "Zero receipt should have no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn both_errors_at_once() {
+        // Bad math AND bad rate: $100 + $5 tax but total = $120
+        let errors = check_receipt_health(100.0, 5.0, 120.0);
+        assert!(errors.contains(&"tax-math-error"), "Should flag math error");
+        assert!(errors.contains(&"unexpected-tax-rate"), "Should flag unexpected rate (5%%)");
     }
 }

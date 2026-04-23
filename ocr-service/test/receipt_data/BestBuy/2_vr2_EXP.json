@@ -1,0 +1,24 @@
+{
+  "source_file": "2_vr2.jpg",
+  "content_type": "image/jpeg",
+  "expected": {
+    "vendor_name": "Best Buy",
+    "receipt_number": "S943-R50-T7121_20251125",
+    "receipt_date": "2025-11-25",
+    "subtotal": "839.98",
+    "tax": "109.20",
+    "total": "949.18",
+    "payment_method": "Amex (1003)",
+    "line_items_count": 1,
+    "line_items_expected": [
+      {
+        "description_contains": "headset",
+        "quantity": 2,
+        "unit_cost": "419.99",
+        "line_total": "839.98"
+      }
+    ],
+    "raw_text_contains": ["headset", "subtotal", "account"],
+    "warnings_contains": []
+  }
+}

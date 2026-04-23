@@ -90,7 +90,7 @@ pub struct Receipt {
     pub receipt_number: String,
     pub receipt_date: NaiveDate,
     pub subtotal: Decimal,
-    pub tax_rate: Decimal,
+    pub tax_amount: Decimal,
     pub total: Decimal,
     pub payment_method: Option<String>,
     pub ingestion_metadata: Option<serde_json::Value>,
@@ -253,6 +253,7 @@ pub struct PurchaseEconomics {
     pub refunds_purchase_id: Option<Uuid>,
     pub purchase_type: Option<String>,
     pub bonus_for_purchase_id: Option<Uuid>,
+    pub invoice_reconciliation_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -305,7 +306,7 @@ pub struct ReceiptWithVendor {
     pub receipt_number: String,
     pub receipt_date: NaiveDate,
     pub subtotal: Decimal,
-    pub tax_rate: Decimal,
+    pub tax_amount: Decimal,
     pub total: Decimal,
     pub payment_method: Option<String>,
     pub ingestion_metadata: Option<serde_json::Value>,
@@ -319,6 +320,7 @@ pub struct ReceiptWithVendor {
     pub total_selling: Option<Decimal>,
     pub total_commission: Option<Decimal>,
     pub invoiced_count: Option<i64>,
+    pub locked_purchase_count: Option<i64>,
 }
 
 // Invoice detail with destination info and linked purchase economics
@@ -399,6 +401,7 @@ pub struct CreateInvoice {
     pub invoice_date: NaiveDate,
     pub delivery_date: Option<NaiveDate>,
     pub subtotal: Decimal,
+    pub tax_amount: Option<Decimal>,
     pub tax_rate: Option<Decimal>, // defaults to 13.00 if not provided
     pub reconciliation_state: Option<String>,
     pub notes: Option<String>,
@@ -411,6 +414,7 @@ pub struct UpdateInvoice {
     pub invoice_date: Option<NaiveDate>,
     pub delivery_date: Option<NaiveDate>,
     pub subtotal: Option<Decimal>,
+    pub tax_amount: Option<Decimal>,
     pub tax_rate: Option<Decimal>,
     pub reconciliation_state: Option<String>,
     pub notes: Option<String>,
@@ -443,6 +447,7 @@ pub struct CreateInvoiceFromPdfRequest {
     pub invoice_date: String,
     pub delivery_date: Option<String>,
     pub subtotal: String,
+    pub tax_amount: Option<String>,
     pub tax_rate: Option<String>,
     pub notes: Option<String>,
     pub line_items: Vec<CreateInvoiceFromPdfLineItem>,
@@ -747,6 +752,7 @@ mod tests {
             assert_eq!(invoice.order_number, Some("ORD-123".to_string()));
             assert_eq!(invoice.notes, Some("February shipment".to_string()));
             assert_eq!(invoice.subtotal, dec!(2500.50));
+            assert_eq!(invoice.tax_amount, None);
             assert_eq!(invoice.tax_rate, Some(dec!(13.00)));
             assert_eq!(invoice.reconciliation_state, None);
         }
@@ -762,6 +768,7 @@ mod tests {
             let invoice: CreateInvoice = serde_json::from_str(json).unwrap();
             assert_eq!(invoice.order_number, None);
             assert_eq!(invoice.notes, None);
+            assert_eq!(invoice.tax_amount, None);
             assert_eq!(invoice.tax_rate, None);
             assert_eq!(invoice.reconciliation_state, None);
         }
@@ -775,6 +782,7 @@ mod tests {
                 invoice_date: NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
                 delivery_date: None,
                 subtotal: dec!(999.99),
+                tax_amount: None,
                 tax_rate: None,
                 reconciliation_state: None,
                 notes: None,
@@ -794,6 +802,7 @@ mod tests {
             assert_eq!(update.order_number, None);
             assert_eq!(update.invoice_date, None);
             assert_eq!(update.subtotal, None);
+            assert_eq!(update.tax_amount, None);
             assert_eq!(update.tax_rate, None);
             assert_eq!(update.reconciliation_state, None);
             assert_eq!(update.notes, None);
@@ -1185,6 +1194,7 @@ mod tests {
                 refunds_purchase_id: None,
                 purchase_type: None,
                 bonus_for_purchase_id: None,
+                invoice_reconciliation_state: None,
             };
 
             assert_eq!(econ.quantity, -1);
@@ -1223,6 +1233,7 @@ mod tests {
                 refunds_purchase_id: None,
                 purchase_type: None,
                 bonus_for_purchase_id: None,
+                invoice_reconciliation_state: None,
             };
 
             let refund = PurchaseEconomics {
@@ -1252,6 +1263,7 @@ mod tests {
                 refunds_purchase_id: None,
                 purchase_type: None,
                 bonus_for_purchase_id: None,
+                invoice_reconciliation_state: None,
             };
 
             let items = vec![sale, refund];
@@ -1540,6 +1552,7 @@ mod tests {
                 refunds_purchase_id: None,
                 purchase_type: None,
                 bonus_for_purchase_id: None,
+                invoice_reconciliation_state: None,
             }
         }
 
@@ -1573,6 +1586,7 @@ mod tests {
                 refunds_purchase_id: None,
                 purchase_type: None,
                 bonus_for_purchase_id: None,
+                invoice_reconciliation_state: None,
             }
         }
 
@@ -1725,6 +1739,7 @@ mod tests {
                 refunds_purchase_id: None,
                 purchase_type: Some("bonus".to_string()),
                 bonus_for_purchase_id: Some(Uuid::new_v4()),
+                invoice_reconciliation_state: None,
             }
         }
 
@@ -1861,6 +1876,7 @@ mod tests {
                 refunds_purchase_id: None,
                 purchase_type: Some("unit".to_string()),
                 bonus_for_purchase_id: None,
+                invoice_reconciliation_state: None,
             };
 
             assert_eq!(parent.total_commission, Some(dec!(46.00)));

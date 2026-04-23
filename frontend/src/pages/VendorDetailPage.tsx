@@ -340,6 +340,7 @@ export default function VendorDetailPage() {
                   invoice_id: purchase.invoice_id,
                   invoice_unit_price: purchase.invoice_unit_price,
                   destination_code: purchase.destination_code,
+                  invoiceLocked: purchase.invoice_reconciliation_state === "locked",
                 })
 
                 return (
@@ -377,6 +378,10 @@ export default function VendorDetailPage() {
                     {reconciliation.isReconciled ? (
                       <span className="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">
                         Reconciled
+                      </span>
+                    ) : reconciliation.isReadyToReconcile ? (
+                      <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700">
+                        Ready to reconcile
                       </span>
                     ) : (
                       <div className="space-y-1">
