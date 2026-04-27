@@ -12,9 +12,9 @@
     "line_items_count": 11,
     "line_items_expected": [
       {
-        "description_contains": "echo pop",
+        "description_contains": "echo pop (glacier white)",
         "quantity": 2,
-        "unit_cost": "32.99",
+        "unit_cost": "34.34",
         "sub_items_expected": [
           {
             "description_contains": "environmental handling fee",
@@ -24,9 +24,9 @@
         ]
       },
       {
-        "description_contains": "echo spot",
+        "description_contains": "echo spot (glacier white)",
         "quantity": 2,
-        "unit_cost": "59.99",
+        "unit_cost": "61.34",
         "sub_items_expected": [
           {
             "description_contains": "environmental handling fee",
@@ -36,9 +36,9 @@
         ]
       },
       {
-        "description_contains": "echo spot",
+        "description_contains": "echo spot (black)",
         "quantity": 2,
-        "unit_cost": "59.99",
+        "unit_cost": "61.34",
         "sub_items_expected": [
           {
             "description_contains": "environmental handling fee",
@@ -48,9 +48,9 @@
         ]
       },
       {
-        "description_contains": "echo dot",
+        "description_contains": "echo dot (deep sea blue)",
         "quantity": 2,
-        "unit_cost": "39.99",
+        "unit_cost": "41.34",
         "sub_items_expected": [
           {
             "description_contains": "environmental handling fee",
@@ -60,9 +60,9 @@
         ]
       },
       {
-        "description_contains": "echo show 5",
+        "description_contains": "echo show 5 (glacier white)",
         "quantity": 2,
-        "unit_cost": "69.99",
+        "unit_cost": "71.34",
         "sub_items_expected": [
           {
             "description_contains": "environmental handling fee",
@@ -72,33 +72,9 @@
         ]
       },
       {
-        "description_contains": "echo dot",
+        "description_contains": "echo dot (charcoal)",
         "quantity": 2,
-        "unit_cost": "39.99",
-        "sub_items_expected": [
-          {
-            "description_contains": "environmental handling fee",
-            "quantity": 1,
-            "unit_cost": "2.70"
-          }
-        ]
-      },
-      {
-        "description_contains": "echo dot kids",
-        "quantity": 2,
-        "unit_cost": "40.99",
-        "sub_items_expected": [
-          {
-            "description_contains": "environmental handling fee",
-            "quantity": 1,
-            "unit_cost": "2.70"
-          }
-        ]
-      },
-      {
-        "description_contains": "echo show 5",
-        "quantity": 2,
-        "unit_cost": "69.99",
+        "unit_cost": "41.34",
         "sub_items_expected": [
           {
             "description_contains": "environmental handling fee",
@@ -109,13 +85,37 @@
       },
       {
         "description_contains": "echo dot kids",
+        "quantity": 2,
+        "unit_cost": "42.34",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "echo show 5 (charcoal)",
+        "quantity": 2,
+        "unit_cost": "71.34",
+        "sub_items_expected": [
+          {
+            "description_contains": "environmental handling fee",
+            "quantity": 1,
+            "unit_cost": "2.70"
+          }
+        ]
+      },
+      {
+        "description_contains": "echo dot kids (dragon)",
         "quantity": 2,
         "unit_cost": "40.99"
       },
       {
-        "description_contains": "echo dot",
+        "description_contains": "echo dot (glacier white)",
         "quantity": 2,
-        "unit_cost": "39.99",
+        "unit_cost": "41.34",
         "sub_items_expected": [
           {
             "description_contains": "environmental handling fee",
@@ -127,7 +127,7 @@
       {
         "description_contains": "echo dot kids",
         "quantity": 2,
-        "unit_cost": "40.99",
+        "unit_cost": "41.97",
         "sub_items_expected": [
           {
             "description_contains": "environmental handling fee",

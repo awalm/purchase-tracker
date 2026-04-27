@@ -1,3 +1,5 @@
+import concurrent.futures
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -305,16 +307,33 @@ def _should_skip_rotation_fallback(lines: list[dict[str, Any]]) -> bool:
     return any(keyword in text for keyword in ("total", "subtotal", "tax", "amount due"))
 
 
+_logger = logging.getLogger(__name__)
+
+
+def _run_classic_ocr_with_timeout(
+    ocr: PaddleOCR, image: np.ndarray, variant_name: str, timeout: int,
+) -> list[dict[str, Any]]:
+    """Run classic OCR on a single image variant with a timeout."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_run_classic_ocr, ocr, image)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            _logger.warning("Classic OCR variant '%s' timed out after %ds", variant_name, timeout)
+            return []
+
+
 def _ocr_best_from_candidates(candidates: list[tuple[str, np.ndarray]]) -> list[dict[str, Any]]:
     ocr = get_classic_ocr()
     best_lines: list[dict[str, Any]] = []
     best_score = -1.0
+    variant_timeout = env_int("OCR_CLASSIC_VARIANT_TIMEOUT_SECONDS", 10, 2)
 
     candidate_map = {name: image for name, image in candidates}
 
     primary_name = "grayscale" if "grayscale" in candidate_map else next(iter(candidate_map), None)
     if primary_name is not None:
-        lines = _run_classic_ocr(ocr, candidate_map[primary_name])
+        lines = _run_classic_ocr_with_timeout(ocr, candidate_map[primary_name], primary_name, variant_timeout)
         score = _score_lines(lines)
         if score > best_score:
             best_score = score
@@ -322,7 +341,7 @@ def _ocr_best_from_candidates(candidates: list[tuple[str, np.ndarray]]) -> list[
 
     enhanced_enabled = env_bool("OCR_CLASSIC_ENHANCED_FALLBACK_ENABLED", True)
     if enhanced_enabled and "enhanced" in candidate_map and not _has_receipt_signals(best_lines):
-        enhanced_lines = _run_classic_ocr(ocr, candidate_map["enhanced"])
+        enhanced_lines = _run_classic_ocr_with_timeout(ocr, candidate_map["enhanced"], "enhanced", variant_timeout)
         enhanced_score = _score_lines(enhanced_lines)
         if enhanced_score > best_score:
             best_score = enhanced_score
@@ -334,7 +353,7 @@ def _ocr_best_from_candidates(candidates: list[tuple[str, np.ndarray]]) -> list[
     for name, image in candidates:
         if not name.startswith("rot"):
             continue
-        lines = _run_classic_ocr(ocr, image)
+        lines = _run_classic_ocr_with_timeout(ocr, image, name, variant_timeout)
         score = _score_lines(lines)
         if score > best_score:
             best_score = score

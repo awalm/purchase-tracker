@@ -109,6 +109,7 @@ pub struct ReceiptLineItem {
     pub unit_cost: Decimal,
     pub notes: Option<String>,
     pub parent_line_item_id: Option<Uuid>,
+    pub state: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -123,6 +124,7 @@ pub struct ReceiptLineItemWithItem {
     pub unit_cost: Decimal,
     pub notes: Option<String>,
     pub parent_line_item_id: Option<Uuid>,
+    pub state: String,
     pub allocated_qty: i32,
     pub remaining_qty: i32,
     pub created_at: DateTime<Utc>,
@@ -137,6 +139,8 @@ pub struct Purchase {
     pub receipt_id: Option<Uuid>,
     pub quantity: i32,
     pub purchase_cost: Decimal,
+    pub cost_adjustment: Decimal,
+    pub adjustment_note: Option<String>,
     pub invoice_unit_price: Option<Decimal>, // Invoice-side unit price (invoice context)
     pub destination_id: Option<Uuid>,
     pub status: DeliveryStatus,
@@ -223,6 +227,30 @@ pub struct ActiveItem {
     pub default_destination_code: Option<String>,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
+    pub total_qty: i64,
+    pub total_value: Decimal,
+    pub min_unit_cost: Option<Decimal>,
+    pub avg_unit_cost: Option<Decimal>,
+    pub max_unit_cost: Option<Decimal>,
+    pub total_commission: Option<Decimal>,
+    pub avg_unit_commission: Option<Decimal>,
+    pub last_receipt_date: Option<DateTime<Utc>>,
+}
+
+/// A receipt line for a specific item, joined with receipt metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ItemReceiptLine {
+    pub receipt_line_item_id: Uuid,
+    pub receipt_id: Uuid,
+    pub receipt_number: String,
+    pub receipt_date: NaiveDate,
+    pub vendor_name: Option<String>,
+    pub quantity: i32,
+    pub unit_cost: Decimal,
+    pub line_total: Decimal,
+    pub receipt_subtotal: Decimal,
+    pub receipt_total: Decimal,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -235,6 +263,8 @@ pub struct PurchaseEconomics {
     pub destination_code: Option<String>,
     pub quantity: i32,
     pub purchase_cost: Decimal,
+    pub cost_adjustment: Option<Decimal>,
+    pub adjustment_note: Option<String>,
     pub total_cost: Option<Decimal>,
     pub invoice_unit_price: Option<Decimal>,
     pub total_selling: Option<Decimal>,
@@ -254,6 +284,9 @@ pub struct PurchaseEconomics {
     pub purchase_type: Option<String>,
     pub bonus_for_purchase_id: Option<Uuid>,
     pub invoice_reconciliation_state: Option<String>,
+    pub bonus_parent_item_name: Option<String>,
+    pub bonus_parent_quantity: Option<i32>,
+    pub bonus_parent_invoice_number: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -394,6 +427,17 @@ pub struct UpdateItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferItemRequest {
+    pub target_item_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferItemResult {
+    pub purchases_transferred: i64,
+    pub receipt_lines_transferred: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateInvoice {
     pub destination_id: Uuid,
     pub invoice_number: String,
@@ -509,6 +553,7 @@ pub struct CreateReceiptLineItem {
     pub unit_cost: Decimal,
     pub notes: Option<String>,
     pub parent_line_item_id: Option<Uuid>,
+    pub state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +562,7 @@ pub struct UpdateReceiptLineItem {
     pub quantity: Option<i32>,
     pub unit_cost: Option<Decimal>,
     pub notes: Option<String>,
+    pub state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,7 +582,7 @@ pub struct CreatePurchase {
     pub bonus_for_purchase_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdatePurchase {
     pub item_id: Option<Uuid>,
     pub invoice_id: Option<Uuid>,
@@ -547,6 +593,10 @@ pub struct UpdatePurchase {
     pub clear_receipt: bool, // true → set receipt_id to NULL
     pub quantity: Option<i32>,
     pub purchase_cost: Option<Decimal>,
+    pub cost_adjustment: Option<Decimal>,
+    pub adjustment_note: Option<String>,
+    #[serde(default)]
+    pub clear_adjustment_note: bool, // true → set adjustment_note to NULL
     pub invoice_unit_price: Option<Decimal>, // Invoice-side unit price (invoice context)
     #[serde(default)]
     pub clear_invoice_unit_price: bool, // true → set invoice_unit_price to NULL
@@ -601,6 +651,60 @@ pub struct AutoAllocatePurchaseResult {
     pub allocations_updated: i32,
     pub receipts_touched: i32,
     pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitPurchaseLine {
+    pub item_id: Uuid,
+    pub quantity: i32,
+    pub purchase_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitPurchaseRequest {
+    pub lines: Vec<SplitPurchaseLine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitPurchaseResult {
+    pub original_purchase_id: Uuid,
+    pub created_purchases: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistributeBonusItem {
+    pub item_id: Uuid,
+    /// If None, auto-fill from existing purchases. If Some, use as fixed qty.
+    pub quantity: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistributeBonusRequest {
+    pub items: Vec<DistributeBonusItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistributeBonusPreviewItem {
+    pub item_id: Uuid,
+    pub item_name: String,
+    pub auto_qty: i32,
+    pub parent_count: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistributeBonusPreviewResult {
+    pub items: Vec<DistributeBonusPreviewItem>,
+    pub total_qty: i32,
+    pub original_qty: i32,
+    pub remainder: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistributeBonusResult {
+    pub bonus_purchases_created: i32,
+    pub total_qty_attributed: i32,
+    pub remainder_qty: i32,
+    pub remainder_purchase_id: Option<Uuid>,
 }
 
 // ============================================
@@ -1195,6 +1299,9 @@ mod tests {
                 purchase_type: None,
                 bonus_for_purchase_id: None,
                 invoice_reconciliation_state: None,
+                bonus_parent_item_name: None,
+                bonus_parent_quantity: None,
+                bonus_parent_invoice_number: None,
             };
 
             assert_eq!(econ.quantity, -1);
@@ -1234,6 +1341,9 @@ mod tests {
                 purchase_type: None,
                 bonus_for_purchase_id: None,
                 invoice_reconciliation_state: None,
+                bonus_parent_item_name: None,
+                bonus_parent_quantity: None,
+                bonus_parent_invoice_number: None,
             };
 
             let refund = PurchaseEconomics {
@@ -1264,6 +1374,9 @@ mod tests {
                 purchase_type: None,
                 bonus_for_purchase_id: None,
                 invoice_reconciliation_state: None,
+                bonus_parent_item_name: None,
+                bonus_parent_quantity: None,
+                bonus_parent_invoice_number: None,
             };
 
             let items = vec![sale, refund];
@@ -1431,6 +1544,14 @@ mod tests {
                 default_destination_code: Some("BSC".to_string()),
                 notes: None,
                 created_at: Utc::now(),
+                total_qty: 0,
+                total_value: dec!(0),
+                min_unit_cost: None,
+                avg_unit_cost: None,
+                max_unit_cost: None,
+                total_commission: None,
+                avg_unit_commission: None,
+                last_receipt_date: None,
             };
             let json = serde_json::to_string(&item).unwrap();
             assert!(
@@ -1492,6 +1613,14 @@ mod tests {
                 default_destination_code: Some("CBG".to_string()),
                 notes: Some("White model".to_string()),
                 created_at: Utc::now(),
+                total_qty: 0,
+                total_value: dec!(0),
+                min_unit_cost: None,
+                avg_unit_cost: None,
+                max_unit_cost: None,
+                total_commission: None,
+                avg_unit_commission: None,
+                last_receipt_date: None,
             };
             let json = serde_json::to_string(&item).unwrap();
             let parsed: ActiveItem = serde_json::from_str(&json).unwrap();
@@ -1553,6 +1682,9 @@ mod tests {
                 purchase_type: None,
                 bonus_for_purchase_id: None,
                 invoice_reconciliation_state: None,
+                bonus_parent_item_name: None,
+                bonus_parent_quantity: None,
+                bonus_parent_invoice_number: None,
             }
         }
 
@@ -1587,6 +1719,9 @@ mod tests {
                 purchase_type: None,
                 bonus_for_purchase_id: None,
                 invoice_reconciliation_state: None,
+                bonus_parent_item_name: None,
+                bonus_parent_quantity: None,
+                bonus_parent_invoice_number: None,
             }
         }
 
@@ -1740,6 +1875,9 @@ mod tests {
                 purchase_type: Some("bonus".to_string()),
                 bonus_for_purchase_id: Some(Uuid::new_v4()),
                 invoice_reconciliation_state: None,
+                bonus_parent_item_name: None,
+                bonus_parent_quantity: None,
+                bonus_parent_invoice_number: None,
             }
         }
 
@@ -1877,12 +2015,100 @@ mod tests {
                 purchase_type: Some("unit".to_string()),
                 bonus_for_purchase_id: None,
                 invoice_reconciliation_state: None,
+                bonus_parent_item_name: None,
+                bonus_parent_quantity: None,
+                bonus_parent_invoice_number: None,
             };
 
             assert_eq!(parent.total_commission, Some(dec!(46.00)));
             assert_eq!(parent.unit_commission, Some(dec!(4.60)));
             assert_eq!(parent.total_selling, Some(dec!(96.00)));
             assert_eq!(parent.tax_owed, Some(dec!(5.98)));
+        }
+
+        #[test]
+        fn bonus_parent_fields_none_by_default() {
+            let econ = make_bonus_economics(1, dec!(10.00));
+            // Test helper sets no parent info — simulates unresolved parent
+            assert!(econ.bonus_parent_item_name.is_none());
+            assert!(econ.bonus_parent_quantity.is_none());
+            assert!(econ.bonus_parent_invoice_number.is_none());
+        }
+
+        #[test]
+        fn bonus_parent_fields_populated_for_cross_invoice() {
+            let mut econ = make_bonus_economics(3, dec!(0.50));
+            econ.bonus_parent_item_name = Some("Echo Dot 5th Gen Blue".to_string());
+            econ.bonus_parent_quantity = Some(28);
+            econ.bonus_parent_invoice_number = Some("6".to_string());
+
+            assert_eq!(econ.bonus_parent_item_name.as_deref(), Some("Echo Dot 5th Gen Blue"));
+            assert_eq!(econ.bonus_parent_quantity, Some(28));
+            assert_eq!(econ.bonus_parent_invoice_number.as_deref(), Some("6"));
+            assert!(econ.bonus_for_purchase_id.is_some(), "attributed bonus must have parent id");
+        }
+
+        #[test]
+        fn unit_purchase_has_no_parent_fields() {
+            let parent = PurchaseEconomics {
+                purchase_id: Uuid::new_v4(),
+                purchase_date: Utc::now(),
+                item_id: Uuid::new_v4(),
+                item_name: "Widget".to_string(),
+                vendor_name: None,
+                destination_code: None,
+                quantity: 5,
+                purchase_cost: dec!(10),
+                total_cost: Some(dec!(50)),
+                invoice_unit_price: Some(dec!(15)),
+                total_selling: Some(dec!(75)),
+                unit_commission: Some(dec!(5)),
+                total_commission: Some(dec!(25)),
+                tax_paid: Some(dec!(6.50)),
+                tax_owed: Some(dec!(3.25)),
+                status: DeliveryStatus::Delivered,
+                delivery_date: None,
+                invoice_id: None,
+                receipt_id: None,
+                receipt_number: None,
+                invoice_number: None,
+                allow_receipt_date_override: false,
+                notes: None,
+                refunds_purchase_id: None,
+                purchase_type: Some("unit".to_string()),
+                bonus_for_purchase_id: None,
+                invoice_reconciliation_state: None,
+                bonus_parent_item_name: None,
+                bonus_parent_quantity: None,
+                bonus_parent_invoice_number: None,
+            };
+
+            assert!(parent.bonus_for_purchase_id.is_none());
+            assert!(parent.bonus_parent_item_name.is_none());
+            assert!(parent.bonus_parent_quantity.is_none());
+            assert!(parent.bonus_parent_invoice_number.is_none());
+        }
+
+        #[test]
+        fn bonus_parent_fields_serialize_in_json() {
+            let mut econ = make_bonus_economics(2, dec!(0.50));
+            econ.bonus_parent_item_name = Some("PS5 Pro".to_string());
+            econ.bonus_parent_quantity = Some(6);
+            econ.bonus_parent_invoice_number = Some("7".to_string());
+
+            let json = serde_json::to_value(&econ).unwrap();
+            assert_eq!(json["bonus_parent_item_name"], "PS5 Pro");
+            assert_eq!(json["bonus_parent_quantity"], 6);
+            assert_eq!(json["bonus_parent_invoice_number"], "7");
+        }
+
+        #[test]
+        fn bonus_parent_fields_serialize_null_when_none() {
+            let econ = make_bonus_economics(1, dec!(0.50));
+            let json = serde_json::to_value(&econ).unwrap();
+            assert!(json["bonus_parent_item_name"].is_null());
+            assert!(json["bonus_parent_quantity"].is_null());
+            assert!(json["bonus_parent_invoice_number"].is_null());
         }
     }
 }

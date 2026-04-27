@@ -15,6 +15,7 @@ const makeLine = (remainingQty: number): ReceiptLineItem => ({
   unit_cost: "39.99",
   notes: null,
   parent_line_item_id: null,
+  state: "active",
   allocated_qty: 12 - remainingQty,
   remaining_qty: remainingQty,
   created_at: "2026-04-18T00:00:00Z",

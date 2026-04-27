@@ -69,6 +69,8 @@ interface Invoice {
   notes: string | null
   purchase_count: number | null
   purchases_total: string | null
+  total_cost: string | null
+  total_commission: string | null
   receipted_count: number | null
 }
 
@@ -557,8 +559,15 @@ export default function InvoicesPage() {
     }
   }
 
-  // Summary stats
+  // Summary stats - only include finalized invoices per commission policy
   const totalInvoiceValue = invoices.reduce((sum, inv) => sum + parseFloat(inv.subtotal), 0)
+  const totalCost = invoices
+    .filter((inv) => inv.reconciliation_state === "locked")
+    .reduce((sum, inv) => sum + parseFloat(inv.total_cost || "0"), 0)
+  const totalCommission = invoices
+    .filter((inv) => inv.reconciliation_state === "locked")
+    .reduce((sum, inv) => sum + parseFloat(inv.total_commission || "0"), 0)
+  const commissionPct = totalCost > 0 ? (totalCommission / totalCost) * 100 : null
   const unfinalizedCount = invoices.filter((inv) => inv.reconciliation_state !== "locked").length
   const emptyCount = invoices.filter(inv => (inv.purchase_count || 0) === 0).length
 
@@ -581,13 +590,13 @@ export default function InvoicesPage() {
             columns={[
               { header: "Invoice #", accessor: (inv: Invoice) => inv.invoice_number },
               { header: "Destination", accessor: (inv: Invoice) => `${inv.destination_code} - ${inv.destination_name}` },
-              { header: "Order #", accessor: (inv: Invoice) => inv.order_number },
               { header: "Date", accessor: (inv: Invoice) => inv.invoice_date },
               { header: "Subtotal", accessor: (inv: Invoice) => inv.subtotal },
               { header: "Tax Rate", accessor: (inv: Invoice) => formatNumber(inv.tax_rate) },
               { header: "Total", accessor: (inv: Invoice) => inv.total },
               { header: "Purchase Count", accessor: (inv: Invoice) => inv.purchase_count },
               { header: "Purchases Total", accessor: (inv: Invoice) => inv.purchases_total },
+              { header: "Total Commission", accessor: (inv: Invoice) => inv.total_commission },
               { header: "Notes", accessor: (inv: Invoice) => inv.notes },
             ]}
             data={invoices}
@@ -755,7 +764,7 @@ export default function InvoicesPage() {
                 Import from PDF
               </Button>
             </DialogTrigger>
-            <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">
+            <DialogContent className="max-w-lg">
               <DialogHeader>
                 <DialogTitle>Import Invoice from PDF</DialogTitle>
               </DialogHeader>
@@ -1341,7 +1350,7 @@ export default function InvoicesPage() {
       )}
 
       {/* Summary cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
         <Card>
           <CardContent className="pt-6">
             <p className="text-sm text-muted-foreground">Total Invoices</p>
@@ -1352,6 +1361,22 @@ export default function InvoicesPage() {
           <CardContent className="pt-6">
             <p className="text-sm text-muted-foreground">Total Value</p>
             <p className="text-2xl font-bold">{formatCurrency(totalInvoiceValue)}</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="pt-6">
+            <p className="text-sm text-muted-foreground">Total Commission</p>
+            <p className={`text-2xl font-bold ${totalCommission >= 0 ? "text-green-600" : "text-red-600"}`}>
+              {formatCurrency(totalCommission)}
+            </p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="pt-6">
+            <p className="text-sm text-muted-foreground">Commission %</p>
+            <p className={`text-2xl font-bold ${commissionPct === null ? "text-muted-foreground" : commissionPct >= 0 ? "text-green-600" : "text-red-600"}`}>
+              {commissionPct === null ? "-" : `${commissionPct.toFixed(1)}%`}
+            </p>
           </CardContent>
         </Card>
         <Card>
@@ -1388,10 +1413,10 @@ export default function InvoicesPage() {
                 </TableHead>
                 <TableHead>Invoice #</TableHead>
                 <TableHead>Destination</TableHead>
-                <TableHead>Order #</TableHead>
                 <TableHead>Date</TableHead>
                 <TableHead className="text-right">Subtotal</TableHead>
                 <TableHead className="text-right">Purchases</TableHead>
+                <TableHead className="text-right">Commission</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Notes</TableHead>
                 <TableHead className="w-[76px]">Actions</TableHead>
@@ -1414,13 +1439,15 @@ export default function InvoicesPage() {
                   </TableCell>
                   <TableCell className="font-mono font-medium text-blue-600 hover:text-blue-800 hover:underline">{inv.invoice_number}</TableCell>
                   <TableCell>{inv.destination_code} - {inv.destination_name}</TableCell>
-                  <TableCell className="font-mono">{inv.order_number || "-"}</TableCell>
                   <TableCell>{formatDate(inv.invoice_date)}</TableCell>
                   <TableCell className="text-right">{formatCurrency(inv.subtotal)}</TableCell>
                   <TableCell className="text-right">
                     <span className="text-muted-foreground">
                       {inv.purchase_count || 0} items · {formatCurrency(inv.purchases_total || "0")}
                     </span>
+                  </TableCell>
+                  <TableCell className={`text-right ${parseFloat(inv.total_commission || "0") >= 0 ? "text-green-600" : "text-red-600"}`}>
+                    {formatCurrency(inv.total_commission || "0")}
                   </TableCell>
                   <TableCell>
                     <ReconciliationBadge invoice={inv} />

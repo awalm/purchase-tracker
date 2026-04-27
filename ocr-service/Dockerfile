@@ -21,6 +21,7 @@ COPY ocr_service_classic_engine.py ./
 COPY ocr_service_llm_engine.py ./
 COPY ocr_service_orchestrator.py ./
 COPY ocr-service-orchestrator.py ./
+COPY amazon_rules.json ./
 
 EXPOSE 8001
 

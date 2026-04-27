@@ -13,12 +13,27 @@ use crate::{
 
 use super::AppState;
 
+#[derive(Debug, serde::Serialize)]
+pub struct TaxValidationError {
+    pub error: String,
+    pub missing_tax_rates: Vec<MissingTaxRate>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MissingTaxRate {
+    pub invoice_id: String,
+    pub invoice_number: String,
+    pub reconciliation_state: String,
+    pub message: String,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_items).post(create_item))
         .route("/active", get(list_active_items))
         .route("/{id}", get(get_item).put(update_item).delete(delete_item))
         .route("/{id}/purchases", get(list_item_purchases))
+        .route("/{id}/receipt-lines", get(list_item_receipt_lines))
 }
 
 async fn list_items(
@@ -94,9 +109,72 @@ async fn delete_item(
 async fn list_item_purchases(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<PurchaseEconomics>>, (StatusCode, String)> {
+) -> Result<Json<Vec<PurchaseEconomics>>, (StatusCode, Json<TaxValidationError>)> {
+    // Check for missing tax rates first
+    if let Some(missing) = check_missing_tax_rates(&state.pool).await.ok().flatten() {
+        if !missing.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(TaxValidationError {
+                    error: format!(
+                        "Cannot retrieve item purchases: {} invoice(s) have missing tax rates. Please add tax_rate to these invoices.",
+                        missing.len()
+                    ),
+                    missing_tax_rates: missing,
+                }),
+            ));
+        }
+    }
+
     let purchases = queries::get_purchases_by_item(&state.pool, id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(TaxValidationError {
+                error: format!("Database error: {}", e),
+                missing_tax_rates: vec![],
+            }),
+        ))?;
     Ok(Json(purchases))
+}
+
+async fn list_item_receipt_lines(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<ItemReceiptLine>>, (StatusCode, String)> {
+    let lines = queries::get_item_receipt_lines(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(lines))
+}
+
+/// Check for invoices that are locked but have NULL tax_rate
+async fn check_missing_tax_rates(
+    pool: &sqlx::PgPool,
+) -> Result<Option<Vec<MissingTaxRate>>, sqlx::Error> {
+    let missing: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id::text, invoice_number, reconciliation_state 
+         FROM invoices 
+         WHERE reconciliation_state IN ('locked', 'in_review', 'reconciled')
+         AND tax_rate IS NULL 
+         ORDER BY invoice_date DESC"
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if missing.is_empty() {
+        return Ok(None);
+    }
+
+    let missing_tax_rates = missing
+        .into_iter()
+        .map(|(id, number, state)| MissingTaxRate {
+            message: format!("Invoice #{} ({}) is missing tax_rate. Click to edit and add the tax rate percentage.", &number, &state),
+            invoice_id: id,
+            invoice_number: number,
+            reconciliation_state: state,
+        })
+        .collect();
+
+    Ok(Some(missing_tax_rates))
 }

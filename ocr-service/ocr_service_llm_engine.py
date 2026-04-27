@@ -105,7 +105,7 @@ def parse_receipt_path_with_score(path: str | Path) -> tuple[dict[str, Any], flo
         "device": os.getenv("OCR_VL_DEVICE", "gpu:0"),
         "max_new_tokens": env_int("OCR_VL_MAX_NEW_TOKENS", 64, 16),
         "max_pixels": env_int("OCR_VL_MAX_PIXELS", 512 * 512, 65536),
-        "timeout_seconds": env_int("OCR_VL_TIMEOUT_SECONDS", 120, 5),
+        "timeout_seconds": env_int("OCR_VL_TIMEOUT_SECONDS", 30, 5),
         "ld_library_path_prefix": os.getenv("OCR_VL_LD_LIBRARY_PATH_PREFIX", "/usr/lib/wsl/lib"),
     }
 

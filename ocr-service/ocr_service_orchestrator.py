@@ -61,6 +61,10 @@ def _append_warning_with_final_engine(parsed: dict[str, Any], warning: str, engi
     parsed["warnings"].append(f"{warning} Final engine: {_engine_display_name(engine)}.")
 
 
+def _vl_enabled() -> bool:
+    return env_bool("OCR_VL_ENABLED", False)
+
+
 def parse_receipt_path(path: str | Path) -> dict[str, Any]:
     path = str(path)
     threshold = env_float("OCR_LOW_CONFIDENCE_THRESHOLD", 8.0, 0.0)
@@ -78,11 +82,14 @@ def parse_receipt_path(path: str | Path) -> dict[str, Any]:
     if classic_result is not None and classic_error is None:
         if not is_low_confidence(classic_result, classic_score, threshold):
             return classic_result
+        # For Best Buy receipts with valid classic parse, keep classic engine to avoid VL timeout
+        if classic_result.get("vendor_name") == "Best Buy" and classic_result.get("receipt_number"):
+            return classic_result
         fallback_reason = f"Low-confidence parse (score {classic_score:.2f} < {threshold:.2f})"
     else:
         fallback_reason = f"Classic PaddleOCR failed: {classic_error}"
 
-    if not env_bool("OCR_VL_ENABLED", True):
+    if not _vl_enabled():
         if classic_result is not None:
             _append_warning_with_final_engine(
                 classic_result,
@@ -156,6 +163,10 @@ def parse_receipt_path_with_mode(path: str | Path, mode: str) -> dict[str, Any]:
         return classic_result
 
     if normalized == "vl":
+        if not _vl_enabled():
+            raise RuntimeError(
+                "Forced OCR mode 'vl' requested, but PaddleOCR-VL is disabled by OCR_VL_ENABLED=0."
+            )
         vl_available, vl_unavailable_reason = check_vl_engine_available()
         if not vl_available:
             vl_reason = vl_unavailable_reason or "unknown reason"
@@ -172,10 +183,14 @@ def parse_receipt_path_with_mode(path: str | Path, mode: str) -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    vl_available, vl_unavailable_reason = check_vl_engine_available()
+    vl_enabled = _vl_enabled()
+    if vl_enabled:
+        vl_available, vl_unavailable_reason = check_vl_engine_available()
+    else:
+        vl_available, vl_unavailable_reason = False, "disabled by OCR_VL_ENABLED=0"
     return {
         "status": "ok",
-        "ocr_vl_enabled": env_bool("OCR_VL_ENABLED", True),
+        "ocr_vl_enabled": vl_enabled,
         "ocr_vl_available": vl_available,
         "ocr_vl_unavailable_reason": vl_unavailable_reason,
     }
@@ -197,17 +212,37 @@ async def parse_receipt(
     if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".pdf"}:
         suffix = ".jpg"
 
+    parse_timeout = env_int("OCR_PARSE_TIMEOUT_SECONDS", 30, 5)
+    semaphore_timeout = env_int("OCR_SEMAPHORE_TIMEOUT_SECONDS", 10, 1)
+
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
         tmp.write(data)
         tmp.flush()
 
         try:
-            async with _parse_limiter:
-                return await run_in_threadpool(parse_receipt_path_with_mode, tmp.name, mode)
+            acquired = await asyncio.wait_for(_parse_limiter.acquire(), timeout=semaphore_timeout)
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=503,
+                detail=f"OCR service is busy. All parse slots occupied for >{semaphore_timeout}s. Try again shortly.",
+            )
+
+        try:
+            return await asyncio.wait_for(
+                run_in_threadpool(parse_receipt_path_with_mode, tmp.name, mode),
+                timeout=parse_timeout,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail=f"OCR timed out after {parse_timeout}s. The receipt may be too complex or the service is overloaded.",
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"OCR failed: {exc}")
+        finally:
+            _parse_limiter.release()
 
 
 if __name__ == "__main__":

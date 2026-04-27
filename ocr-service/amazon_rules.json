@@ -1,0 +1,52 @@
+{
+  "_comment": "Rules for cleaning up Amazon OCR line-item descriptions. Loaded by ocr_service_common.py at startup.",
+
+  "description_cleanup": {
+    "_comment": "If a description matches a prefix pattern, truncate to the short form and append the color variant (if found in nearby OCR text).",
+    "product_prefixes": [
+      "Amazon Echo Show 8",
+      "Amazon Echo Show 5",
+      "Amazon Echo Show",
+      "Amazon Echo Spot",
+      "Amazon Echo Pop Kids",
+      "Amazon Echo Pop",
+      "Amazon Echo Dot Kids",
+      "Amazon Echo Dot",
+      "Amazon Echo Hub",
+      "Amazon Echo Auto",
+      "Amazon Echo Buds",
+      "Amazon Echo Frames",
+      "Amazon Echo Studio",
+      "Amazon Echo"
+    ],
+    "color_variants": [
+      "Charcoal",
+      "Glacier White",
+      "Deep Sea Blue",
+      "Cloud Blue",
+      "Midnight Teal",
+      "Sandstone",
+      "Lavender Bloom",
+      "Arctic White",
+      "Owl Point",
+      "Dragon",
+      "Galaxy",
+      "Space",
+      "Sapphire",
+      "Twilight Blue",
+      "Breeze Blue",
+      "Glacier",
+      "Emerald",
+      "Denim Blue",
+      "Pearl White",
+      "White",
+      "Black",
+      "Blue",
+      "Green",
+      "Purple",
+      "Red",
+      "Pink"
+    ],
+    "color_scan_lines_after": 2
+  }
+}

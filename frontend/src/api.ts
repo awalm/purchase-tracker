@@ -220,6 +220,14 @@ export const items = {
       default_destination_code: string | null;
       notes: string | null;
       created_at: string;
+      total_qty: number;
+      total_value: string;
+      min_unit_cost: string | null;
+      avg_unit_cost: string | null;
+      max_unit_cost: string | null;
+      total_commission: string | null;
+      avg_unit_commission: string | null;
+      last_receipt_date: string | null;
     }[]>('/items/active'),
   create: (data: {
     name: string;
@@ -237,6 +245,11 @@ export const items = {
     }),
   delete: (id: string) =>
     request<void>(`/items/${id}`, { method: 'DELETE' }),
+  transfer: (sourceId: string, targetItemId: string) =>
+    request<{ purchases_transferred: number; receipt_lines_transferred: number }>(
+      `/items/${sourceId}/transfer`,
+      { method: 'POST', body: JSON.stringify({ target_item_id: targetItemId }) }
+    ),
   get: (id: string) =>
     request<{
       id: string;
@@ -276,6 +289,20 @@ export const items = {
       bonus_for_purchase_id: string | null;
       invoice_reconciliation_state: string | null;
     }[]>(`/items/${id}/purchases`),
+  receiptLines: (id: string) =>
+    request<{
+      receipt_line_item_id: string;
+      receipt_id: string;
+      receipt_number: string;
+      receipt_date: string;
+      vendor_name: string | null;
+      quantity: number;
+      unit_cost: string;
+      line_total: string;
+      receipt_subtotal: string;
+      receipt_total: string;
+      notes: string | null;
+    }[]>(`/items/${id}/receipt-lines`),
 };
 
 // Invoices
@@ -357,6 +384,9 @@ export const invoices = {
       purchase_type: string | null;
       bonus_for_purchase_id: string | null;
       invoice_reconciliation_state: string | null;
+      bonus_parent_item_name: string | null;
+      bonus_parent_quantity: number | null;
+      bonus_parent_invoice_number: string | null;
     }[]>(`/invoices/${id}/purchases`),
   create: (data: {
     destination_id: string;
@@ -598,12 +628,12 @@ export const receipts = {
   lineItems: {
     list: (id: string) =>
       request<ReceiptLineItem[]>(`/receipts/${id}/line-items`),
-    create: (id: string, data: { item_id: string; quantity: number; unit_cost: string; notes?: string; parent_line_item_id?: string }) =>
+    create: (id: string, data: { item_id: string; quantity: number; unit_cost: string; notes?: string; parent_line_item_id?: string; state?: string }) =>
       request<ReceiptLineItem>(`/receipts/${id}/line-items`, {
         method: 'POST',
         body: JSON.stringify(data),
       }),
-    update: (id: string, lineItemId: string, data: { item_id?: string; quantity?: number; unit_cost?: string; notes?: string }) =>
+    update: (id: string, lineItemId: string, data: { item_id?: string; quantity?: number; unit_cost?: string; notes?: string; state?: string }) =>
       request<ReceiptLineItem>(`/receipts/${id}/line-items/${lineItemId}`, {
         method: 'PUT',
         body: JSON.stringify(data),
@@ -732,6 +762,28 @@ export const purchases = {
     }),
   delete: (id: string) =>
     request<void>(`/purchases/${id}`, { method: 'DELETE' }),
+  split: (id: string, data: { lines: { item_id: string; quantity: number; purchase_type?: string }[] }) =>
+    request<{ original_purchase_id: string; created_purchases: string[] }>(`/purchases/${id}/split`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  distributePreview: (id: string) =>
+    request<{
+      items: { item_id: string; item_name: string; auto_qty: number; parent_count: number }[];
+      total_qty: number;
+      original_qty: number;
+      remainder: number;
+    }>(`/purchases/${id}/distribute-preview`),
+  distribute: (id: string, data: { items: { item_id: string; quantity?: number }[] }) =>
+    request<{
+      bonus_purchases_created: number;
+      total_qty_attributed: number;
+      remainder_qty: number;
+      remainder_purchase_id: string | null;
+    }>(`/purchases/${id}/distribute`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   allocations: {
     list: (purchaseId: string) =>
       request<PurchaseAllocation[]>(`/purchases/${purchaseId}/allocations`),
@@ -762,6 +814,22 @@ export const purchases = {
 };
 
 // Reports
+export interface UnreconciledReceiptItem {
+  receipt_line_item_id: string;
+  receipt_id: string;
+  receipt_number: string;
+  receipt_date: string;
+  vendor_name: string;
+  item_id: string;
+  item_name: string;
+  line_quantity: number;
+  unit_cost: string;
+  line_total: string;
+  allocated_to_invoice_qty: number;
+  unreconciled_qty: number;
+  unreconciled_value: string;
+}
+
 export const reports = {
   vendorSummary: () =>
     request<{
@@ -786,6 +854,13 @@ export const reports = {
       total_tax_paid: string | null;
       total_tax_owed: string | null;
     }[]>('/reports/destinations'),
+  unreconciledItems: (from?: string, to?: string) => {
+    const params = new URLSearchParams();
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    const query = params.toString();
+    return request<UnreconciledReceiptItem[]>(`/reports/unreconciled-items${query ? `?${query}` : ''}`);
+  },
 };
 
 // Import
@@ -1180,6 +1255,7 @@ export interface ReceiptLineItem {
   unit_cost: string;
   notes: string | null;
   parent_line_item_id: string | null;
+  state: string;
   allocated_qty: number;
   remaining_qty: number;
   created_at: string;

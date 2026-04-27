@@ -154,6 +154,7 @@ export default function ReceiptDetailPage() {
   const [lineItemQty, setLineItemQty] = useState("1")
   const [lineItemUnitCost, setLineItemUnitCost] = useState("")
   const [lineItemNotes, setLineItemNotes] = useState("")
+  const [lineItemState, setLineItemState] = useState("active")
 
   const [isOpen, setIsOpen] = useState(false)
   const [editingPurchaseId, setEditingPurchaseId] = useState<string | null>(null)
@@ -187,6 +188,7 @@ export default function ReceiptDetailPage() {
     setLineItemQty("1")
     setLineItemUnitCost("")
     setLineItemNotes("")
+    setLineItemState("active")
   }
 
   const handleLineItemSubmit = async (e: React.FormEvent) => {
@@ -199,6 +201,7 @@ export default function ReceiptDetailPage() {
         quantity: Number.parseInt(lineItemQty, 10),
         unit_cost: lineItemUnitCost,
         notes: lineItemNotes || undefined,
+        state: lineItemState,
       })
     } else {
       await receiptsApi.lineItems.create(id, {
@@ -206,6 +209,7 @@ export default function ReceiptDetailPage() {
         quantity: Number.parseInt(lineItemQty, 10),
         unit_cost: lineItemUnitCost,
         notes: lineItemNotes || undefined,
+        state: lineItemState,
       })
     }
 
@@ -221,6 +225,7 @@ export default function ReceiptDetailPage() {
     setLineItemQty(String(line.quantity))
     setLineItemUnitCost(Number.parseFloat(line.unit_cost).toFixed(2))
     setLineItemNotes(line.notes || "")
+    setLineItemState(line.state || "active")
     setLineItemDialogOpen(true)
   }
 
@@ -440,7 +445,7 @@ export default function ReceiptDetailPage() {
     (entry) => entry.operation === "update"
   )
   const latestMetadataAudit = metadataAuditHistory[0]
-  const creatableReceiptLines = receiptLineItems.filter((line) => line.remaining_qty > 0)
+  const creatableReceiptLines = receiptLineItems.filter((line) => line.remaining_qty > 0 && line.state === "active")
   const selectedReceiptLine = receiptLineItems.find((line) => line.id === selectedReceiptLineId)
 
   return (
@@ -474,19 +479,19 @@ export default function ReceiptDetailPage() {
           <div className="flex gap-2 mt-2 flex-wrap">
             {(() => {
               const taxBadge = getReceiptReconciliationBadgeState(receipt, getStoredExpectedTaxRate())
-              if (taxBadge.kind === "tax-math-error") {
+              if (taxBadge.kind === "error") {
                 return (
                   <span className="flex items-center gap-1 text-red-700 bg-red-50 px-3 py-1.5 rounded-full text-sm font-medium">
                     <AlertCircle className="h-4 w-4" />
-                    {taxBadge.label}
+                    {taxBadge.label}{taxBadge.detail ? ` · ${taxBadge.detail}` : ""}
                   </span>
                 )
               }
-              if (taxBadge.kind === "unexpected-tax-rate") {
+              if (taxBadge.kind === "warning") {
                 return (
                   <span className="flex items-center gap-1 text-orange-700 bg-orange-50 px-3 py-1.5 rounded-full text-sm font-medium">
                     <AlertCircle className="h-4 w-4" />
-                    {taxBadge.label}
+                    {taxBadge.label}{taxBadge.detail ? ` · ${taxBadge.detail}` : ""}
                   </span>
                 )
               }
@@ -505,23 +510,23 @@ export default function ReceiptDetailPage() {
             ) : (
               <>
                 {!isCostMatched && (
-                  <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
+                  <span className="flex items-center gap-1 text-slate-600 bg-slate-100 px-3 py-1.5 rounded-full text-sm font-medium">
                     <AlertCircle className="h-4 w-4" />
                     {loadingPurchases
-                      ? "Loading linked purchases..."
+                      ? "Nominal · Checking linked purchases..."
                       : purchasesLoadError
-                        ? "Linked purchases unavailable"
+                        ? "Nominal · Linked purchases unavailable"
                         : purchases.length === 0
                           ? receiptLineItems.length > 0
-                            ? `${receiptLineItems.length} receipt line${receiptLineItems.length === 1 ? "" : "s"} · no linked purchases`
-                            : "No linked purchases"
-                          : `${formatCurrency(Math.abs(costDifference))} ${costDifference > 0 ? "unaccounted" : "over"}`}
+                            ? `Nominal · ${receiptLineItems.length} receipt line${receiptLineItems.length === 1 ? "" : "s"}, no linked purchases`
+                            : "Nominal · No linked purchases"
+                          : `Nominal · Subtotal difference ${formatCurrency(Math.abs(costDifference))}`}
                   </span>
                 )}
                 {purchases.length > 0 && !allInvoiced && (
-                  <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
+                  <span className="flex items-center gap-1 text-slate-600 bg-slate-100 px-3 py-1.5 rounded-full text-sm font-medium">
                     <AlertCircle className="h-4 w-4" />
-                    {purchases.length - unlinkedCount}/{purchases.length} invoiced
+                    Nominal · {purchases.length - unlinkedCount}/{purchases.length} invoiced
                   </span>
                 )}
               </>
@@ -864,6 +869,19 @@ export default function ReceiptDetailPage() {
                   <Label>Notes</Label>
                   <Input value={lineItemNotes} onChange={(e) => setLineItemNotes(e.target.value)} />
                 </div>
+                <div className="space-y-2">
+                  <Label>State</Label>
+                  <Select value={lineItemState} onValueChange={setLineItemState}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="active">Active</SelectItem>
+                      <SelectItem value="returned">Returned</SelectItem>
+                      <SelectItem value="damaged">Damaged</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
                 <div className="flex justify-end gap-2">
                   <Button type="button" variant="outline" onClick={() => setLineItemDialogOpen(false)}>
                     Cancel
@@ -882,6 +900,7 @@ export default function ReceiptDetailPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Item</TableHead>
+                  <TableHead>State</TableHead>
                   <TableHead className="text-right">Qty</TableHead>
                   <TableHead className="text-right">Allocated</TableHead>
                   <TableHead className="text-right">Remaining</TableHead>
@@ -905,8 +924,9 @@ export default function ReceiptDetailPage() {
                   const rows: React.ReactNode[] = []
                   for (const line of parentLines) {
                     rows.push(
-                      <TableRow key={line.id}>
+                      <TableRow key={line.id} className={line.state !== "active" ? "opacity-60" : ""}>
                         <TableCell className="font-medium">{line.item_name}</TableCell>
+                        <TableCell>{line.state !== "active" ? <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">{line.state}</span> : <span className="text-muted-foreground text-xs">active</span>}</TableCell>
                         <TableCell className="text-right">{line.quantity}</TableCell>
                         <TableCell className="text-right">{line.allocated_qty}</TableCell>
                         <TableCell className={`text-right ${line.remaining_qty < 0 ? "text-red-600" : ""}`}>{line.remaining_qty}</TableCell>
@@ -935,8 +955,9 @@ export default function ReceiptDetailPage() {
                     const children = childrenByParent.get(line.id) || []
                     for (const child of children) {
                       rows.push(
-                        <TableRow key={child.id} className="bg-muted/30">
+                        <TableRow key={child.id} className={`bg-muted/30 ${child.state !== "active" ? "opacity-60" : ""}`}>
                           <TableCell className="pl-8 text-muted-foreground text-sm">↳ {child.item_name}</TableCell>
+                          <TableCell>{child.state !== "active" ? <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">{child.state}</span> : <span className="text-muted-foreground text-xs">active</span>}</TableCell>
                           <TableCell className="text-right text-sm">{child.quantity}</TableCell>
                           <TableCell className="text-right text-sm">{child.allocated_qty}</TableCell>
                           <TableCell className={`text-right text-sm ${child.remaining_qty < 0 ? "text-red-600" : ""}`}>{child.remaining_qty}</TableCell>

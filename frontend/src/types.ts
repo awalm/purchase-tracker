@@ -108,6 +108,8 @@ export interface Purchase {
   receipt_id: string | null;
   quantity: number;
   purchase_cost: string;
+  cost_adjustment: string;
+  adjustment_note: string | null;
   invoice_unit_price: string | null;
   destination_id: string | null;
   status: DeliveryStatus;
@@ -128,6 +130,14 @@ export interface ActiveItem {
   default_destination_code: string | null;
   notes: string | null;
   created_at: string;
+  total_qty: number;
+  total_value: string;
+  min_unit_cost: string | null;
+  avg_unit_cost: string | null;
+  max_unit_cost: string | null;
+  total_commission: string | null;
+  avg_unit_commission: string | null;
+  last_receipt_date: string | null;
 }
 
 export interface PurchaseEconomics {
@@ -139,6 +149,8 @@ export interface PurchaseEconomics {
   destination_code: string | null;
   quantity: number;
   purchase_cost: string;
+  cost_adjustment: string | null;
+  adjustment_note: string | null;
   total_cost: string | null;
   invoice_unit_price: string | null;
   total_selling: string | null;
@@ -157,6 +169,10 @@ export interface PurchaseEconomics {
   refunds_purchase_id: string | null;
   purchase_type: string | null;
   bonus_for_purchase_id: string | null;
+  bonus_parent_item_name: string | null;
+  bonus_parent_quantity: number | null;
+  bonus_parent_invoice_number: string | null;
+  invoice_reconciliation_state: string | null;
 }
 
 export interface VendorSummary {

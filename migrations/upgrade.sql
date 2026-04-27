@@ -667,3 +667,110 @@ BEGIN
       CHECK (ABS(subtotal + tax_amount - total) <= 0.02);
   END IF;
 END $$;
+
+-- ============================================
+-- RECEIPT LINE ITEM STATE (returned/damaged support)
+-- ============================================
+ALTER TABLE receipt_line_items
+  ADD COLUMN IF NOT EXISTS state VARCHAR(20) NOT NULL DEFAULT 'active';
+
+-- Add check constraint if not exists
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'chk_receipt_line_items_state'
+  ) THEN
+    ALTER TABLE receipt_line_items ADD CONSTRAINT chk_receipt_line_items_state
+      CHECK (state IN ('active', 'returned', 'damaged'));
+  END IF;
+END $$;
+
+-- ============================================
+-- COST ADJUSTMENT (per-unit economics correction)
+-- ============================================
+-- Allows redistributing promotional/bundle discounts across purchases.
+-- purchase_cost stays as-is (matches actual receipt); economics use purchase_cost + cost_adjustment.
+ALTER TABLE purchases
+  ADD COLUMN IF NOT EXISTS cost_adjustment DECIMAL(10, 4) NOT NULL DEFAULT 0;
+ALTER TABLE purchases
+  ADD COLUMN IF NOT EXISTS adjustment_note TEXT;
+
+-- Recreate v_purchase_economics with cost_adjustment support
+DROP VIEW IF EXISTS v_purchase_economics;
+CREATE VIEW v_purchase_economics AS
+WITH bonus_sums AS (
+    SELECT bonus_for_purchase_id AS parent_id,
+           SUM(quantity * COALESCE(invoice_unit_price, 0)) AS bonus_selling
+    FROM purchases
+    WHERE purchase_type = 'bonus' AND bonus_for_purchase_id IS NOT NULL
+    GROUP BY bonus_for_purchase_id
+)
+SELECT 
+    p.id AS purchase_id,
+    COALESCE(inv.invoice_date::timestamptz, r.receipt_date::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS purchase_date,
+    p.item_id,
+    i.name AS item_name,
+    v.name AS vendor_name,
+    d.code AS destination_code,
+    p.quantity,
+    p.purchase_cost,
+    p.cost_adjustment,
+    p.adjustment_note,
+    CASE WHEN p.purchase_type = 'bonus' THEN 0
+      WHEN (p.purchase_cost + p.cost_adjustment) = 0 AND p.invoice_unit_price IS NOT NULL
+        THEN p.quantity * p.invoice_unit_price
+      ELSE p.quantity * (p.purchase_cost + p.cost_adjustment)
+    END AS total_cost,
+    p.invoice_unit_price,
+    -- total_selling: own selling + attributed bonus selling (not for attributed bonuses)
+    CASE WHEN p.bonus_for_purchase_id IS NOT NULL
+        THEN p.quantity * p.invoice_unit_price
+      ELSE p.quantity * p.invoice_unit_price + COALESCE(bs.bonus_selling, 0)
+    END AS total_selling,
+    -- unit_commission: attributed bonus → 0; standalone bonus → full price; normal → own + bonus boost
+    CASE WHEN p.bonus_for_purchase_id IS NOT NULL THEN 0
+      WHEN p.purchase_type = 'bonus'
+        THEN COALESCE(p.invoice_unit_price, 0)
+      WHEN (p.purchase_cost + p.cost_adjustment) = 0 THEN 0
+      ELSE (p.invoice_unit_price - (p.purchase_cost + p.cost_adjustment))
+           + COALESCE(bs.bonus_selling, 0) / NULLIF(p.quantity, 0)::numeric
+    END AS unit_commission,
+    -- total_commission: attributed bonus → 0; standalone bonus → full; normal → own + bonus
+    CASE WHEN p.bonus_for_purchase_id IS NOT NULL THEN 0
+      WHEN p.purchase_type = 'bonus'
+        THEN p.quantity * COALESCE(p.invoice_unit_price, 0)
+      WHEN (p.purchase_cost + p.cost_adjustment) = 0 THEN 0
+      ELSE p.quantity * (p.invoice_unit_price - (p.purchase_cost + p.cost_adjustment))
+           + COALESCE(bs.bonus_selling, 0)
+    END AS total_commission,
+    CASE WHEN p.purchase_type = 'bonus' THEN 0
+      WHEN (p.purchase_cost + p.cost_adjustment) = 0 AND p.invoice_unit_price IS NOT NULL
+        THEN p.quantity * p.invoice_unit_price * 0.13
+      ELSE p.quantity * (p.purchase_cost + p.cost_adjustment) * 0.13
+    END AS tax_paid,
+    -- tax_owed: attributed bonus → 0; standalone bonus → on commission; normal → on commission + bonus
+    CASE WHEN p.bonus_for_purchase_id IS NOT NULL THEN 0
+      WHEN p.purchase_type = 'bonus'
+        THEN p.quantity * COALESCE(p.invoice_unit_price, 0) * 0.13
+      WHEN (p.purchase_cost + p.cost_adjustment) = 0 THEN 0
+      WHEN p.invoice_unit_price IS NOT NULL
+        THEN (p.quantity * (p.invoice_unit_price - (p.purchase_cost + p.cost_adjustment))
+             + COALESCE(bs.bonus_selling, 0)) * 0.13
+      ELSE 0
+    END AS tax_owed,
+    p.status,
+    p.delivery_date,
+    p.invoice_id,
+    p.receipt_id,
+    r.receipt_number,
+    inv.invoice_number,
+    p.notes,
+    p.purchase_type,
+    inv.reconciliation_state AS invoice_reconciliation_state
+FROM purchases p
+LEFT JOIN bonus_sums bs ON bs.parent_id = p.id
+JOIN items i ON i.id = p.item_id
+LEFT JOIN receipts r ON r.id = p.receipt_id
+LEFT JOIN vendors v ON v.id = r.vendor_id
+LEFT JOIN destinations d ON d.id = p.destination_id
+LEFT JOIN invoices inv ON inv.id = p.invoice_id;

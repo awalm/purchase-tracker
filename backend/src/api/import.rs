@@ -1799,6 +1799,8 @@ pub struct ParsedReceiptLineItem {
     pub unit_cost: Option<String>,
     pub line_total: Option<String>,
     pub confidence: Option<f32>,
+    #[serde(default)]
+    pub sub_items: Option<Vec<ParsedReceiptLineItem>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2108,7 +2110,10 @@ async fn parse_receipt_image(
         endpoint = format!("{}?mode={}", endpoint, mode.as_query_value());
     }
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(35))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let part = match reqwest::multipart::Part::bytes(file_bytes.clone())
         .file_name(file_name.clone())
         .mime_str(&content_type)

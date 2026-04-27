@@ -141,6 +141,18 @@ export function useDeleteItem() {
   })
 }
 
+export function useTransferItem() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ sourceId, targetItemId }: { sourceId: string; targetItemId: string }) =>
+      items.transfer(sourceId, targetItemId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["items"] })
+      queryClient.invalidateQueries({ queryKey: ["item"] })
+    },
+  })
+}
+
 export function useItem(id: string) {
   return useQuery({
     queryKey: ["item", id],
@@ -153,6 +165,14 @@ export function useItemPurchases(id: string) {
   return useQuery({
     queryKey: ["item", id, "purchases"],
     queryFn: () => items.purchases(id),
+    enabled: !!id,
+  })
+}
+
+export function useItemReceiptLines(id: string) {
+  return useQuery({
+    queryKey: ["item", id, "receipt-lines"],
+    queryFn: () => items.receiptLines(id),
     enabled: !!id,
   })
 }
@@ -377,5 +397,12 @@ export function useDestinationSummary() {
   return useQuery({
     queryKey: ["reports", "destinations"],
     queryFn: reports.destinationSummary,
+  })
+}
+
+export function useUnreconciledItems(from?: string, to?: string) {
+  return useQuery({
+    queryKey: ["reports", "unreconciled-items", from, to],
+    queryFn: () => reports.unreconciledItems(from, to),
   })
 }

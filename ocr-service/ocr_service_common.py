@@ -1,7 +1,75 @@
+import json
 import os
 import re
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Any
+
+
+# ── Amazon description cleanup rules (loaded once at import time) ──
+
+_AMAZON_RULES_PATH = Path(__file__).resolve().parent / "amazon_rules.json"
+_AMAZON_RULES: dict[str, Any] = {}
+if _AMAZON_RULES_PATH.is_file():
+    try:
+        _AMAZON_RULES = json.loads(_AMAZON_RULES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass  # graceful fallback — no cleanup applied
+
+
+def _apply_amazon_description_cleanup(
+    items: list[dict[str, Any]],
+    lines: list[dict[str, Any]],
+) -> None:
+    """Shorten verbose Amazon descriptions using rules from amazon_rules.json.
+
+    For each item whose description starts with a known product prefix,
+    truncate to that prefix and append the color variant found in nearby
+    OCR text lines (if any).
+    """
+    cfg = _AMAZON_RULES.get("description_cleanup")
+    if not cfg:
+        return
+    prefixes: list[str] = cfg.get("product_prefixes", [])
+    colors: list[str] = cfg.get("color_variants", [])
+    scan_after: int = cfg.get("color_scan_lines_after", 10)
+    if not prefixes:
+        return
+
+    # Pre-compute lowercase variants for matching (longer prefixes first)
+    prefixes_lower = [(p, p.lower()) for p in sorted(prefixes, key=len, reverse=True)]
+    colors_lower = [(c, c.lower()) for c in sorted(colors, key=len, reverse=True)]
+    all_texts = [l.get("text", "") for l in lines]
+
+    for item in items:
+        desc: str = item.get("description", "")
+        desc_lower = desc.lower()
+        matched_prefix: str | None = None
+        for original, plow in prefixes_lower:
+            if desc_lower.startswith(plow):
+                matched_prefix = original
+                break
+        if matched_prefix is None:
+            continue
+
+        # Scan nearby OCR lines for a color mention
+        src_idx = item.get("_source_index", 0)
+        color_found: str | None = None
+        window_end = min(len(all_texts), src_idx + scan_after + 1)
+        for line_idx in range(src_idx, window_end):
+            line_text = all_texts[line_idx]
+            line_lower = line_text.lower()
+            for color_orig, color_low in colors_lower:
+                if color_low in line_lower:
+                    color_found = color_orig
+                    break
+            if color_found:
+                break
+
+        if color_found:
+            item["description"] = f"{matched_prefix} ({color_found})"
+        else:
+            item["description"] = matched_prefix
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -944,10 +1012,16 @@ def extract_bestbuy_receipt_number_from_metadata(
     if not parsed_date:
         parsed_date = extract_receipt_date_from_texts(texts)
 
-    if not s_value or not r_value or not t_value:
-        return None
-
     bus_date_parts = extract_bus_date_parts()
+
+    # Best effort: use dummy values if any component is missing, so it's obvious
+    # and easily editable. Use 'x' prefix to signal incomplete parse.
+    if not s_value:
+        s_value = "x" + "".join(filter(str.isdigit, normalized[:10]))[:2] if any(c.isdigit() for c in normalized[:10]) else "999"
+    if not r_value:
+        r_value = "x" + "".join(filter(str.isdigit, normalized[10:20]))[:2] if any(c.isdigit() for c in normalized[10:20]) else "999"
+    if not t_value:
+        t_value = "x" + "".join(filter(str.isdigit, normalized[-20:]))[:3] if any(c.isdigit() for c in normalized[-20:]) else "9999"
 
     # Best Buy labels for register (R) and transaction (T) are stable; keep
     # the explicit OCR labels instead of inferring a swap from value lengths.
@@ -1584,6 +1658,34 @@ def extract_amazon_line_items(lines: list[dict[str, Any]]) -> list[dict[str, Any
             fee_item["_source_index"] = idx
             items.append(fee_item)
 
+    # Fold sub_items costs into the parent's unit_cost.
+    # Eco fees are a flat total for the whole line (not per-unit), so we
+    # divide by parent quantity to get the per-unit adjustment.
+    for item in items:
+        subs = item.get("sub_items")
+        if not subs:
+            continue
+        parent_qty = max(item.get("quantity", 1), 1)
+        raw_unit = item.get("unit_cost")
+        if raw_unit is None:
+            continue
+        try:
+            base_unit = float(raw_unit)
+        except (ValueError, TypeError):
+            continue
+        fee_total = 0.0
+        for sub in subs:
+            try:
+                sub_cost = float(sub.get("unit_cost", 0))
+                sub_qty = max(int(sub.get("quantity", 1)), 1)
+                fee_total += sub_cost * sub_qty
+            except (ValueError, TypeError):
+                continue
+        if fee_total > 0:
+            adjusted = base_unit + fee_total / parent_qty
+            item["unit_cost"] = f"{adjusted:.2f}"
+            item["line_total"] = f"{adjusted * parent_qty:.2f}"
+
     # Fallback: if no ASIN-based items found, scan for "qty $price" lines
     # preceded by a description line.
     if not items:
@@ -1636,6 +1738,9 @@ def extract_amazon_line_items(lines: list[dict[str, Any]]) -> list[dict[str, Any
                 "confidence": conf,
                 "_source_index": desc_idx if desc_idx is not None else idx,
             })
+
+    # Clean up verbose descriptions using amazon_rules.json
+    _apply_amazon_description_cleanup(items, lines)
 
     items.sort(
         key=lambda x: (

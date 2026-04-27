@@ -23,6 +23,20 @@ use crate::{
 
 use super::AppState;
 
+#[derive(Debug, serde::Serialize)]
+pub struct TaxValidationError {
+    pub error: String,
+    pub missing_tax_rates: Vec<MissingTaxRate>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MissingTaxRate {
+    pub invoice_id: String,
+    pub invoice_number: String,
+    pub reconciliation_state: String,
+    pub message: String,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_invoices).post(create_invoice))
@@ -76,16 +90,50 @@ async fn get_invoice_detail(
 async fn get_invoice_purchases(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<PurchaseEconomics>>, (StatusCode, String)> {
+) -> Result<Json<Vec<PurchaseEconomics>>, (StatusCode, Json<TaxValidationError>)> {
     // Verify invoice exists
     let _invoice = queries::get_invoice_by_id(&state.pool, id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Invoice not found".to_string()))?;
+        .map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(TaxValidationError {
+                error: format!("Database error: {}", e),
+                missing_tax_rates: vec![],
+            }),
+        ))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            Json(TaxValidationError {
+                error: "Invoice not found".to_string(),
+                missing_tax_rates: vec![],
+            }),
+        ))?;
+
+    // Check for missing tax rates first
+    if let Some(missing) = check_missing_tax_rates(&state.pool).await.ok().flatten() {
+        if !missing.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(TaxValidationError {
+                    error: format!(
+                        "Cannot retrieve purchase economics: {} invoice(s) have missing tax rates. Please add tax_rate to these invoices.",
+                        missing.len()
+                    ),
+                    missing_tax_rates: missing,
+                }),
+            ));
+        }
+    }
 
     let purchases = queries::get_purchases_by_invoice(&state.pool, id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(TaxValidationError {
+                error: format!("Database error: {}", e),
+                missing_tax_rates: vec![],
+            }),
+        ))?;
     Ok(Json(purchases))
 }
 
@@ -135,6 +183,37 @@ fn map_invoice_write_error(err: sqlx::Error) -> (StatusCode, String) {
     }
 
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+}
+
+/// Check for invoices that are locked but have NULL tax_rate
+async fn check_missing_tax_rates(
+    pool: &sqlx::PgPool,
+) -> Result<Option<Vec<MissingTaxRate>>, sqlx::Error> {
+    let missing: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id::text, invoice_number, reconciliation_state 
+         FROM invoices 
+         WHERE reconciliation_state IN ('locked', 'in_review', 'reconciled')
+         AND tax_rate IS NULL 
+         ORDER BY invoice_date DESC"
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if missing.is_empty() {
+        return Ok(None);
+    }
+
+    let missing_tax_rates = missing
+        .into_iter()
+        .map(|(id, number, state)| MissingTaxRate {
+            message: format!("Invoice #{} ({}) is missing tax_rate. Click to edit and add the tax rate percentage.", &number, &state),
+            invoice_id: id,
+            invoice_number: number,
+            reconciliation_state: state,
+        })
+        .collect();
+
+    Ok(Some(missing_tax_rates))
 }
 
 async fn upload_document(
@@ -276,6 +355,12 @@ struct BackupPurchase {
     notes: Option<String>,
     #[serde(alias = "legacy_receipt_id")]
     source_receipt_id: Option<Uuid>,
+    #[serde(default)]
+    purchase_type: Option<String>,
+    #[serde(default)]
+    source_bonus_for_purchase_id: Option<Uuid>,
+    #[serde(default)]
+    source_refunds_purchase_id: Option<Uuid>,
     allocations: Vec<BackupPurchaseAllocation>,
 }
 
@@ -481,6 +566,9 @@ async fn build_invoice_backup_zip(
                 delivery_date: purchase.delivery_date,
                 notes: purchase.notes,
                 source_receipt_id: purchase.receipt_id,
+                purchase_type: purchase.purchase_type.clone(),
+                source_bonus_for_purchase_id: purchase.bonus_for_purchase_id,
+                source_refunds_purchase_id: purchase.refunds_purchase_id,
                 allocations: allocations
                     .into_iter()
                     .map(|allocation| BackupPurchaseAllocation {
@@ -1044,6 +1132,7 @@ async fn import_backup_zip_payload(
                     unit_cost: line_item.unit_cost,
                     notes: line_item.notes.clone(),
                     parent_line_item_id: None,
+                    state: None,
                 },
             )
             .await
@@ -1102,7 +1191,7 @@ async fn import_backup_zip_payload(
                 delivery_date: purchase.delivery_date,
                 notes: purchase.notes.clone(),
                 refunds_purchase_id: None,
-                purchase_type: None,
+                purchase_type: purchase.purchase_type.clone(),
                 bonus_for_purchase_id: None,
             },
             user_id,
@@ -1111,6 +1200,31 @@ async fn import_backup_zip_payload(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         purchase_id_map.insert(purchase.source_id, created_purchase.id);
+    }
+
+    // Second pass: resolve bonus_for_purchase_id and refunds_purchase_id cross-references
+    for purchase in &bundle.purchases {
+        let bonus_target = purchase.source_bonus_for_purchase_id
+            .and_then(|src| purchase_id_map.get(&src).copied());
+        let refund_target = purchase.source_refunds_purchase_id
+            .and_then(|src| purchase_id_map.get(&src).copied());
+
+        if bonus_target.is_some() || refund_target.is_some() {
+            let restored_id = purchase_id_map.get(&purchase.source_id).copied().ok_or((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("Missing restored purchase mapping for {}", purchase.source_id),
+            ))?;
+
+            let update = UpdatePurchase {
+                bonus_for_purchase_id: bonus_target,
+                refunds_purchase_id: refund_target,
+                ..Default::default()
+            };
+
+            queries::update_purchase(&state.pool, restored_id, update, user_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
     }
 
     let mut restored_allocation_count = 0usize;

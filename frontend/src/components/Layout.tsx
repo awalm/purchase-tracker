@@ -10,6 +10,7 @@ import {
   Receipt,
   LogOut,
   Settings,
+  BarChart3,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -22,6 +23,7 @@ const navItems = [
   { to: "/items", icon: Package, label: "Items" },
   { to: "/vendors", icon: Store, label: "Vendors" },
   { to: "/destinations", icon: MapPin, label: "Destinations" },
+  { to: "/reports/unreconciled", icon: BarChart3, label: "Reports" },
   { to: "/options", icon: Settings, label: "Options" },
 ]
 

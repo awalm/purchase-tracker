@@ -1,4 +1,5 @@
 import type { ParsedReceipt } from "@/api"
+import { receipts as receiptsApi } from "@/api"
 import {
   computeImportLineItemsSubtotal,
   mergeMappedImportLines,
@@ -6,6 +7,7 @@ import {
   type MergedMappedImportLine,
 } from "./receiptImportValidation"
 import { getCachedVendorItemId } from "./vendorItemMappingCache"
+import { rememberVendorItemMappings } from "./vendorItemMappingCache"
 
 // ── Shared types ──
 
@@ -414,15 +416,6 @@ export const buildMergedLinesForSave = (
   }> = []
   const learnedMappings: Array<{ sourceText: string; itemId: string }> = []
 
-  // Collect sub_items keyed by their parent's itemId
-  const rawSubItemsByParentItemId = new Map<string, Array<{
-    itemId: string
-    description: string
-    quantity: number
-    unitCost: number
-    notes: string
-  }>>()
-
   for (let i = 0; i < parsedReceipt.line_items.length; i += 1) {
     if (isLineDeleted(overrides.deletedLineIndexes, i)) continue
 
@@ -460,31 +453,6 @@ export const buildMergedLinesForSave = (
     })
 
     learnedMappings.push({ sourceText: description, itemId })
-
-    // Process sub_items for this parent line
-    if (li.sub_items && li.sub_items.length > 0) {
-      for (const sub of li.sub_items) {
-        const subDesc = sub.description.trim()
-        if (!subDesc) continue
-        const subItemId = getAutoMatchedItemId(ctx, subDesc)
-        if (!subItemId) continue // Skip unmappable sub_items
-        const subQty = sub.quantity > 0 ? sub.quantity : 1
-        const subUnitCost = sub.unit_cost ? Number.parseFloat(sub.unit_cost) : NaN
-        if (!Number.isFinite(subUnitCost) || subUnitCost <= 0) continue
-
-        const existing = rawSubItemsByParentItemId.get(itemId) || []
-        existing.push({
-          itemId: subItemId,
-          description: subDesc,
-          quantity: subQty,
-          unitCost: subUnitCost,
-          notes: subDesc,
-        })
-        rawSubItemsByParentItemId.set(itemId, existing)
-
-        learnedMappings.push({ sourceText: subDesc, itemId: subItemId })
-      }
-    }
   }
 
   const parsedLineCountForNumbering = parsedReceipt.line_items.reduce(
@@ -522,20 +490,105 @@ export const buildMergedLinesForSave = (
     throw new Error("No valid mapped line items to create")
   }
 
-  // Merge sub_items per parent and build flat list for save
-  const subItemsForSave: SubItemForSave[] = []
-  for (const [parentItemId, rawSubs] of rawSubItemsByParentItemId) {
-    const mergedSubs = mergeMappedImportLines(rawSubs)
-    for (const sub of mergedSubs) {
-      subItemsForSave.push({
-        parentItemId,
-        itemId: sub.itemId,
-        quantity: sub.quantity,
-        unitCost: sub.unitCost,
-        notes: sub.notes,
+  return { mergedLines, subItemsForSave: [], learnedMappings }
+}
+
+// ── Shared receipt import execution ──
+// Both single-import and bulk-import call this exact function.
+
+export type ExecuteReceiptImportInput = {
+  parsedReceipt: ParsedReceipt
+  overrides: ImportLineOverrides
+  manualLines: ManualImportLine[]
+  autoMatchCtx: { vendorId: string; items: Array<{ id: string; name: string }>; itemIdSet: Set<string> }
+  itemNameById: Map<string, string>
+  vendorId: string
+  receiptNumber: string
+  receiptDate: string
+  subtotal: string
+  taxAmount: string
+  paymentMethod: string
+  notes: string
+  file: File
+  bypassCompression: boolean
+  onStatus?: (msg: string) => void
+}
+
+export type ExecuteReceiptImportResult = {
+  receiptId: string
+}
+
+export const executeReceiptImport = async (
+  input: ExecuteReceiptImportInput
+): Promise<ExecuteReceiptImportResult> => {
+  const {
+    parsedReceipt, overrides, manualLines, autoMatchCtx, itemNameById,
+    vendorId, receiptNumber, receiptDate, subtotal, taxAmount,
+    paymentMethod, notes, file, bypassCompression, onStatus,
+  } = input
+
+  let createdReceiptId: string | null = null
+
+  try {
+    onStatus?.("Creating receipt...")
+    const created = await receiptsApi.create({
+      vendor_id: vendorId,
+      source_vendor_alias: parsedReceipt.vendor_name?.trim() || undefined,
+      ...(receiptNumber.trim() ? { receipt_number: receiptNumber.trim() } : {}),
+      receipt_date: receiptDate,
+      subtotal,
+      tax_amount: taxAmount || undefined,
+      payment_method: paymentMethod || undefined,
+      ingestion_metadata: {
+        source: "ocr",
+        auto_parsed: true,
+        parse_engine: parsedReceipt.parse_engine || "unknown",
+        ...(parsedReceipt.parse_version ? { parse_version: parsedReceipt.parse_version } : {}),
+        ...(parsedReceipt.fixture_used ? { fixture_used: parsedReceipt.fixture_used } : {}),
+        ...(typeof parsedReceipt.confidence_score === "number" ? { confidence_score: parsedReceipt.confidence_score } : {}),
+        ...(parsedReceipt.vendor_name?.trim() ? { raw_vendor_name: parsedReceipt.vendor_name.trim() } : {}),
+        ...(parsedReceipt.warnings.length ? { warnings: parsedReceipt.warnings } : {}),
+        ingested_at: new Date().toISOString(),
+        ingestion_version: "ocr-v1",
+      },
+      notes: notes || undefined,
+    })
+    createdReceiptId = created.id
+
+    onStatus?.("Creating receipt line items...")
+    const { mergedLines, learnedMappings } = buildMergedLinesForSave(
+      parsedReceipt, overrides, manualLines, autoMatchCtx, itemNameById
+    )
+
+    for (const line of mergedLines) {
+      await receiptsApi.lineItems.create(createdReceiptId, {
+        item_id: line.itemId,
+        quantity: line.quantity,
+        unit_cost: line.unitCost,
+        notes: line.notes || undefined,
       })
     }
-  }
 
-  return { mergedLines, subItemsForSave, learnedMappings }
+    onStatus?.("Uploading original receipt document...")
+    await receiptsApi.uploadPdf(createdReceiptId, file, { bypassCompression })
+    rememberVendorItemMappings(vendorId, learnedMappings)
+    onStatus?.("Done")
+
+    return { receiptId: createdReceiptId }
+  } catch (err) {
+    // Rollback: delete the partially-created receipt
+    if (createdReceiptId) {
+      try {
+        await receiptsApi.delete(createdReceiptId)
+        const baseMessage = err instanceof Error ? err.message : "Failed to import receipt"
+        throw new Error(`${baseMessage}. Import was rolled back and temporary receipt (${createdReceiptId}) was deleted.`)
+      } catch (cleanupErr) {
+        if (cleanupErr instanceof Error && cleanupErr.message.includes("rolled back")) throw cleanupErr
+        const baseMessage = err instanceof Error ? err.message : "Failed to import receipt"
+        const cleanupMessage = cleanupErr instanceof Error ? cleanupErr.message : "Failed to clean up created receipt"
+        throw new Error(`${baseMessage}. Receipt was created (${createdReceiptId}) but rollback failed: ${cleanupMessage}`)
+      }
+    }
+    throw err
+  }
 }

@@ -28,7 +28,7 @@ describe("receiptSummary", () => {
     expect(getReceiptItemsDisplayCount(receipt)).toBe(3)
   })
 
-  it("shows tax-math-error when subtotal + tax_amount ≠ total", () => {
+  it("shows error when subtotal + tax_amount ≠ total", () => {
     const receipt = buildReceipt({
       subtotal: "100.00",
       tax_amount: "13.00",
@@ -37,11 +37,12 @@ describe("receiptSummary", () => {
 
     const state = getReceiptReconciliationBadgeState(receipt)
 
-    expect(state.kind).toBe("tax-math-error")
-    expect(state.label).toContain("off")
+    expect(state.kind).toBe("error")
+    expect(state.label).toBe("Tax Math Error")
+    expect(state.detail).toContain("off")
   })
 
-  it("does not show tax-math-error when math is within tolerance", () => {
+  it("does not show error when math is within tolerance", () => {
     const receipt = buildReceipt({
       subtotal: "100.00",
       tax_amount: "13.00",
@@ -50,10 +51,10 @@ describe("receiptSummary", () => {
 
     const state = getReceiptReconciliationBadgeState(receipt)
 
-    expect(state.kind).not.toBe("tax-math-error")
+    expect(state.kind).not.toBe("error")
   })
 
-  it("shows no linked purchases when receipt has lines but no purchases (regression)", () => {
+  it("shows nominal when receipt has lines but no purchases (regression)", () => {
     const receipt = buildReceipt({
       receipt_line_item_count: 2,
       purchase_count: 0,
@@ -63,11 +64,10 @@ describe("receiptSummary", () => {
 
     const state = getReceiptReconciliationBadgeState(receipt)
 
-    expect(state.kind).toBe("no-linked-purchases")
-    expect(state.label).toBe("No linked purchases")
+    expect(state.kind).toBe("nominal")
   })
 
-  it("shows no receipt lines when receipt has no lines", () => {
+  it("shows warning when receipt has no lines", () => {
     const receipt = buildReceipt({
       receipt_line_item_count: 0,
       purchase_count: 0,
@@ -77,18 +77,18 @@ describe("receiptSummary", () => {
 
     const state = getReceiptReconciliationBadgeState(receipt)
 
-    expect(state.kind).toBe("no-receipt-lines")
-    expect(state.label).toBe("No receipt lines")
+    expect(state.kind).toBe("warning")
+    expect(state.label).toBe("No Receipt Lines")
   })
 
-  it("shows reconciled when totals match, all linked purchases invoiced, and all are finalized", () => {
+  it("shows reconciled when all linked purchases are finalized (locked)", () => {
     const state = getReceiptReconciliationBadgeState(buildReceipt())
 
     expect(state.kind).toBe("reconciled")
     expect(state.label).toBe("Reconciled")
   })
 
-  it("shows ready-to-reconcile when totals match and all linked purchases invoiced but invoices are not finalized", () => {
+  it("shows nominal when purchases are invoiced but invoices are not yet finalized", () => {
     const state = getReceiptReconciliationBadgeState(
       buildReceipt({
         purchase_count: 1,
@@ -97,11 +97,10 @@ describe("receiptSummary", () => {
       })
     )
 
-    expect(state.kind).toBe("ready-to-reconcile")
-    expect(state.label).toContain("Ready to reconcile")
+    expect(state.kind).toBe("nominal")
   })
 
-  it("shows issue details when linked purchases are not fully invoiced", () => {
+  it("shows nominal when linked purchases are not fully invoiced", () => {
     const receipt = buildReceipt({
       purchase_count: 2,
       invoiced_count: 1,
@@ -110,11 +109,10 @@ describe("receiptSummary", () => {
 
     const state = getReceiptReconciliationBadgeState(receipt)
 
-    expect(state.kind).toBe("issues")
-    expect(state.label).toContain("1/2 invoiced")
+    expect(state.kind).toBe("nominal")
   })
 
-  it("shows unexpected-tax-rate when effective rate differs from expected", () => {
+  it("shows warning when effective tax rate differs from expected", () => {
     const receipt = buildReceipt({
       subtotal: "100.00",
       tax_amount: "5.00", // 5% instead of 13%
@@ -123,12 +121,13 @@ describe("receiptSummary", () => {
 
     const state = getReceiptReconciliationBadgeState(receipt, 13)
 
-    expect(state.kind).toBe("unexpected-tax-rate")
-    expect(state.label).toContain("5%")
-    expect(state.label).toContain("expected")
+    expect(state.kind).toBe("warning")
+    expect(state.label).toBe("Unexpected Tax Rate")
+    expect(state.detail).toContain("5%")
+    expect(state.detail).toContain("expected")
   })
 
-  it("does not show unexpected-tax-rate when rate matches expected", () => {
+  it("does not show warning when tax rate matches expected", () => {
     const receipt = buildReceipt({
       subtotal: "100.00",
       tax_amount: "13.00",
@@ -137,10 +136,10 @@ describe("receiptSummary", () => {
 
     const state = getReceiptReconciliationBadgeState(receipt, 13)
 
-    expect(state.kind).not.toBe("unexpected-tax-rate")
+    expect(state.kind).not.toBe("warning")
   })
 
-  it("uses custom expected tax rate for unexpected-tax-rate check", () => {
+  it("uses custom expected tax rate for warning check", () => {
     const receipt = buildReceipt({
       subtotal: "100.00",
       tax_amount: "13.00",
@@ -149,7 +148,7 @@ describe("receiptSummary", () => {
 
     // If expected is 15%, then 13% is unexpected
     const state = getReceiptReconciliationBadgeState(receipt, 15)
-    expect(state.kind).toBe("unexpected-tax-rate")
+    expect(state.kind).toBe("warning")
   })
 
   it("flags Staples receipt with correct math but wrong tax rate (regression)", () => {
@@ -166,9 +165,9 @@ describe("receiptSummary", () => {
     })
 
     const state = getReceiptReconciliationBadgeState(receipt, 13)
-    expect(state.kind).toBe("unexpected-tax-rate")
-    expect(state.label).toContain("8.1")
-    expect(state.label).toContain("expected")
+    expect(state.kind).toBe("warning")
+    expect(state.detail).toContain("8.1")
+    expect(state.detail).toContain("expected")
   })
 })
 

@@ -83,7 +83,7 @@ export function ReceiptImportLineTable({
           {parsedReceipt.line_items
             .map((li, idx) => ({ li, idx }))
             .filter(({ idx }) => !isLineDeleted(overrides.deletedLineIndexes, idx))
-            .map(({ li, idx }) => {
+            .flatMap(({ li, idx }) => {
               const selectedItemId =
                 resolveImportedItemId(autoMatchCtx, overrides, idx, li.description) || "__none__"
               const descriptionValue = resolveImportedDescription(
@@ -94,7 +94,7 @@ export function ReceiptImportLineTable({
               const qtyValue = overrides.lineQtyOverrides[idx] ?? String(li.quantity)
               const unitCostValue = overrides.lineUnitCostOverrides[idx] ?? (li.unit_cost || "")
 
-              return (
+              const parentRow = (
                 <TableRow key={`${idx}-${li.description}`}>
                   <TableCell className="align-top">
                     <Input
@@ -168,6 +168,30 @@ export function ReceiptImportLineTable({
                   </TableCell>
                 </TableRow>
               )
+
+              const subRows = (li.sub_items || []).map((sub, subIdx) => {
+                return (
+                  <TableRow key={`${idx}-sub-${subIdx}`} className="bg-muted/30">
+                    <TableCell className="align-top pl-6 text-xs text-muted-foreground italic" colSpan={2}>
+                      ↳ {sub.description} (included in unit cost)
+                    </TableCell>
+                    <TableCell className="align-top text-right text-xs text-muted-foreground">
+                      {sub.quantity}
+                    </TableCell>
+                    <TableCell className="align-top text-right text-xs text-muted-foreground">
+                      {sub.unit_cost ?? "—"}
+                    </TableCell>
+                    <TableCell className="align-top text-center text-xs text-muted-foreground">
+                      {sub.confidence !== null && sub.confidence !== undefined
+                        ? `${Math.round(sub.confidence * 100)}%`
+                        : "—"}
+                    </TableCell>
+                    <TableCell />
+                  </TableRow>
+                )
+              })
+
+              return [parentRow, ...subRows]
             })}
 
           {manualLines.map((line) => (

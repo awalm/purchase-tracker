@@ -45,9 +45,11 @@ import { StatusSelect } from "@/components/StatusSelect"
 import { DateInput } from "@/components/ui/date-input"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
 import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
-import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, FileDown, Upload, Loader2, ChevronDown, ChevronRight, Check, X } from "lucide-react"
+import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, FileDown, Upload, Loader2, ChevronDown, ChevronRight, Check, X, Scissors, Share2 } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
 import { assessPurchaseReconciliation } from "@/lib/purchaseReconciliation"
+import { getBonusAttribution, countUnattributedBonuses, buildDisplayRows } from "@/lib/bonusAttribution"
+import type { PurchaseEconomics } from "@/types"
 import { getOrLoadReceiptLineItems, invalidateReceiptLineItemsCache } from "@/lib/receiptLineItemsCache"
 import { ApiError, invoices as invoicesApi, receipts as receiptsApi, purchases as purchasesApi, type AutoAllocatePurchaseResult, type PurchaseAllocation, type ReceiptLineItem } from "@/api"
 
@@ -91,6 +93,22 @@ export default function InvoiceDetailPage() {
   const [purchasePendingDeleteId, setPurchasePendingDeleteId] = useState<string | null>(null)
   const [editingDeliveryDate, setEditingDeliveryDate] = useState(false)
   const [deliveryDateDraft, setDeliveryDateDraft] = useState("")
+
+  // Split purchase dialog
+  const [splitDialogOpen, setSplitDialogOpen] = useState(false)
+  const [splitPurchase, setSplitPurchase] = useState<InvoicePurchase | null>(null)
+  const [splitLines, setSplitLines] = useState<{ item_id: string; quantity: number; purchase_type: string }[]>([])
+  const [isSplitting, setIsSplitting] = useState(false)
+  const [splitError, setSplitError] = useState("")
+
+  // Distribute bonus dialog
+  const [distributeDialogOpen, setDistributeDialogOpen] = useState(false)
+  const [distributePurchase, setDistributePurchase] = useState<InvoicePurchase | null>(null)
+  const [distributeItems, setDistributeItems] = useState<{ item_id: string; item_name: string; auto_qty: number; parent_count: number; quantity: number; checked: boolean }[]>([])
+  const [isDistributeLoading, setIsDistributeLoading] = useState(false)
+  const [isDistributing, setIsDistributing] = useState(false)
+  const [distributeError, setDistributeError] = useState("")
+  const [distributeStage, setDistributeStage] = useState<"select" | "distribute">("select")
 
   const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -247,22 +265,18 @@ export default function InvoiceDetailPage() {
   const [destinationId, setDestinationId] = useState("")
   const [notes, setNotes] = useState("")
   const [refundsPurchaseId, setRefundsPurchaseId] = useState("")
-  const [bonusForPurchaseId, setBonusForPurchaseId] = useState("")
+  const [purchaseType, setPurchaseType] = useState<"unit" | "bonus" | "refund">("unit")
+  const [costAdjustment, setCostAdjustment] = useState("")
+  const [adjustmentNote, setAdjustmentNote] = useState("")
 
   // Candidate purchases for the "Refunds Purchase" selector (same item, positive qty)
   const parsedQty = parseInt(quantity)
-  const isRefund = !Number.isNaN(parsedQty) && parsedQty < 0
+  const isRefund = purchaseType === "refund" || (!Number.isNaN(parsedQty) && parsedQty < 0)
+  const isBonus = purchaseType === "bonus"
   const { data: itemPurchases = [] } = useItemPurchases(itemId)
   const refundCandidates = itemPurchases.filter(
     (p) => p.quantity > 0 && p.purchase_id !== editingPurchaseId
   )
-  const bonusCandidates = itemPurchases.filter(
-    (p) => p.quantity > 0 && p.purchase_type !== "bonus" && p.purchase_id !== editingPurchaseId
-  )
-  const editingPurchaseType = editingPurchaseId
-    ? purchases.find((p) => p.purchase_id === editingPurchaseId)?.purchase_type
-    : undefined
-  const isBonus = editingPurchaseType === "bonus"
 
   // Receipt-link dialog (focused, not the full edit form)
   const [linkDialogOpen, setLinkDialogOpen] = useState(false)
@@ -287,6 +301,7 @@ export default function InvoiceDetailPage() {
   const [allocatableReceiptIds, setAllocatableReceiptIds] = useState<string[]>([])
   const [loadingAllocatableReceipts, setLoadingAllocatableReceipts] = useState(false)
   const [autoAllocatingPurchaseId, setAutoAllocatingPurchaseId] = useState<string | null>(null)
+  const [isAutoAllocatingAll, setIsAutoAllocatingAll] = useState(false)
   const [autoAllocateLineSummaryByPurchase, setAutoAllocateLineSummaryByPurchase] = useState<Record<string, AutoAllocateLineSummary>>({})
   const receiptLineItemsCacheRef = useRef<Record<string, ReceiptLineItem[]>>({})
 
@@ -323,15 +338,16 @@ export default function InvoiceDetailPage() {
       (sum, a) => sum + Number.parseFloat(a.unit_cost || "0") * a.allocated_qty,
       0
     )
-
-    if (allocs.length > 0 && allocatedQty === purchase.quantity && allocatedQty > 0) {
+    const unitCost = Number.parseFloat(purchase.purchase_cost || "0")
+    if (purchase.quantity > 0 && allocs.length > 0) {
+      const remainingQty = Math.max(0, purchase.quantity - allocatedQty)
+      const blendedTotalCost = allocatedTotalCost + remainingQty * unitCost
       return {
-        unitCost: allocatedTotalCost / allocatedQty,
-        totalCost: allocatedTotalCost,
+        unitCost: blendedTotalCost / purchase.quantity,
+        totalCost: blendedTotalCost,
       }
     }
 
-    const unitCost = Number.parseFloat(purchase.purchase_cost || "0")
     return {
       unitCost,
       totalCost: unitCost * purchase.quantity,
@@ -829,6 +845,18 @@ export default function InvoiceDetailPage() {
     }
   }
 
+  const getAllocatedQtyForPurchase = (purchase: InvoicePurchase) => {
+    return getEffectiveAllocations(purchase).reduce((sum, allocation) => sum + allocation.allocated_qty, 0)
+  }
+
+  const isPurchaseEligibleForAutoAllocation = (purchase: InvoicePurchase) => {
+    if (purchase.purchase_type === "bonus" || purchase.quantity <= 0) {
+      return false
+    }
+
+    return getAllocatedQtyForPurchase(purchase) < purchase.quantity
+  }
+
   const handleAutoAllocatePurchase = async (
     purchase: InvoicePurchase,
     options?: {
@@ -1006,10 +1034,12 @@ export default function InvoiceDetailPage() {
         destination_id: destinationId || undefined,
         invoice_id: id,
         notes: notes || undefined,
+        purchase_type: purchaseType,
         refunds_purchase_id: refundsPurchaseId || undefined,
         clear_refunds_purchase: !refundsPurchaseId,
-        bonus_for_purchase_id: bonusForPurchaseId || undefined,
-        clear_bonus_for_purchase: !bonusForPurchaseId,
+        cost_adjustment: costAdjustment ? costAdjustment : "0",
+        adjustment_note: adjustmentNote || undefined,
+        clear_adjustment_note: !adjustmentNote,
       })
     } else {
       await createPurchase.mutateAsync({
@@ -1020,8 +1050,8 @@ export default function InvoiceDetailPage() {
         destination_id: destinationId || undefined,
         invoice_id: id,
         notes: notes || undefined,
+        purchase_type: purchaseType,
         refunds_purchase_id: refundsPurchaseId || undefined,
-        bonus_for_purchase_id: bonusForPurchaseId || undefined,
       })
     }
     // Also invalidate the invoice detail to refresh counts
@@ -1039,7 +1069,9 @@ export default function InvoiceDetailPage() {
     setDestinationId("")
     setNotes("")
     setRefundsPurchaseId("")
-    setBonusForPurchaseId("")
+    setPurchaseType("unit")
+    setCostAdjustment("")
+    setAdjustmentNote("")
   }
 
   const handleItemChange = (selectedId: string) => {
@@ -1052,6 +1084,88 @@ export default function InvoiceDetailPage() {
       } else if (invoice) {
         setDestinationId(invoice.destination_id)
       }
+    }
+  }
+
+  const handleAutoAllocateAllPurchases = async () => {
+    if (invoiceLocked || isAutoAllocatingAll) {
+      return
+    }
+
+    const eligiblePurchases = purchases.filter(isPurchaseEligibleForAutoAllocation)
+    if (eligiblePurchases.length === 0) {
+      setReconciliationActionNotice("All eligible invoice line items are already fully allocated.")
+      return
+    }
+
+    setReconciliationActionError("")
+    setReconciliationActionNotice("")
+    setIsAutoAllocatingAll(true)
+
+    let linesUpdated = 0
+    let totalAutoAllocatedQty = 0
+    let totalRemainingQty = 0
+    let warningCount = 0
+
+    try {
+      for (const purchase of eligiblePurchases) {
+        try {
+          const result = await purchasesApi.allocations.auto(purchase.purchase_id, {
+            allow_receipt_date_override: Boolean(purchase.allow_receipt_date_override),
+          })
+
+          totalAutoAllocatedQty += result.auto_allocated_qty
+          totalRemainingQty += result.remaining_qty
+
+          if (result.auto_allocated_qty > 0) {
+            linesUpdated += 1
+          }
+
+          if (result.warning) {
+            warningCount += 1
+          }
+
+          clearReceiptLineItemsCache()
+          await reloadAllocations(purchase.purchase_id)
+
+          setAutoAllocateLineSummaryByPurchase((previous) => ({
+            ...previous,
+            [purchase.purchase_id]: buildAutoAllocateLineSummary(result),
+          }))
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 404) {
+            setAllocationApiUnavailable(true)
+            throw err
+          }
+
+          throw err
+        }
+      }
+
+      queryClient.invalidateQueries({ queryKey: ["invoices", id] })
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      queryClient.invalidateQueries({ queryKey: ["receipts"] })
+      queryClient.invalidateQueries({ queryKey: ["reports"] })
+
+      const summaryParts = [
+        `Auto-allocated ${totalAutoAllocatedQty} unit${totalAutoAllocatedQty === 1 ? "" : "s"}`,
+        `across ${linesUpdated} line item${linesUpdated === 1 ? "" : "s"}`,
+      ]
+
+      if (totalRemainingQty > 0) {
+        summaryParts.push(`${totalRemainingQty} unit${totalRemainingQty === 1 ? "" : "s"} still need manual allocation`)
+      }
+
+      if (warningCount > 0) {
+        summaryParts.push(`${warningCount} line item${warningCount === 1 ? "" : "s"} need review`)
+      }
+
+      setReconciliationActionNotice(summaryParts.join(". ") + ".")
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to auto-allocate invoice line items"
+      setReconciliationActionError(message)
+    } finally {
+      setIsAutoAllocatingAll(false)
     }
   }
 
@@ -1071,7 +1185,9 @@ export default function InvoiceDetailPage() {
     setDestinationId(matchedDest?.id || "")
     setNotes(p.notes || "")
     setRefundsPurchaseId(p.refunds_purchase_id || "")
-    setBonusForPurchaseId(p.bonus_for_purchase_id || "")
+    setPurchaseType((p.purchase_type as "unit" | "bonus" | "refund") || "unit")
+    setCostAdjustment(p.cost_adjustment && Number.parseFloat(p.cost_adjustment) !== 0 ? Number.parseFloat(p.cost_adjustment).toFixed(4) : "")
+    setAdjustmentNote(p.adjustment_note || "")
     setIsOpen(true)
   }
 
@@ -1092,6 +1208,130 @@ export default function InvoiceDetailPage() {
     setReconciliationActionError("")
     setPurchasePendingDeleteId(purchaseId)
     setDeletePurchaseDialogOpen(true)
+  }
+
+  const handleOpenSplit = (p: InvoicePurchase) => {
+    if (invoiceLocked) {
+      setReconciliationActionError("Finalized invoices are locked.")
+      return
+    }
+    // Find the item that matches this purchase
+    const matchedItem = items.find((i) => i.name === p.item_name)
+    setSplitPurchase(p)
+    setSplitLines([
+      { item_id: matchedItem?.id || "", quantity: p.quantity, purchase_type: p.purchase_type || "unit" },
+    ])
+    setSplitError("")
+    setSplitDialogOpen(true)
+  }
+
+  const handleSplitSubmit = async () => {
+    if (!splitPurchase) return
+    const totalQty = splitLines.reduce((s, l) => s + l.quantity, 0)
+    if (totalQty !== splitPurchase.quantity) {
+      setSplitError(`Split quantities (${totalQty}) must equal original quantity (${splitPurchase.quantity}).`)
+      return
+    }
+    if (splitLines.some((l) => !l.item_id)) {
+      setSplitError("All split lines must have an item selected.")
+      return
+    }
+    setIsSplitting(true)
+    setSplitError("")
+    try {
+      await purchasesApi.split(splitPurchase.purchase_id, { lines: splitLines })
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      queryClient.invalidateQueries({ queryKey: ["purchases"] })
+      queryClient.invalidateQueries({ queryKey: ["reports"] })
+      setSplitDialogOpen(false)
+      setSplitPurchase(null)
+      setReconciliationActionNotice(
+        `Split purchase into ${splitLines.length} line${splitLines.length === 1 ? "" : "s"}.`
+      )
+    } catch (err) {
+      setSplitError(err instanceof Error ? err.message : "Failed to split purchase")
+    } finally {
+      setIsSplitting(false)
+    }
+  }
+
+  const handleOpenDistribute = async (p: InvoicePurchase) => {
+    if (invoiceLocked) {
+      setReconciliationActionError("Finalized invoices are locked.")
+      return
+    }
+    setDistributePurchase(p)
+    setDistributeItems([])
+    setDistributeError("")
+    setDistributeStage("select")
+    setDistributeDialogOpen(true)
+    setIsDistributeLoading(true)
+    try {
+      const preview = await purchasesApi.distributePreview(p.purchase_id)
+      const previewByItem = new Map(preview.items.map((item) => [item.item_id, item]))
+      const bonusItemId = p.item_id
+      // Only show eligible items; pre-check only the bonus's own item
+      const eligible = availableItems
+        .map((item) => {
+          const match = previewByItem.get(item.id)
+          return {
+            item_id: item.id,
+            item_name: item.name,
+            auto_qty: match?.auto_qty ?? 0,
+            parent_count: match?.parent_count ?? 0,
+            quantity: 0,
+            checked: item.id === bonusItemId && (match?.auto_qty ?? 0) > 0,
+          }
+        })
+        .filter((i) => i.parent_count > 0)
+        .sort((a, b) => {
+          // Bonus's own item always first
+          if (a.item_id === bonusItemId && b.item_id !== bonusItemId) return -1
+          if (b.item_id === bonusItemId && a.item_id !== bonusItemId) return 1
+          return b.auto_qty - a.auto_qty
+        })
+      setDistributeItems(eligible)
+      // If any items are pre-checked, skip straight to stage 2 with auto-filled quantities
+      const hasPreChecked = eligible.some((i) => i.checked)
+      if (hasPreChecked) {
+        setDistributeItems(eligible.map((i) => i.checked ? { ...i, quantity: i.auto_qty } : i))
+        setDistributeStage("distribute")
+      }
+    } catch (err) {
+      setDistributeError(err instanceof Error ? err.message : "Failed to load distribute preview")
+    } finally {
+      setIsDistributeLoading(false)
+    }
+  }
+
+  const handleDistributeSubmit = async () => {
+    if (!distributePurchase) return
+    const checkedItems = distributeItems.filter((i) => i.checked && i.quantity > 0)
+    if (checkedItems.length === 0) {
+      setDistributeError("Select at least one item with a quantity.")
+      return
+    }
+    setIsDistributing(true)
+    setDistributeError("")
+    try {
+      const result = await purchasesApi.distribute(distributePurchase.purchase_id, {
+        items: checkedItems.map((i) => ({ item_id: i.item_id, quantity: i.quantity })),
+      })
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      queryClient.invalidateQueries({ queryKey: ["purchases"] })
+      queryClient.invalidateQueries({ queryKey: ["reports"] })
+      setDistributeDialogOpen(false)
+      setDistributePurchase(null)
+      const parts = [`Distributed bonus → ${result.bonus_purchases_created} purchase${result.bonus_purchases_created === 1 ? "" : "s"} created (${result.total_qty_attributed} qty attributed)`]
+      if (result.remainder_qty > 0) {
+        parts.push(`${result.remainder_qty} qty left as unattributed remainder`)
+      }
+      setReconciliationActionNotice(parts.join(". "))
+    } catch (err) {
+      setDistributeError(err instanceof Error ? err.message : "Failed to distribute bonus")
+    } finally {
+      setIsDistributing(false)
+    }
   }
 
   const confirmDeletePurchase = async () => {
@@ -1130,6 +1370,8 @@ export default function InvoiceDetailPage() {
   const totalCommission = purchases.reduce((sum, p) => sum + parseFloat(p.total_commission || "0"), 0)
   const hasAnyPrice = purchases.some((p) => p.invoice_unit_price !== null)
   const receiptedCount = purchases.filter((p) => {
+    // Bonus purchases don't need receipt allocation
+    if (p.purchase_type === "bonus") return true
     const allocs = getEffectiveAllocations(p)
     const allocatedQty = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
     return Boolean(p.receipt_id) || allocatedQty >= p.quantity
@@ -1160,12 +1402,19 @@ export default function InvoiceDetailPage() {
   })
 
   const unreconciledLineItems = lineItemAssessments.filter(
-    ({ assessment }) => !assessment.isReconciled && !assessment.isReadyToReconcile
+    ({ purchase, assessment }) => {
+      // Bonus purchases with attribution are always reconciled
+      if (purchase.purchase_type === "bonus" && purchase.bonus_for_purchase_id) return false
+      // Bonus purchases without attribution are unreconciled
+      if (purchase.purchase_type === "bonus" && !purchase.bonus_for_purchase_id) return true
+      return !assessment.isReconciled && !assessment.isReadyToReconcile
+    }
   )
   const unreconciledLineItemCount = unreconciledLineItems.length
 
   const totalPurchases = purchases.length
   const isFinalized = invoice.reconciliation_state === "locked"
+  const autoAllocatablePurchases = purchases.filter(isPurchaseEligibleForAutoAllocation)
   const hasReceiptGap = totalPurchases > 0 && receiptedCount < totalPurchases
   const canFinalize =
     isReconciled && totalPurchases > 0 && !hasReceiptGap && unreconciledLineItemCount === 0
@@ -1183,9 +1432,18 @@ export default function InvoiceDetailPage() {
     finalizeBlockReasons.push(`${receiptedCount}/${totalPurchases} line items are receipted.`)
   }
   if (unreconciledLineItemCount > 0) {
-    finalizeBlockReasons.push(
-      `${unreconciledLineItemCount}/${totalPurchases} line items are unreconciled.`
-    )
+    const unattributedBonuses = countUnattributedBonuses(purchases)
+    if (unattributedBonuses > 0) {
+      finalizeBlockReasons.push(
+        `${unattributedBonuses} bonus line${unattributedBonuses === 1 ? " is" : "s are"} not attributed to a parent purchase.`
+      )
+    }
+    const otherUnreconciled = unreconciledLineItemCount - unattributedBonuses
+    if (otherUnreconciled > 0) {
+      finalizeBlockReasons.push(
+        `${otherUnreconciled}/${totalPurchases} line items are unreconciled.`
+      )
+    }
   }
 
   return (
@@ -1287,6 +1545,358 @@ export default function InvoiceDetailPage() {
               )}
             </Button>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Split Purchase Dialog */}
+      <Dialog
+        open={splitDialogOpen}
+        onOpenChange={(open) => {
+          setSplitDialogOpen(open)
+          if (!open) {
+            setSplitPurchase(null)
+            setSplitLines([])
+            setSplitError("")
+          }
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Split Purchase</DialogTitle>
+          </DialogHeader>
+          {splitPurchase && (
+            <div className="space-y-4">
+              <div className="text-sm bg-muted p-3 rounded-md space-y-1">
+                <p><strong>Original:</strong> {splitPurchase.item_name} × {splitPurchase.quantity}</p>
+                <p className="text-muted-foreground">Invoice unit price: {splitPurchase.invoice_unit_price ? formatCurrency(splitPurchase.invoice_unit_price) : "—"}</p>
+              </div>
+              <div className="space-y-2">
+                {splitLines.map((line, idx) => (
+                  <div key={idx} className="flex items-center gap-2 bg-blue-50/50 p-2 rounded">
+                    <span className="text-xs text-muted-foreground">↳</span>
+                    <Select
+                      value={line.item_id || "__none__"}
+                      onValueChange={(v) => {
+                        setSplitLines((prev) => {
+                          const next = [...prev]
+                          next[idx] = { ...next[idx], item_id: v === "__none__" ? "" : v }
+                          return next
+                        })
+                      }}
+                    >
+                      <SelectTrigger className="h-8 text-xs flex-1">
+                        <SelectValue placeholder="Select item" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__none__">
+                          <span className="text-amber-600">— Select item</span>
+                        </SelectItem>
+                        {availableItems.map((i) => (
+                          <SelectItem key={i.id} value={i.id}>
+                            {i.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Input
+                      type="number"
+                      className="h-8 w-20 text-xs text-right"
+                      value={line.quantity}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value) || 0
+                        setSplitLines((prev) => {
+                          const next = [...prev]
+                          next[idx] = { ...next[idx], quantity: val }
+                          return next
+                        })
+                      }}
+                    />
+                    <Select
+                      value={line.purchase_type}
+                      onValueChange={(v) => {
+                        setSplitLines((prev) => {
+                          const next = [...prev]
+                          next[idx] = { ...next[idx], purchase_type: v }
+                          return next
+                        })
+                      }}
+                    >
+                      <SelectTrigger className="h-8 w-24 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="unit">Unit</SelectItem>
+                        <SelectItem value="bonus">Bonus</SelectItem>
+                        <SelectItem value="refund">Refund</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    {splitLines.length > 1 && (
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-8 w-8"
+                        onClick={() => setSplitLines((prev) => prev.filter((_, i) => i !== idx))}
+                      >
+                        <X className="h-3 w-3" />
+                      </Button>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div className="flex items-center justify-between">
+                <button
+                  type="button"
+                  className="text-xs text-blue-600 hover:text-blue-800 hover:underline inline-flex items-center gap-1"
+                  onClick={() => setSplitLines((prev) => [...prev, { item_id: "", quantity: 0, purchase_type: "unit" }])}
+                >
+                  <Plus className="h-3 w-3" />Add split row
+                </button>
+                {(() => {
+                  const totalQty = splitLines.reduce((s, l) => s + l.quantity, 0)
+                  const matches = totalQty === splitPurchase.quantity
+                  return (
+                    <span className={`text-xs font-medium ${matches ? "text-green-600" : "text-red-500"}`}>
+                      Qty: {totalQty}/{splitPurchase.quantity} {matches ? "✓" : ""}
+                    </span>
+                  )
+                })()}
+              </div>
+              {splitError && (
+                <p className="text-xs text-red-600">{splitError}</p>
+              )}
+              <div className="flex justify-end gap-2">
+                <Button type="button" variant="outline" onClick={() => setSplitDialogOpen(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  onClick={handleSplitSubmit}
+                  disabled={isSplitting}
+                >
+                  {isSplitting ? (
+                    <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Splitting...</>
+                  ) : (
+                    `Split into ${splitLines.length} Line${splitLines.length === 1 ? "" : "s"}`
+                  )}
+                </Button>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Distribute Bonus Dialog */}
+      <Dialog
+        open={distributeDialogOpen}
+        onOpenChange={(open) => {
+          setDistributeDialogOpen(open)
+          if (!open) {
+            setDistributePurchase(null)
+            setDistributeItems([])
+            setDistributeError("")
+            setDistributeStage("select")
+          }
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>
+              {distributeStage === "select" ? "Distribute Bonus — Select Items" : "Distribute Bonus — Set Quantities"}
+            </DialogTitle>
+          </DialogHeader>
+          {distributePurchase && (
+            <div className="space-y-4">
+              <div className="text-sm bg-muted p-3 rounded-md space-y-1">
+                <p><strong>Bonus:</strong> {distributePurchase.item_name} × {distributePurchase.quantity}</p>
+                <p className="text-muted-foreground">
+                  Unit price: {distributePurchase.invoice_unit_price ? formatCurrency(distributePurchase.invoice_unit_price) : "—"}
+                </p>
+              </div>
+
+              {isDistributeLoading ? (
+                <div className="flex items-center gap-2 justify-center py-4 text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <span className="text-sm">Loading eligible items…</span>
+                </div>
+              ) : distributeItems.length === 0 ? (
+                <p className="text-sm text-muted-foreground text-center py-4">
+                  No eligible parent purchases found for distribution.
+                </p>
+              ) : distributeStage === "select" ? (
+                /* ── Stage 1: Select Items ── */
+                <>
+                  <p className="text-xs text-muted-foreground">
+                    Select which items this bonus should be attributed across. Only items with unattributed unit purchases are shown.
+                  </p>
+                  <div className="space-y-1 max-h-64 overflow-y-auto">
+                    {distributeItems.map((item) => {
+                      const idx = distributeItems.findIndex((d) => d.item_id === item.item_id)
+                      return (
+                        <label
+                          key={item.item_id}
+                          className={`flex items-center gap-3 p-2 rounded cursor-pointer ${
+                            item.checked ? "bg-blue-50/50 ring-1 ring-blue-200" : "hover:bg-muted/50"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={item.checked}
+                            onChange={(e) => {
+                              setDistributeItems((prev) => {
+                                const next = [...prev]
+                                next[idx] = { ...next[idx], checked: e.target.checked }
+                                return next
+                              })
+                            }}
+                            className="rounded"
+                          />
+                          <div className="flex-1 min-w-0">
+                            <div className="text-sm font-medium truncate">{item.item_name}</div>
+                            <div className="text-[11px] text-muted-foreground">
+                              {item.parent_count} parent purchase{item.parent_count === 1 ? "" : "s"} • {item.auto_qty} suggested qty
+                            </div>
+                          </div>
+                        </label>
+                      )
+                    })}
+                  </div>
+                  <div className="flex items-center justify-between">
+                    {(() => {
+                      const allChecked = distributeItems.every((i) => i.checked)
+                      return (
+                        <button
+                          type="button"
+                          className="text-xs text-blue-600 hover:text-blue-800 hover:underline"
+                          onClick={() => {
+                            setDistributeItems((prev) =>
+                              prev.map((i) => ({ ...i, checked: !allChecked }))
+                            )
+                          }}
+                        >
+                          {allChecked ? "Deselect All" : "Select All"}
+                        </button>
+                      )
+                    })()}
+                    <span className="text-xs text-muted-foreground">
+                      {distributeItems.filter((i) => i.checked).length} of {distributeItems.length} selected
+                    </span>
+                  </div>
+                  {distributeError && (
+                    <p className="text-xs text-red-600">{distributeError}</p>
+                  )}
+                  <div className="flex justify-end gap-2">
+                    <Button type="button" variant="outline" onClick={() => setDistributeDialogOpen(false)}>
+                      Cancel
+                    </Button>
+                    <Button
+                      type="button"
+                      onClick={() => {
+                        const selected = distributeItems.filter((i) => i.checked)
+                        if (selected.length === 0) {
+                          setDistributeError("Select at least one item.")
+                          return
+                        }
+                        setDistributeError("")
+                        // Auto-fill quantities for selected items
+                        setDistributeItems((prev) =>
+                          prev.map((i) => i.checked ? { ...i, quantity: i.auto_qty } : i)
+                        )
+                        setDistributeStage("distribute")
+                      }}
+                      disabled={distributeItems.filter((i) => i.checked).length === 0}
+                    >
+                      Next →
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                /* ── Stage 2: Set Quantities & Distribute ── */
+                <>
+                  <p className="text-xs text-muted-foreground">
+                    Adjust quantities for each item. Bonus qty is distributed FIFO across each item's parent purchases.
+                  </p>
+                  <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                    {distributeItems.filter((i) => i.checked).map((item) => {
+                      const idx = distributeItems.findIndex((d) => d.item_id === item.item_id)
+                      return (
+                        <div
+                          key={item.item_id}
+                          className="flex items-center gap-3 p-2 rounded bg-blue-50/50"
+                        >
+                          <div className="flex-1 min-w-0">
+                            <div className="text-sm font-medium truncate">{item.item_name}</div>
+                            <div className="text-[11px] text-muted-foreground">
+                              {item.parent_count} parent{item.parent_count === 1 ? "" : "s"} • suggested: {item.auto_qty}
+                            </div>
+                          </div>
+                          <Input
+                            type="number"
+                            className="h-8 w-20 text-xs text-right"
+                            value={item.quantity || ""}
+                            min={0}
+                            onChange={(e) => {
+                              const val = parseInt(e.target.value) || 0
+                              setDistributeItems((prev) => {
+                                const next = [...prev]
+                                next[idx] = { ...next[idx], quantity: val }
+                                return next
+                              })
+                            }}
+                            placeholder="0"
+                          />
+                        </div>
+                      )
+                    })}
+                  </div>
+                  {(() => {
+                    const totalQty = distributeItems.filter((i) => i.checked).reduce((s, i) => s + i.quantity, 0)
+                    const remainder = distributePurchase.quantity - totalQty
+                    return (
+                      <div className="flex items-center justify-between text-xs">
+                        <button
+                          type="button"
+                          className="text-blue-600 hover:text-blue-800 hover:underline"
+                          onClick={() => {
+                            setDistributeItems((prev) =>
+                              prev.map((i) => i.checked ? { ...i, quantity: i.auto_qty } : i)
+                            )
+                          }}
+                        >
+                          Reset to suggested
+                        </button>
+                        <span className={`font-medium ${remainder === 0 ? "text-green-600" : remainder > 0 ? "text-amber-600" : "text-red-500"}`}>
+                          {totalQty}/{distributePurchase.quantity} qty
+                          {remainder === 0 ? " ✓" : remainder > 0 ? ` (${remainder} left)` : " (over!)"}
+                        </span>
+                      </div>
+                    )
+                  })()}
+                  {distributeError && (
+                    <p className="text-xs text-red-600">{distributeError}</p>
+                  )}
+                  <div className="flex justify-between gap-2">
+                    <Button type="button" variant="outline" onClick={() => {
+                      setDistributeStage("select")
+                      setDistributeError("")
+                    }}>
+                      ← Change Items
+                    </Button>
+                    <Button
+                      type="button"
+                      onClick={handleDistributeSubmit}
+                      disabled={isDistributing || distributeItems.filter((i) => i.checked && i.quantity > 0).length === 0}
+                    >
+                      {isDistributing ? (
+                        <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Distributing...</>
+                      ) : (
+                        "Distribute Bonus"
+                      )}
+                    </Button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
         </DialogContent>
       </Dialog>
 
@@ -1399,7 +2009,7 @@ export default function InvoiceDetailPage() {
               { header: "Item", accessor: (p) => p.item_name },
               { header: "Destination", accessor: (p) => p.destination_code },
               { header: "Quantity", accessor: (p) => p.quantity },
-              { header: "Purchase Cost", accessor: (p) => p.purchase_cost },
+              { header: "Avg. Unit Cost", accessor: (p) => getDisplayPurchaseCosts(p).unitCost.toFixed(2) },
               { header: "Invoice Unit Price", accessor: (p) => p.invoice_unit_price },
               { header: "Line Total", accessor: (p) => p.total_selling },
               { header: "Commission", accessor: (p) => p.total_commission },
@@ -1611,22 +2221,42 @@ export default function InvoiceDetailPage() {
                 {totalQuantity} units across {purchases.length} purchase{purchases.length !== 1 ? "s" : ""}
               </CardDescription>
             </div>
-            <Dialog
-              open={isOpen}
-              onOpenChange={(open) => {
-                setIsOpen(open)
-                if (!open) resetForm()
-              }}
-            >
-              <DialogTrigger asChild>
-                <Button onClick={() => {
-                  resetForm()
-                  if (invoice) setDestinationId(invoice.destination_id)
-                }} disabled={isFinalized}>
-                  <Plus className="h-4 w-4 mr-2" />
-                  Add Line Item
-                </Button>
-              </DialogTrigger>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                onClick={() => void handleAutoAllocateAllPurchases()}
+                disabled={
+                  isFinalized ||
+                  allocationApiUnavailable ||
+                  isAutoAllocatingAll ||
+                  autoAllocatablePurchases.length === 0
+                }
+              >
+                {isAutoAllocatingAll ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Auto-Allocating...
+                  </>
+                ) : (
+                  "Auto Allocate All"
+                )}
+              </Button>
+              <Dialog
+                open={isOpen}
+                onOpenChange={(open) => {
+                  setIsOpen(open)
+                  if (!open) resetForm()
+                }}
+              >
+                <DialogTrigger asChild>
+                  <Button onClick={() => {
+                    resetForm()
+                    if (invoice) setDestinationId(invoice.destination_id)
+                  }} disabled={isFinalized}>
+                    <Plus className="h-4 w-4 mr-2" />
+                    Add Line Item
+                  </Button>
+                </DialogTrigger>
               <DialogContent className="max-w-md">
                 <DialogHeader>
                   <DialogTitle>{editingPurchaseId ? "Edit Line Item" : "Add Purchase to Invoice"}</DialogTitle>
@@ -1647,6 +2277,22 @@ export default function InvoiceDetailPage() {
                             <span className="truncate">{i.name}</span>
                           </SelectItem>
                         ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="purchaseType">Type</Label>
+                    <Select value={purchaseType} onValueChange={(v) => {
+                      setPurchaseType(v as "unit" | "bonus" | "refund")
+                      if (v !== "refund") setRefundsPurchaseId("")
+                    }}>
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="unit">Unit</SelectItem>
+                        <SelectItem value="bonus">Bonus</SelectItem>
+                        <SelectItem value="refund">Refund</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -1700,6 +2346,32 @@ export default function InvoiceDetailPage() {
                       placeholder="Any notes..."
                     />
                   </div>
+                  {editingPurchaseId && (
+                    <div className="space-y-2">
+                      <Label htmlFor="costAdjustment">Cost Adjustment (per unit)</Label>
+                      <Input
+                        id="costAdjustment"
+                        type="number"
+                        step="0.0001"
+                        value={costAdjustment}
+                        onChange={(e) => setCostAdjustment(e.target.value)}
+                        placeholder="0 (positive = increase cost, negative = decrease)"
+                      />
+                      {costAdjustment && Number.parseFloat(costAdjustment) !== 0 && (
+                        <>
+                          <Input
+                            id="adjustmentNote"
+                            value={adjustmentNote}
+                            onChange={(e) => setAdjustmentNote(e.target.value)}
+                            placeholder="Reason for adjustment (e.g. bundle promo redistribution)"
+                          />
+                          <p className="text-xs text-muted-foreground">
+                            Adjusts effective cost for economics without changing the receipt cost.
+                          </p>
+                        </>
+                      )}
+                    </div>
+                  )}
                   {isRefund && (
                     <div className="space-y-2">
                       <Label htmlFor="refundsPurchase">Refunds Purchase</Label>
@@ -1725,26 +2397,9 @@ export default function InvoiceDetailPage() {
                     </div>
                   )}
                   {isBonus && (
-                    <div className="space-y-2">
-                      <Label htmlFor="bonusForPurchase">Attribute Bonus To</Label>
-                      <Select
-                        value={bonusForPurchaseId || "__none__"}
-                        onValueChange={(v) => setBonusForPurchaseId(v === "__none__" ? "" : v)}
-                      >
-                        <SelectTrigger>
-                          <SelectValue placeholder="Link to parent purchase" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {bonusCandidates.map((p) => (
-                            <SelectItem key={p.purchase_id} value={p.purchase_id}>
-                              {p.item_name} × {p.quantity} — {p.invoice_number || p.receipt_number || "unlinked"}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <p className="text-xs text-muted-foreground">
-                        Link this bonus to a parent purchase to boost its commission.
-                      </p>
+                    <div className="text-xs text-muted-foreground bg-blue-50 border border-blue-200 p-3 rounded-md">
+                      After saving this bonus line, use the <strong>Distribute</strong> button (
+                      <Share2 className="inline h-3 w-3 text-blue-600" />) on the purchase row to attribute it across items.
                     </div>
                   )}
                   {/* Live reconciliation hint */}
@@ -1773,7 +2428,8 @@ export default function InvoiceDetailPage() {
                   </div>
                 </form>
               </DialogContent>
-            </Dialog>
+              </Dialog>
+            </div>
           </div>
         </CardHeader>
         <CardContent>
@@ -1786,7 +2442,7 @@ export default function InvoiceDetailPage() {
                   <TableHead>Item</TableHead>
                   <TableHead>Receipts</TableHead>
                   <TableHead className="text-right">Qty</TableHead>
-                  <TableHead className="text-right">Purchase Cost</TableHead>
+                  <TableHead className="text-right">Avg. Unit Cost</TableHead>
                   <TableHead className="text-right">Invoice Unit Price</TableHead>
                   <TableHead className="text-right">Line Total</TableHead>
                   <TableHead className="text-right">Commission</TableHead>
@@ -1795,7 +2451,49 @@ export default function InvoiceDetailPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {purchases.map((p) => {
+                {buildDisplayRows(purchases as PurchaseEconomics[]).map((row) => {
+                  if (row.kind === "bonus-group") {
+                    const { representative: p, totalQty, totalSelling, totalCommission, attributions } = row
+                    return (
+                      <TableRow key={`bonus-group-${p.item_id}`} className="bg-blue-50/50">
+                        <TableCell className="font-medium">
+                          <div className="flex flex-col gap-0.5">
+                            <div className="flex items-center gap-2">
+                              <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
+                                {p.item_name}
+                              </Link>
+                              <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700">BONUS</span>
+                            </div>
+                            {attributions.map((a, i) => (
+                              <span key={i} className="text-[10px] text-muted-foreground">
+                                ↳ {a.parentQty} × {a.parentItemName} (inv #{a.invoiceNumber})
+                              </span>
+                            ))}
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <span className="text-xs text-muted-foreground italic">bonus — no allocation</span>
+                        </TableCell>
+                        <TableCell className="text-right">{totalQty}</TableCell>
+                        <TableCell className="text-right text-muted-foreground">{formatCurrency(0)}</TableCell>
+                        <TableCell className="text-right">{p.invoice_unit_price ? formatCurrency(p.invoice_unit_price) : "-"}</TableCell>
+                        <TableCell className="text-right">{formatCurrency(totalSelling)}</TableCell>
+                        <TableCell className="text-right text-muted-foreground">
+                          {formatCurrency(totalCommission)}
+                        </TableCell>
+                        <TableCell>
+                          <StatusSelect
+                            value={p.status}
+                            onValueChange={(value) => handleStatusChange(p.purchase_id, value)}
+                            disabled={isFinalized}
+                          />
+                        </TableCell>
+                        <TableCell />
+                      </TableRow>
+                    )
+                  }
+
+                  const p = row.purchase
                   const allocs = getEffectiveAllocations(p)
                   const allocated = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
                   const autoAllocateLineSummary = autoAllocateLineSummaryByPurchase[p.purchase_id]
@@ -1808,11 +2506,27 @@ export default function InvoiceDetailPage() {
 
                   return (
                     <Fragment key={p.purchase_id}>
-                      <TableRow>
+                      <TableRow className={p.purchase_type === "bonus" ? "bg-blue-50/50" : p.purchase_type === "refund" ? "bg-red-50/50" : ""}>
                         <TableCell className="font-medium">
-                          <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
-                            {p.item_name}
-                          </Link>
+                          <div className="flex flex-col gap-0.5">
+                            <div className="flex items-center gap-2">
+                              <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
+                                {p.item_name}
+                              </Link>
+                              {p.purchase_type === "bonus" && (
+                                <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700">BONUS</span>
+                              )}
+                              {p.purchase_type === "refund" && (
+                                <span className="inline-flex items-center rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-semibold text-red-700">REFUND</span>
+                              )}
+                            </div>
+                            {(() => {
+                              const attr = getBonusAttribution(p)
+                              return attr.label ? (
+                                <span className="text-[10px] text-muted-foreground">{attr.label}</span>
+                              ) : null
+                            })()}
+                          </div>
                         </TableCell>
                         <TableCell>
                           {p.purchase_type === "bonus" ? (
@@ -1854,6 +2568,27 @@ export default function InvoiceDetailPage() {
                                     link receipt
                                   </button>
                                   )
+                                )}
+                                {isPartiallyAllocated && !isFinalized && (
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleAutoAllocatePurchase(p)}
+                                    disabled={
+                                      allocationApiUnavailable ||
+                                      autoAllocatingPurchaseId === p.purchase_id
+                                    }
+                                    className="text-[11px] text-muted-foreground hover:underline disabled:opacity-50 disabled:no-underline"
+                                    title="Automatically allocate remaining from matching receipt line items"
+                                  >
+                                    {autoAllocatingPurchaseId === p.purchase_id ? (
+                                      <span className="inline-flex items-center gap-1">
+                                        <Loader2 className="h-3 w-3 animate-spin" />
+                                        allocating...
+                                      </span>
+                                    ) : (
+                                      "auto allocate"
+                                    )}
+                                  </button>
                                 )}
                                 {!isFinalized && (
                                   <button
@@ -1920,7 +2655,17 @@ export default function InvoiceDetailPage() {
                           )}
                         </TableCell>
                         <TableCell className="text-right">{p.quantity}</TableCell>
-                        <TableCell className="text-right text-muted-foreground">{formatCurrency(displayCosts.unitCost)}</TableCell>
+                        <TableCell className="text-right text-muted-foreground">
+                          {formatCurrency(displayCosts.unitCost)}
+                          {p.cost_adjustment && Number.parseFloat(p.cost_adjustment) !== 0 && (
+                            <span
+                              className="ml-1 inline-flex items-center rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-semibold text-amber-700"
+                              title={p.adjustment_note || `Cost adjustment: ${p.cost_adjustment}/unit`}
+                            >
+                              ADJ
+                            </span>
+                          )}
+                        </TableCell>
                         <TableCell className="text-right">{p.invoice_unit_price ? formatCurrency(p.invoice_unit_price) : "-"}</TableCell>
                         <TableCell className="text-right">{p.total_selling ? formatCurrency(p.total_selling) : formatCurrency(p.total_cost)}</TableCell>
                         <TableCell className={`text-right ${p.total_commission ? (parseFloat(p.total_commission) >= 0 ? "text-green-600" : "text-red-600") : "text-muted-foreground"}`}>
@@ -1938,10 +2683,26 @@ export default function InvoiceDetailPage() {
                             <Button
                               size="icon"
                               variant="ghost"
-                              onClick={() => handleEditPurchase(p)}
+                              onClick={() => getBonusAttribution(p).showDistributeAction
+                                ? handleOpenDistribute(p)
+                                : handleEditPurchase(p)
+                              }
                               disabled={isFinalized}
+                              title={getBonusAttribution(p).showDistributeAction ? "Distribute bonus" : "Edit"}
                             >
-                              <Pencil className="h-4 w-4" />
+                              {getBonusAttribution(p).showDistributeAction
+                                ? <Share2 className="h-4 w-4 text-blue-600" />
+                                : <Pencil className="h-4 w-4" />
+                              }
+                            </Button>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              onClick={() => handleOpenSplit(p)}
+                              disabled={isFinalized}
+                              title="Split into multiple items"
+                            >
+                              <Scissors className="h-4 w-4" />
                             </Button>
                             <Button
                               size="icon"
@@ -1949,6 +2710,7 @@ export default function InvoiceDetailPage() {
                               className="text-red-600"
                               onClick={() => handleDeletePurchase(p.purchase_id)}
                               disabled={isFinalized}
+                              title="Delete"
                             >
                               <Trash2 className="h-4 w-4" />
                             </Button>
