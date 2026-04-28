@@ -124,6 +124,8 @@ const makePurchase = (overrides: Partial<PurchaseEconomics> = {}): PurchaseEcono
   destination_code: null,
   quantity: 10,
   purchase_cost: "0",
+  cost_adjustment: null,
+  adjustment_note: null,
   total_cost: "0",
   invoice_unit_price: "0.50",
   total_selling: "5.00",
@@ -145,6 +147,9 @@ const makePurchase = (overrides: Partial<PurchaseEconomics> = {}): PurchaseEcono
   bonus_parent_item_name: null,
   bonus_parent_quantity: null,
   bonus_parent_invoice_number: null,
+  display_parent_purchase_id: null,
+  display_group: null,
+  invoice_reconciliation_state: null,
   ...overrides,
 })
 
@@ -253,7 +258,7 @@ describe("buildDisplayRows", () => {
     }
   })
 
-  it("preserves order: group appears at position of first member", () => {
+  it("orphan bonus group placed after all unit rows", () => {
     const purchases = [
       makePurchase({ purchase_id: "unit-1", purchase_type: "unit", item_id: "ps5" }),
       makePurchase({
@@ -283,11 +288,11 @@ describe("buildDisplayRows", () => {
     const rows = buildDisplayRows(purchases)
     expect(rows).toHaveLength(3)
     expect(rows[0].kind).toBe("purchase") // unit-1
-    expect(rows[1].kind).toBe("bonus-group") // collapsed blue bonuses
-    expect(rows[2].kind).toBe("purchase") // unit-2
-    if (rows[1].kind === "bonus-group") {
-      expect(rows[1].totalQty).toBe(32)
-      expect(rows[1].attributions).toHaveLength(2)
+    expect(rows[1].kind).toBe("purchase") // unit-2
+    expect(rows[2].kind).toBe("bonus-group") // orphan bonus group at end
+    if (rows[2].kind === "bonus-group") {
+      expect(rows[2].totalQty).toBe(32)
+      expect(rows[2].attributions).toHaveLength(2)
     }
   })
 

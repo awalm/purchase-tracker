@@ -73,12 +73,13 @@ export function assessPurchaseReconciliation(
   }
 
   if (input.requireAllocations) {
+    const requiredAllocatedQty = Math.abs(input.quantity)
     if (allocationCount === 0) {
       reasons.push("No receipt allocations")
-    } else if (allocatedQty < input.quantity) {
-      reasons.push(`Only ${allocatedQty}/${input.quantity} qty allocated`)
-    } else if (allocatedQty > input.quantity) {
-      reasons.push(`Over-allocated qty (${allocatedQty}/${input.quantity})`)
+    } else if (allocatedQty < requiredAllocatedQty) {
+      reasons.push(`Only ${allocatedQty}/${requiredAllocatedQty} qty allocated`)
+    } else if (allocatedQty > requiredAllocatedQty) {
+      reasons.push(`Over-allocated qty (${allocatedQty}/${requiredAllocatedQty})`)
     }
   }
 

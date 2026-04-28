@@ -6,8 +6,8 @@ import {
   useReceiptPurchases,
   useCreatePurchase,
   useUpdateReceipt,
+  useDeleteReceipt,
   useUpdatePurchase,
-  useDeletePurchase,
   useItems,
   useDestinations,
   useInvoices,
@@ -42,6 +42,7 @@ import {
 } from "@/components/ui/select"
 import { StatusSelect } from "@/components/StatusSelect"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
+import { ConfirmCloseDialog } from "@/components/ConfirmCloseDialog"
 import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
 import {
   ArrowLeft,
@@ -52,6 +53,7 @@ import {
   Upload,
   AlertCircle,
   CheckCircle2,
+  Scissors,
 } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
 import { assessPurchaseReconciliation } from "@/lib/purchaseReconciliation"
@@ -126,8 +128,8 @@ export default function ReceiptDetailPage() {
 
   const createPurchase = useCreatePurchase()
   const updateReceipt = useUpdateReceipt()
+  const deleteReceipt = useDeleteReceipt()
   const updatePurchase = useUpdatePurchase()
-  const deletePurchase = useDeletePurchase()
 
   const {
     data: receiptLineItems = [],
@@ -167,9 +169,19 @@ export default function ReceiptDetailPage() {
   const [purchaseNotes, setPurchaseNotes] = useState("")
   const [receiptDialogOpen, setReceiptDialogOpen] = useState(false)
   const [receiptEditError, setReceiptEditError] = useState("")
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
+  const [deleteError, setDeleteError] = useState("")
   const [isEditingMetadata, setIsEditingMetadata] = useState(false)
   const [metadataDraft, setMetadataDraft] = useState("")
   const [metadataError, setMetadataError] = useState("")
+
+  // Split line dialog state
+  const [splitDialogOpen, setSplitDialogOpen] = useState(false)
+  const [splitSourceLine, setSplitSourceLine] = useState<ReceiptLineItem | null>(null)
+  const [splitQty, setSplitQty] = useState("1")
+  const [splitState, setSplitState] = useState("returned")
+  const [splitNotes, setSplitNotes] = useState("")
+  const [splitError, setSplitError] = useState("")
 
   const resetForm = () => {
     setEditingPurchaseId(null)
@@ -189,6 +201,54 @@ export default function ReceiptDetailPage() {
     setLineItemUnitCost("")
     setLineItemNotes("")
     setLineItemState("active")
+  }
+
+  const handleOpenSplitDialog = (line: ReceiptLineItem) => {
+    setSplitSourceLine(line)
+    setSplitQty("1")
+    setSplitState("returned")
+    setSplitNotes("")
+    setSplitError("")
+    setSplitDialogOpen(true)
+  }
+
+  const handleSplitLineItem = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!id || !splitSourceLine) return
+    const splitQuantity = Number.parseInt(splitQty, 10)
+    if (splitQuantity <= 0 || splitQuantity >= splitSourceLine.quantity) return
+
+    const newOriginalQty = splitSourceLine.quantity - splitQuantity
+    if (newOriginalQty < splitSourceLine.allocated_qty) {
+      setSplitError(`Cannot reduce original line below allocated qty (${splitSourceLine.allocated_qty})`)
+      return
+    }
+
+    try {
+      // 1. Update original line: reduce quantity
+      await receiptsApi.lineItems.update(id, splitSourceLine.id, {
+        quantity: newOriginalQty,
+      })
+
+      // 2. Create new line with split quantity and chosen state
+      await receiptsApi.lineItems.create(id, {
+        item_id: splitSourceLine.item_id,
+        quantity: splitQuantity,
+        unit_cost: splitSourceLine.unit_cost,
+        notes: splitNotes || splitSourceLine.notes || undefined,
+        state: splitState,
+        ...(splitSourceLine.parent_line_item_id
+          ? { parent_line_item_id: splitSourceLine.parent_line_item_id }
+          : {}),
+      })
+
+      queryClient.invalidateQueries({ queryKey: ["receipts", id, "line-items"] })
+      queryClient.invalidateQueries({ queryKey: ["receipts"] })
+      setSplitDialogOpen(false)
+      setSplitSourceLine(null)
+    } catch (err) {
+      setSplitError(err instanceof Error ? err.message : "Split failed")
+    }
   }
 
   const handleLineItemSubmit = async (e: React.FormEvent) => {
@@ -267,10 +327,28 @@ export default function ReceiptDetailPage() {
         return
       }
 
+      // Compute cost_adjustment from adjustment children of this line
+      const adjustmentChildren = receiptLineItems.filter(
+        (line) => line.parent_line_item_id === sourceLine.id && line.line_type === "adjustment"
+      )
+      const totalAdjustment = adjustmentChildren.reduce(
+        (sum, line) => sum + Number.parseFloat(line.unit_cost) * line.quantity,
+        0
+      )
+      const perUnitAdjustment = sourceLine.quantity > 0 ? totalAdjustment / sourceLine.quantity : 0
+      const adjustmentNotes = adjustmentChildren
+        .map((line) => line.notes || line.item_name)
+        .filter(Boolean)
+        .join("; ")
+
       const createdPurchase = await createPurchase.mutateAsync({
         item_id: sourceLine.item_id,
         quantity: allocatableQty,
         purchase_cost: sourceLine.unit_cost,
+        ...(perUnitAdjustment !== 0 ? {
+          cost_adjustment: perUnitAdjustment.toFixed(4),
+          adjustment_note: adjustmentNotes || undefined,
+        } : {}),
         destination_id: destinationId || undefined,
         invoice_id: invoiceId || undefined,
         receipt_id: id,
@@ -312,10 +390,12 @@ export default function ReceiptDetailPage() {
     queryClient.invalidateQueries({ queryKey: ["receipts"] })
   }
 
-  const handleDelete = async (purchaseId: string) => {
-    if (confirm("Delete this line item?")) {
-      await deletePurchase.mutateAsync(purchaseId)
+  const handleUnlinkPurchase = async (purchaseId: string) => {
+    if (confirm("Remove this purchase from the receipt?")) {
+      await receiptsApi.unlinkPurchase(id!, purchaseId)
       queryClient.invalidateQueries({ queryKey: ["receipts"] })
+      queryClient.invalidateQueries({ queryKey: ["purchases"] })
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
     }
   }
 
@@ -423,10 +503,18 @@ export default function ReceiptDetailPage() {
     (sum, p) => sum + parseFloat(p.total_cost || "0"),
     0
   )
-  const receiptLineItemsCost = receiptLineItems.reduce(
-    (sum, line) => sum + Number(line.unit_cost) * line.quantity,
-    0
-  )
+  const receiptLineItemsCost = receiptLineItems
+    .filter((line) => line.line_type !== "adjustment")
+    .reduce(
+      (sum, line) => sum + Number(line.unit_cost) * line.quantity,
+      0
+    )
+  const adjustmentsCost = receiptLineItems
+    .filter((line) => line.line_type === "adjustment")
+    .reduce(
+      (sum, line) => sum + Number(line.unit_cost) * line.quantity,
+      0
+    )
   const unlinkedCount = purchases.filter((p) => !p.invoice_id).length
   const lockedLinkedCount = purchases.filter(
     (p) => p.invoice_reconciliation_state === "locked"
@@ -445,7 +533,7 @@ export default function ReceiptDetailPage() {
     (entry) => entry.operation === "update"
   )
   const latestMetadataAudit = metadataAuditHistory[0]
-  const creatableReceiptLines = receiptLineItems.filter((line) => line.remaining_qty > 0 && line.state === "active")
+  const creatableReceiptLines = receiptLineItems.filter((line) => line.remaining_qty > 0 && line.state === "active" && line.line_type !== "adjustment")
   const selectedReceiptLine = receiptLineItems.find((line) => line.id === selectedReceiptLineId)
 
   return (
@@ -557,8 +645,33 @@ export default function ReceiptDetailPage() {
               Upload Document
             </Button>
           )}
+          <Button
+            variant="outline"
+            className="text-red-600 hover:text-red-700 hover:bg-red-50"
+            onClick={() => { setDeleteError(""); setDeleteConfirmOpen(true) }}
+          >
+            <Trash2 className="h-4 w-4 mr-2" />
+            Delete
+          </Button>
         </div>
       </div>
+
+      <ConfirmCloseDialog
+        open={deleteConfirmOpen}
+        onOpenChange={setDeleteConfirmOpen}
+        title="Delete Receipt"
+        description={deleteError || `Delete receipt ${receipt.receipt_number}? This will unlink all associated purchases and cannot be undone.`}
+        confirmLabel={deleteReceipt.isPending ? "Deleting..." : "Delete Receipt"}
+        cancelLabel="Cancel"
+        onConfirm={async () => {
+          try {
+            await deleteReceipt.mutateAsync(id!)
+            navigate("/receipts")
+          } catch (err) {
+            setDeleteError(err instanceof Error ? err.message : "Failed to delete receipt")
+          }
+        }}
+      />
 
       {/* Summary Cards */}
       <div className="grid grid-cols-4 gap-4">
@@ -583,12 +696,14 @@ export default function ReceiptDetailPage() {
         <Card>
           <CardContent className="pt-6">
             <div className="text-2xl font-bold">
-              {formatCurrency(totalCost.toFixed(2))}
+              {formatCurrency(receiptLineItemsCost.toFixed(2))}
             </div>
-            <p className="text-sm text-muted-foreground">Linked Purchases Cost</p>
-            <p className="text-xs text-muted-foreground mt-1">
-              Receipt lines total: {formatCurrency(receiptLineItemsCost.toFixed(2))}
-            </p>
+            <p className="text-sm text-muted-foreground">Receipt Lines Total</p>
+            {adjustmentsCost !== 0 && (
+              <p className="text-xs text-amber-600 mt-1">
+                Adjustments: {formatCurrency(adjustmentsCost.toFixed(2))}
+              </p>
+            )}
           </CardContent>
         </Card>
         <Card>
@@ -596,7 +711,7 @@ export default function ReceiptDetailPage() {
             <div className="text-2xl font-bold">{purchases.length}</div>
             <p className="text-sm text-muted-foreground">Linked Purchases</p>
             <p className="text-xs text-muted-foreground mt-1">
-              Receipt lines: {receiptLineItems.length}
+              Cost: {formatCurrency(totalCost.toFixed(2))}
             </p>
           </CardContent>
         </Card>
@@ -923,6 +1038,14 @@ export default function ReceiptDetailPage() {
                   }
                   const rows: React.ReactNode[] = []
                   for (const line of parentLines) {
+                    const children = childrenByParent.get(line.id) || []
+                    const adjChildren = children.filter((c) => c.line_type === "adjustment")
+                    const adjPerUnit = adjChildren.reduce(
+                      (sum, c) => sum + (Number(c.unit_cost) * c.quantity) / line.quantity,
+                      0
+                    )
+                    const effectiveUnitCost = Number(line.unit_cost) + adjPerUnit
+                    const hasAdj = adjChildren.length > 0
                     rows.push(
                       <TableRow key={line.id} className={line.state !== "active" ? "opacity-60" : ""}>
                         <TableCell className="font-medium">{line.item_name}</TableCell>
@@ -930,14 +1053,38 @@ export default function ReceiptDetailPage() {
                         <TableCell className="text-right">{line.quantity}</TableCell>
                         <TableCell className="text-right">{line.allocated_qty}</TableCell>
                         <TableCell className={`text-right ${line.remaining_qty < 0 ? "text-red-600" : ""}`}>{line.remaining_qty}</TableCell>
-                        <TableCell className="text-right">{formatCurrency(line.unit_cost)}</TableCell>
-                        <TableCell className="text-right">{formatCurrency(Number(line.unit_cost) * line.quantity)}</TableCell>
+                        <TableCell className="text-right">
+                          {formatCurrency(line.unit_cost)}
+                          {hasAdj && (
+                            <div className="text-xs text-amber-600 dark:text-amber-400">
+                              eff: {formatCurrency(effectiveUnitCost.toFixed(2))}
+                            </div>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          {formatCurrency(Number(line.unit_cost) * line.quantity)}
+                          {hasAdj && (
+                            <div className="text-xs text-amber-600 dark:text-amber-400">
+                              eff: {formatCurrency((effectiveUnitCost * line.quantity).toFixed(2))}
+                            </div>
+                          )}
+                        </TableCell>
                         <TableCell className="text-muted-foreground">{line.notes || "-"}</TableCell>
                         <TableCell>
                           <div className="flex gap-1">
                             <Button size="icon" variant="ghost" onClick={() => handleEditLineItem(line)}>
                               <Pencil className="h-4 w-4" />
                             </Button>
+                            {line.quantity > 1 && (
+                              <Button
+                                size="icon"
+                                variant="ghost"
+                                onClick={() => handleOpenSplitDialog(line)}
+                                title="Split line by quantity"
+                              >
+                                <Scissors className="h-4 w-4" />
+                              </Button>
+                            )}
                             <Button
                               size="icon"
                               variant="ghost"
@@ -952,11 +1099,18 @@ export default function ReceiptDetailPage() {
                         </TableCell>
                       </TableRow>
                     )
-                    const children = childrenByParent.get(line.id) || []
                     for (const child of children) {
+                      const isAdj = child.line_type === "adjustment"
                       rows.push(
-                        <TableRow key={child.id} className={`bg-muted/30 ${child.state !== "active" ? "opacity-60" : ""}`}>
-                          <TableCell className="pl-8 text-muted-foreground text-sm">↳ {child.item_name}</TableCell>
+                        <TableRow key={child.id} className={`${isAdj ? "bg-amber-50 dark:bg-amber-950/20" : "bg-muted/30"} ${child.state !== "active" ? "opacity-60" : ""}`}>
+                          <TableCell className="pl-8 text-muted-foreground text-sm">
+                            {isAdj && (
+                              <span className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-900 dark:text-amber-200 mr-1">
+                                ADJ
+                              </span>
+                            )}
+                            ↳ {child.item_name}
+                          </TableCell>
                           <TableCell>{child.state !== "active" ? <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">{child.state}</span> : <span className="text-muted-foreground text-xs">active</span>}</TableCell>
                           <TableCell className="text-right text-sm">{child.quantity}</TableCell>
                           <TableCell className="text-right text-sm">{child.allocated_qty}</TableCell>
@@ -991,10 +1145,88 @@ export default function ReceiptDetailPage() {
                   <EmptyTableRow colSpan={8} message="No receipt lines yet" />
                 )}
               </TableBody>
+              {receiptLineItems.length > 0 && (
+                <tfoot>
+                  <tr className="border-t font-medium">
+                    <td colSpan={5} className="px-4 py-2 text-right text-sm text-muted-foreground">Items Subtotal</td>
+                    <td></td>
+                    <td className="px-4 py-2 text-right text-sm">{formatCurrency(receiptLineItemsCost.toFixed(2))}</td>
+                    <td colSpan={2}></td>
+                  </tr>
+                  {adjustmentsCost !== 0 && (
+                    <tr className="bg-amber-50 dark:bg-amber-950/20">
+                      <td colSpan={5} className="px-4 py-2 text-right text-sm text-amber-700 dark:text-amber-300">Adjustments Total</td>
+                      <td></td>
+                      <td className="px-4 py-2 text-right text-sm text-amber-700 dark:text-amber-300">{formatCurrency(adjustmentsCost.toFixed(2))}</td>
+                      <td colSpan={2}></td>
+                    </tr>
+                  )}
+                  <tr className="border-t">
+                    <td colSpan={5} className="px-4 py-2 text-right text-sm font-semibold">Net Total</td>
+                    <td></td>
+                    <td className="px-4 py-2 text-right text-sm font-semibold">{formatCurrency((receiptLineItemsCost + adjustmentsCost).toFixed(2))}</td>
+                    <td colSpan={2}></td>
+                  </tr>
+                </tfoot>
+              )}
             </Table>
           )}
         </CardContent>
       </Card>
+
+      {/* Split Line Dialog */}
+      <Dialog open={splitDialogOpen} onOpenChange={(open) => { setSplitDialogOpen(open); if (!open) setSplitSourceLine(null) }}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Split Line Item</DialogTitle>
+          </DialogHeader>
+          {splitSourceLine && (
+            <form onSubmit={handleSplitLineItem} className="space-y-4">
+              <p className="text-sm text-muted-foreground">
+                Split <span className="font-medium text-foreground">{splitSourceLine.item_name}</span> (qty {splitSourceLine.quantity} @ {formatCurrency(splitSourceLine.unit_cost)}) into two lines.
+              </p>
+              {splitError && <p className="text-sm text-red-600">{splitError}</p>}
+              <div className="space-y-2">
+                <Label>Quantity to split off *</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={splitSourceLine.quantity - Math.max(1, splitSourceLine.allocated_qty)}
+                  value={splitQty}
+                  onChange={(e) => { setSplitQty(e.target.value); setSplitError("") }}
+                  required
+                />
+                <p className="text-xs text-muted-foreground">
+                  Original line keeps {splitSourceLine.quantity - (Number.parseInt(splitQty, 10) || 0)}{splitSourceLine.allocated_qty > 0 ? ` (${splitSourceLine.allocated_qty} allocated)` : ""} &middot; New line gets {Number.parseInt(splitQty, 10) || 0}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label>State for new line</Label>
+                <Select value={splitState} onValueChange={setSplitState}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="active">Active</SelectItem>
+                    <SelectItem value="returned">Returned</SelectItem>
+                    <SelectItem value="damaged">Damaged</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Notes</Label>
+                <Input value={splitNotes} onChange={(e) => setSplitNotes(e.target.value)} placeholder="Reason for split" />
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button type="button" variant="outline" onClick={() => setSplitDialogOpen(false)}>Cancel</Button>
+                <Button type="submit" disabled={
+                  (Number.parseInt(splitQty, 10) || 0) <= 0 ||
+                  (Number.parseInt(splitQty, 10) || 0) >= splitSourceLine.quantity ||
+                  (splitSourceLine.quantity - (Number.parseInt(splitQty, 10) || 0)) < splitSourceLine.allocated_qty
+                }>Split</Button>
+              </div>
+            </form>
+          )}
+        </DialogContent>
+      </Dialog>
 
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
@@ -1321,7 +1553,7 @@ export default function ReceiptDetailPage() {
                             size="icon"
                             variant="ghost"
                             className="text-red-600"
-                            onClick={() => handleDelete(p.purchase_id)}
+                            onClick={() => handleUnlinkPurchase(p.purchase_id)}
                           >
                             <Trash2 className="h-4 w-4" />
                           </Button>

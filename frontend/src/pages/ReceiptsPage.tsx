@@ -7,6 +7,7 @@ import {
   useUpdateReceipt,
   useDeleteReceipt,
   useVendors,
+  usePurchases,
 } from "@/hooks/useApi"
 import {
   type ReceiptOcrMode,
@@ -43,7 +44,7 @@ import { BulkReceiptImportDialog } from "@/components/BulkReceiptImportDialog"
 import { ConfirmCloseDialog } from "@/components/ConfirmCloseDialog"
 import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
 import { ReceiptImportPanel, type ReceiptImportPanelHandle } from "@/components/ReceiptImportPanel"
-import { Plus, Trash2, Pencil, FileText, Upload, CheckCircle2, AlertCircle } from "lucide-react"
+import { Plus, Trash2, Pencil, FileText, Upload, CheckCircle2, AlertCircle, Search } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
 import {
   getReceiptItemsDisplayCount,
@@ -100,6 +101,19 @@ export default function ReceiptsPage() {
   const queryClient = useQueryClient()
   const { data: allReceipts = [], isLoading } = useReceipts()
   const { data: vendors = [] } = useVendors()
+  const { data: allPurchases = [] } = usePurchases()
+
+  // Build receipt → item names lookup for search
+  const receiptItemNames = useMemo(() => {
+    const map = new Map<string, Set<string>>()
+    for (const p of allPurchases) {
+      if (!p.receipt_id) continue
+      let set = map.get(p.receipt_id)
+      if (!set) { set = new Set(); map.set(p.receipt_id, set) }
+      set.add(p.item_name.toLowerCase())
+    }
+    return map
+  }, [allPurchases])
 
   const createReceipt = useCreateReceipt()
   const updateReceipt = useUpdateReceipt()
@@ -111,6 +125,7 @@ export default function ReceiptsPage() {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [vendorFilter, setVendorFilter] = useState<string>("")
   const [statusFilter, setStatusFilter] = useState<string>("")
+  const [searchQuery, setSearchQuery] = useState("")
   const expectedTaxRate = getStoredExpectedTaxRate()
 
   const [isImportOpen, setIsImportOpen] = useState(false)
@@ -139,8 +154,27 @@ export default function ReceiptsPage() {
     if (statusFilter) {
       result = result.filter((r) => getReceiptReconciliationBadgeState(r, expectedTaxRate).kind === statusFilter)
     }
+    if (searchQuery.trim()) {
+      const q = searchQuery.trim().toLowerCase()
+      result = result.filter((r) => {
+        if (
+          r.receipt_number.toLowerCase().includes(q) ||
+          r.vendor_name.toLowerCase().includes(q) ||
+          (r.notes && r.notes.toLowerCase().includes(q)) ||
+          (r.payment_method && r.payment_method.toLowerCase().includes(q))
+        ) return true
+        // Search within linked purchase item names
+        const names = receiptItemNames.get(r.id)
+        if (names) {
+          for (const name of names) {
+            if (name.includes(q)) return true
+          }
+        }
+        return false
+      })
+    }
     return result
-  }, [allReceipts, vendorFilter, statusFilter, expectedTaxRate])
+  }, [allReceipts, vendorFilter, statusFilter, searchQuery, expectedTaxRate, receiptItemNames])
 
   const resetForm = () => {
     setEditingId(null)
@@ -274,6 +308,13 @@ export default function ReceiptsPage() {
                 onImported={closeImportDialogNow}
                 onActionInProgressChange={setImportActionInProgress}
                 onHandle={(h) => { importPanelHandleRef.current = h }}
+                onMultipleFilesSelected={(files) => {
+                  closeImportDialogNow()
+                  setBulkImportPrefillFiles(files)
+                  setBulkImportPrefillOcrMode(null)
+                  setBulkImportAutoStart(true)
+                  setBulkImportOpen(true)
+                }}
                 extraButtons={
                   <Button variant="outline" onClick={requestImportDialogClose}>Cancel</Button>
                 }
@@ -331,6 +372,18 @@ export default function ReceiptsPage() {
       <Card>
         <CardContent className="pt-6">
           <div className="flex gap-4">
+            <div className="flex-1 min-w-[200px]">
+              <Label className="mb-2 block">Search</Label>
+              <div className="relative">
+                <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                <input
+                  placeholder="Search receipts..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 pl-9 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                />
+              </div>
+            </div>
             <div className="w-48">
               <Label className="mb-2 block">Vendor</Label>
               <Select value={vendorFilter || "all"} onValueChange={(v) => setVendorFilter(v === "all" ? "" : v)}>

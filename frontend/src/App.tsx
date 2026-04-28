@@ -14,6 +14,7 @@ import ReceiptsPage from "@/pages/ReceiptsPage"
 import ReceiptDetailPage from "@/pages/ReceiptDetailPage"
 import PurchasesPage from "@/pages/PurchasesPage"
 import UnreconciledItemsPage from "@/pages/UnreconciledItemsPage"
+import TaxReportPage from "@/pages/TaxReportPage"
 import OptionsPage from "@/pages/OptionsPage"
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -144,6 +145,14 @@ export default function App() {
         element={
           <ProtectedRoute>
             <UnreconciledItemsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/reports/tax"
+        element={
+          <ProtectedRoute>
+            <TaxReportPage />
           </ProtectedRoute>
         }
       />

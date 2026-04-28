@@ -52,8 +52,8 @@ describe("findDuplicateMappedImportItems", () => {
 })
 
 describe("mergeMappedImportLines", () => {
-  it("merges env fee lines into mapped item unit cost while keeping base quantity", () => {
-    const merged = mergeMappedImportLines([
+  it("separates env fee lines as sub-items instead of merging into parent unit cost", () => {
+    const result = mergeMappedImportLines([
       {
         itemId: "item-ps5",
         description: "PS5 SLIM DISC",
@@ -70,18 +70,28 @@ describe("mergeMappedImportLines", () => {
       },
     ])
 
-    expect(merged).toEqual([
+    expect(result.mergedLines).toEqual([
       {
         itemId: "item-ps5",
         quantity: 2,
-        unitCost: "523.74",
-        notes: "PS5 SLIM DISC | Env Fee: Home AU&Rec",
+        unitCost: "519.99",
+        notes: "PS5 SLIM DISC",
+      },
+    ])
+    expect(result.feeLines).toEqual([
+      {
+        parentItemId: "item-ps5",
+        itemId: "item-ps5",
+        description: "Env Fee: Home AU&Rec",
+        quantity: 2,
+        unitCost: 3.75,
+        notes: "Env Fee: Home AU&Rec",
       },
     ])
   })
 
   it("sums quantity across non-fee lines mapped to the same item", () => {
-    const merged = mergeMappedImportLines([
+    const result = mergeMappedImportLines([
       {
         itemId: "item-show",
         description: "Echo Show 5 White",
@@ -98,7 +108,7 @@ describe("mergeMappedImportLines", () => {
       },
     ])
 
-    expect(merged).toEqual([
+    expect(result.mergedLines).toEqual([
       {
         itemId: "item-show",
         quantity: 2,
@@ -106,5 +116,6 @@ describe("mergeMappedImportLines", () => {
         notes: "Echo Show 5 White",
       },
     ])
+    expect(result.feeLines).toEqual([])
   })
 })

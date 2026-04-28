@@ -110,6 +110,7 @@ pub struct ReceiptLineItem {
     pub notes: Option<String>,
     pub parent_line_item_id: Option<Uuid>,
     pub state: String,
+    pub line_type: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -125,6 +126,7 @@ pub struct ReceiptLineItemWithItem {
     pub notes: Option<String>,
     pub parent_line_item_id: Option<Uuid>,
     pub state: String,
+    pub line_type: String,
     pub allocated_qty: i32,
     pub remaining_qty: i32,
     pub created_at: DateTime<Utc>,
@@ -149,6 +151,8 @@ pub struct Purchase {
     pub refunds_purchase_id: Option<Uuid>,
     pub purchase_type: String,
     pub bonus_for_purchase_id: Option<Uuid>,
+    pub display_parent_purchase_id: Option<Uuid>,
+    pub display_group: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -287,6 +291,8 @@ pub struct PurchaseEconomics {
     pub bonus_parent_item_name: Option<String>,
     pub bonus_parent_quantity: Option<i32>,
     pub bonus_parent_invoice_number: Option<String>,
+    pub display_parent_purchase_id: Option<Uuid>,
+    pub display_group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -318,6 +324,77 @@ pub struct DestinationSummary {
     pub total_commission: Option<Decimal>,
     pub total_tax_paid: Option<Decimal>,
     pub total_tax_owed: Option<Decimal>,
+}
+
+/// Raw flat row from the tax report SQL query (one row per purchase×allocation).
+/// Post-processed into the hierarchical TaxReportSummary in the handler.
+#[derive(Debug, Clone, FromRow)]
+pub struct TaxReportFlatRow {
+    pub purchase_id: Uuid,
+    pub invoice_id: Uuid,
+    pub invoice_number: String,
+    pub invoice_date: NaiveDate,
+    pub delivery_date: Option<NaiveDate>,
+    pub tax_rate: Decimal,
+    pub item_name: String,
+    pub quantity: i32,
+    pub invoice_unit_price: Decimal,
+    pub receipt_id: Option<Uuid>,
+    pub receipt_number: Option<String>,
+    pub receipt_date: Option<NaiveDate>,
+    pub vendor_name: Option<String>,
+    pub allocated_qty: Option<i32>,
+    pub allocation_unit_cost: Option<Decimal>,
+    pub allocation_total: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxReportAllocation {
+    pub receipt_id: Uuid,
+    pub receipt_number: String,
+    pub receipt_date: NaiveDate,
+    pub vendor_name: String,
+    pub allocated_qty: i32,
+    pub unit_cost: Decimal,
+    pub allocated_total: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxReportPurchase {
+    pub item_name: String,
+    pub quantity: i32,
+    pub invoice_unit_price: Decimal,
+    pub total_cost: Decimal,
+    pub total_revenue: Decimal,
+    pub commission: Decimal,
+    pub hst_on_cost: Decimal,
+    pub hst_on_commission: Decimal,
+    pub allocations: Vec<TaxReportAllocation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxReportInvoice {
+    pub invoice_id: Uuid,
+    pub invoice_number: String,
+    pub invoice_date: NaiveDate,
+    pub delivery_date: Option<NaiveDate>,
+    pub tax_rate: Decimal,
+    pub total_cost: Decimal,
+    pub total_revenue: Decimal,
+    pub total_commission: Decimal,
+    pub total_hst_on_cost: Decimal,
+    pub total_hst_on_commission: Decimal,
+    pub purchases: Vec<TaxReportPurchase>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxReportSummary {
+    pub total_commission: Decimal,
+    pub total_hst_on_cost: Decimal,
+    pub total_hst_on_commission: Decimal,
+    pub total_cost: Decimal,
+    pub total_revenue: Decimal,
+    pub invoices: Vec<TaxReportInvoice>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -554,6 +631,7 @@ pub struct CreateReceiptLineItem {
     pub notes: Option<String>,
     pub parent_line_item_id: Option<Uuid>,
     pub state: Option<String>,
+    pub line_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -580,6 +658,8 @@ pub struct CreatePurchase {
     pub refunds_purchase_id: Option<Uuid>,
     pub purchase_type: Option<String>,
     pub bonus_for_purchase_id: Option<Uuid>,
+    pub display_parent_purchase_id: Option<Uuid>,
+    pub display_group: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -611,6 +691,12 @@ pub struct UpdatePurchase {
     pub bonus_for_purchase_id: Option<Uuid>,
     #[serde(default)]
     pub clear_bonus_for_purchase: bool, // true → set bonus_for_purchase_id to NULL
+    pub display_parent_purchase_id: Option<Uuid>,
+    #[serde(default)]
+    pub clear_display_parent_purchase: bool, // true → set display_parent_purchase_id to NULL
+    pub display_group: Option<String>,
+    #[serde(default)]
+    pub clear_display_group: bool, // true → set display_group to NULL
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1302,6 +1388,8 @@ mod tests {
                 bonus_parent_item_name: None,
                 bonus_parent_quantity: None,
                 bonus_parent_invoice_number: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             };
 
             assert_eq!(econ.quantity, -1);
@@ -1344,6 +1432,8 @@ mod tests {
                 bonus_parent_item_name: None,
                 bonus_parent_quantity: None,
                 bonus_parent_invoice_number: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             };
 
             let refund = PurchaseEconomics {
@@ -1377,6 +1467,8 @@ mod tests {
                 bonus_parent_item_name: None,
                 bonus_parent_quantity: None,
                 bonus_parent_invoice_number: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             };
 
             let items = vec![sale, refund];
@@ -1685,6 +1777,8 @@ mod tests {
                 bonus_parent_item_name: None,
                 bonus_parent_quantity: None,
                 bonus_parent_invoice_number: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             }
         }
 
@@ -1722,6 +1816,8 @@ mod tests {
                 bonus_parent_item_name: None,
                 bonus_parent_quantity: None,
                 bonus_parent_invoice_number: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             }
         }
 
@@ -1878,6 +1974,8 @@ mod tests {
                 bonus_parent_item_name: None,
                 bonus_parent_quantity: None,
                 bonus_parent_invoice_number: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             }
         }
 
@@ -2018,6 +2116,8 @@ mod tests {
                 bonus_parent_item_name: None,
                 bonus_parent_quantity: None,
                 bonus_parent_invoice_number: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             };
 
             assert_eq!(parent.total_commission, Some(dec!(46.00)));
@@ -2081,6 +2181,8 @@ mod tests {
                 bonus_parent_item_name: None,
                 bonus_parent_quantity: None,
                 bonus_parent_invoice_number: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             };
 
             assert!(parent.bonus_for_purchase_id.is_none());

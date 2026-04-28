@@ -970,6 +970,8 @@ async fn import_purchases(
                     refunds_purchase_id: None,
                     purchase_type: None,
                     bonus_for_purchase_id: None,
+                    display_parent_purchase_id: None,
+                    display_group: None,
                 };
 
                 match queries::create_purchase(&state.pool, create_purchase, user.user_id).await {
@@ -2128,12 +2130,25 @@ async fn parse_receipt_image(
         .multipart(form)
         .send()
         .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "Receipt OCR service is unavailable right now. Please try again in a moment."
-                    .to_string(),
-            )
+        .map_err(|e| {
+            if e.is_timeout() {
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Receipt OCR timed out after 35s. The image may be too large or complex. Try a simpler photo or a single-page PDF."
+                        .to_string(),
+                )
+            } else if e.is_connect() {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "Receipt OCR service is not running. Please try again in a moment."
+                        .to_string(),
+                )
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Receipt OCR service is unavailable: {e}"),
+                )
+            }
         })?;
 
     if !response.status().is_success() {

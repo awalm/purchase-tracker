@@ -1,7 +1,7 @@
-import React, { useEffect, useState, useRef } from "react"
+import React, { useEffect, useState, useRef, useMemo } from "react"
 import { useNavigate, useSearchParams } from "react-router-dom"
 import { useQueryClient } from "@tanstack/react-query"
-import { useInvoices, useCreateInvoice, useUpdateInvoice, useDeleteInvoice, useDestinations, useItems } from "@/hooks/useApi"
+import { useInvoices, useCreateInvoice, useUpdateInvoice, useDeleteInvoice, useDestinations, useItems, usePurchases } from "@/hooks/useApi"
 import { useMultiSelect } from "@/hooks/useMultiSelect"
 import {
   ApiValidationError,
@@ -47,7 +47,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Plus, Trash2, CheckCircle2, AlertCircle, Clock, Upload, FileText, FileDown, Loader2, Scissors, X } from "lucide-react"
+import { Plus, Trash2, CheckCircle2, AlertCircle, Clock, Upload, FileText, FileDown, Loader2, Scissors, X, Search } from "lucide-react"
 import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
 import { getAutoMatchedItemId } from "@/lib/receiptImportHelpers"
 import { rememberVendorItemMappings } from "@/lib/vendorItemMappingCache"
@@ -98,7 +98,7 @@ function ReconciliationBadge({ invoice }: { invoice: Invoice }) {
     const finalizedIssues: string[] = []
     if (count === 0) finalizedIssues.push("No items")
     if (!totalsMatched) finalizedIssues.push(`${formatCurrency(difference)} off`)
-    if (count > 0 && !allReceipted) finalizedIssues.push(`${receiptedCount}/${count} receipted`)
+    if (count > 0 && !allReceipted) finalizedIssues.push(`${receiptedCount}/${count} have receipts`)
 
     return (
       <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 px-2 py-1 rounded-full">
@@ -138,7 +138,7 @@ function ReconciliationBadge({ invoice }: { invoice: Invoice }) {
   // Show what's missing
   const issues: string[] = []
   if (!totalsMatched) issues.push(`${formatCurrency(difference)} off`)
-  if (!allReceipted) issues.push(`${receiptedCount}/${count} receipted`)
+  if (!allReceipted) issues.push(`${receiptedCount}/${count} have receipts`)
 
   return (
     <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-600 bg-amber-50 px-2 py-1 rounded-full">
@@ -158,6 +158,20 @@ export default function InvoicesPage() {
   const updateInvoice = useUpdateInvoice()
   const deleteInvoice = useDeleteInvoice()
   const { data: activeItems = [] } = useItems()
+  const { data: allPurchases = [] } = usePurchases()
+
+  // Build invoice → item names lookup for search
+  const invoiceItemNames = useMemo(() => {
+    const map = new Map<string, Set<string>>()
+    for (const p of allPurchases) {
+      if (!p.invoice_id) continue
+      let set = map.get(p.invoice_id)
+      if (!set) { set = new Set(); map.set(p.invoice_id, set) }
+      set.add(p.item_name.toLowerCase())
+      if (p.vendor_name) set.add(p.vendor_name.toLowerCase())
+    }
+    return map
+  }, [allPurchases])
 
   // Form state
   const [isOpen, setIsOpen] = useState(false)
@@ -290,6 +304,8 @@ export default function InvoicesPage() {
   const [bulkBackupError, setBulkBackupError] = useState("")
   const [bulkBackupNotice, setBulkBackupNotice] = useState("")
   const [deleteError, setDeleteError] = useState("")
+  const [showUnallocatedOnly, setShowUnallocatedOnly] = useState(false)
+  const [searchQuery, setSearchQuery] = useState("")
 
   useEffect(() => {
     const shouldOpenBulkReceiptImport = searchParams.get("bulkReceiptImport") === "1"
@@ -558,6 +574,44 @@ export default function InvoicesPage() {
       setDeleteError(err instanceof Error ? err.message : "Failed to delete selected invoices")
     }
   }
+
+  // Sort invoices by date descending (most recent first), then by invoice_number
+  const sortedInvoices = React.useMemo(() => {
+    const sorted = [...invoices].sort((a, b) => {
+      const dateCmp = b.invoice_date.localeCompare(a.invoice_date)
+      if (dateCmp !== 0) return dateCmp
+      return a.invoice_number.localeCompare(b.invoice_number, undefined, { numeric: true, sensitivity: "base" })
+    })
+    let result = sorted
+    if (showUnallocatedOnly) {
+      result = result.filter(inv => {
+        const count = inv.purchase_count || 0
+        const receipted = inv.receipted_count || 0
+        return count === 0 || receipted < count
+      })
+    }
+    if (searchQuery.trim()) {
+      const q = searchQuery.trim().toLowerCase()
+      result = result.filter(inv => {
+        if (
+          inv.invoice_number.toLowerCase().includes(q) ||
+          inv.destination_name.toLowerCase().includes(q) ||
+          inv.destination_code.toLowerCase().includes(q) ||
+          (inv.order_number && inv.order_number.toLowerCase().includes(q)) ||
+          (inv.notes && inv.notes.toLowerCase().includes(q))
+        ) return true
+        // Search within linked purchase item/vendor names
+        const names = invoiceItemNames.get(inv.id)
+        if (names) {
+          for (const name of names) {
+            if (name.includes(q)) return true
+          }
+        }
+        return false
+      })
+    }
+    return result
+  }, [invoices, showUnallocatedOnly, searchQuery, invoiceItemNames])
 
   // Summary stats - only include finalized invoices per commission policy
   const totalInvoiceValue = invoices.reduce((sum, inv) => sum + parseFloat(inv.subtotal), 0)
@@ -1397,7 +1451,29 @@ export default function InvoicesPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>All Invoices ({invoices.length})</CardTitle>
+          <div className="flex items-center justify-between">
+            <CardTitle>All Invoices ({sortedInvoices.length !== invoices.length ? `${sortedInvoices.length} / ${invoices.length}` : invoices.length})</CardTitle>
+            <div className="flex items-center gap-4">
+              <div className="relative w-64">
+                <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                <Input
+                  placeholder="Search invoices..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pl-9 h-9"
+                />
+              </div>
+              <label className="flex items-center gap-2 text-sm font-normal whitespace-nowrap">
+                <input
+                  type="checkbox"
+                  checked={showUnallocatedOnly}
+                  onChange={(e) => setShowUnallocatedOnly(e.target.checked)}
+                  className="h-4 w-4 rounded border-gray-300"
+                />
+                Unreconciled only
+              </label>
+            </div>
+          </div>
         </CardHeader>
         <CardContent>
           <Table>
@@ -1423,7 +1499,7 @@ export default function InvoicesPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {invoices.map((inv) => (
+              {sortedInvoices.map((inv) => (
                 <TableRow 
                   key={inv.id}
                   className={`cursor-pointer transition-colors ${selectedIds.has(inv.id) ? "bg-muted/50" : "hover:bg-muted/50"}`}
@@ -1467,8 +1543,8 @@ export default function InvoicesPage() {
                   </TableCell>
                 </TableRow>
               ))}
-              {invoices.length === 0 && (
-                <EmptyTableRow colSpan={10} message="No invoices yet. Add your first invoice to start tracking!" />
+              {sortedInvoices.length === 0 && (
+                <EmptyTableRow colSpan={10} message={showUnallocatedOnly ? "All invoices are fully reconciled!" : "No invoices yet. Add your first invoice to start tracking!"} />
               )}
             </TableBody>
           </Table>

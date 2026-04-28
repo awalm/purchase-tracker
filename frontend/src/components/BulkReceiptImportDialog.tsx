@@ -30,6 +30,7 @@ type BulkReceiptImportDialogProps = {
   prefillFiles?: File[]
   prefillOcrMode?: ReceiptOcrMode
   autoStartParse?: boolean
+  onReceiptImported?: (receiptId: string) => void
 }
 
 export function BulkReceiptImportDialog({
@@ -38,6 +39,7 @@ export function BulkReceiptImportDialog({
   prefillFiles = [],
   prefillOcrMode,
   autoStartParse = true,
+  onReceiptImported,
 }: BulkReceiptImportDialogProps) {
   const [drafts, setDrafts] = useState<BulkDraft[]>([])
   const [activeDraftId, setActiveDraftId] = useState<string | null>(null)
@@ -68,6 +70,7 @@ export function BulkReceiptImportDialog({
   const closeDialogNow = () => {
     setConfirmCloseOpen(false)
     onOpenChange(false)
+    parsingIdsRef.current.clear()
     setDrafts([])
     setActiveDraftId(null)
     setBulkOcrMode(prefillOcrMode ?? "auto")
@@ -102,48 +105,49 @@ export function BulkReceiptImportDialog({
     }
   }, [drafts, activeDraftId])
 
-  // ── Background parse queued drafts ──
+  // ── Background parse queue — parses ALL drafts with concurrency limit ──
+
+  const parsingIdsRef = useRef<Set<string>>(new Set())
+  const MAX_CONCURRENT_PARSES = 2
 
   useEffect(() => {
-    if (!open || !autoStartParse) return
-    const nextDraft = drafts.find(
-      (draft) => draft.id !== activeDraftId && !draft.imported && !draft.parsed && !draft.parsing && !draft.parseError
-    )
-    if (!nextDraft) return
+    if (!open) return
+    const slotsAvailable = MAX_CONCURRENT_PARSES - parsingIdsRef.current.size
+    if (slotsAvailable <= 0) return
 
-    let cancelled = false
+    const candidates = drafts.filter(
+      (d) => !d.imported && !d.parsed && !d.parsing && !d.parseError && !parsingIdsRef.current.has(d.id)
+    ).slice(0, slotsAvailable)
 
-    setDrafts((prev) => prev.map((draft) => (
-      draft.id === nextDraft.id ? { ...draft, parsing: true, parseError: null } : draft
-    )))
+    if (candidates.length === 0) return
 
-    void importApi.receiptImage(nextDraft.file, undefined, {
-      bypassCompression: bulkBypassCompression,
-      ocrMode: bulkOcrMode,
-    }).then((receipt) => {
-      if (cancelled) return
-      setDrafts((prev) => prev.map((draft) => (
-        draft.id === nextDraft.id
-          ? { ...draft, parsing: false, parsed: true, parseError: null, parsedReceipt: receipt }
-          : draft
-      )))
-    }).catch((error) => {
-      if (cancelled) return
-      setDrafts((prev) => prev.map((draft) => (
-        draft.id === nextDraft.id
-          ? {
-              ...draft,
-              parsing: false,
-              parseError: error instanceof Error ? error.message : "Failed to parse receipt image",
-            }
-          : draft
-      )))
-    })
+    for (const candidate of candidates) {
+      parsingIdsRef.current.add(candidate.id)
 
-    return () => {
-      cancelled = true
+      setDrafts((prev) => prev.map((d) =>
+        d.id === candidate.id ? { ...d, parsing: true, parseError: null } : d
+      ))
+
+      void importApi.receiptImage(candidate.file, undefined, {
+        bypassCompression: bulkBypassCompression,
+        ocrMode: bulkOcrMode,
+      }).then((receipt) => {
+        parsingIdsRef.current.delete(candidate.id)
+        setDrafts((prev) => prev.map((d) =>
+          d.id === candidate.id
+            ? { ...d, parsing: false, parsed: true, parseError: null, parsedReceipt: receipt }
+            : d
+        ))
+      }).catch((error) => {
+        parsingIdsRef.current.delete(candidate.id)
+        setDrafts((prev) => prev.map((d) =>
+          d.id === candidate.id
+            ? { ...d, parsing: false, parseError: error instanceof Error ? error.message : "Failed to parse receipt image" }
+            : d
+        ))
+      })
     }
-  }, [open, autoStartParse, drafts, activeDraftId, bulkBypassCompression, bulkOcrMode])
+  }, [open, drafts, bulkBypassCompression, bulkOcrMode])
 
   // ── File input ──
 
@@ -158,6 +162,7 @@ export function BulkReceiptImportDialog({
   // ── Delete draft ──
 
   const deleteDraft = (draftId: string) => {
+    parsingIdsRef.current.delete(draftId)
     const deletingIsActive = draftId === activeDraftId
     setDrafts((prev) => {
       const nextDrafts = prev.filter((d) => d.id !== draftId)
@@ -289,6 +294,7 @@ export function BulkReceiptImportDialog({
                         <ReceiptImportPanel
                           initialFile={draft.file}
                           initialParsedReceipt={draft.parsedReceipt}
+                          externalParsing={draft.parsing}
                           ocrMode={bulkOcrMode}
                           bypassCompression={bulkBypassCompression}
                           hideFilePicker
@@ -296,8 +302,9 @@ export function BulkReceiptImportDialog({
                           onParsed={(receipt) => {
                             setDrafts((prev) => prev.map((d) => (d.id === draft.id ? { ...d, parsed: true, parsedReceipt: receipt } : d)))
                           }}
-                          onImported={() => {
+                          onImported={(receiptId) => {
                             setDrafts((prev) => prev.map((d) => (d.id === draft.id ? { ...d, imported: true } : d)))
+                            onReceiptImported?.(receiptId)
                             const nextDraft = drafts.find((d) => d.id !== draft.id && !d.imported)
                             if (nextDraft) setActiveDraftId(nextDraft.id)
                           }}

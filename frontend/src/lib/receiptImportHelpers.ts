@@ -5,6 +5,7 @@ import {
   mergeMappedImportLines,
   type MappedImportLineForMerge,
   type MergedMappedImportLine,
+  type FeeLineForSave,
 } from "./receiptImportValidation"
 import { getCachedVendorItemId } from "./vendorItemMappingCache"
 import { rememberVendorItemMappings } from "./vendorItemMappingCache"
@@ -17,6 +18,8 @@ export type ManualImportLine = {
   itemId: string
   quantity: string
   unitCost: string
+  lineType: "item" | "adjustment"
+  parentItemId: string // for adjustment lines: the item_id of the parent line
 }
 
 export type ImportLineOverrides = {
@@ -46,12 +49,14 @@ export const tokenizeName = (name: string): string[] =>
     .map((t) => t.trim())
     .filter((t) => t.length >= 2)
 
-export const createManualImportLine = (): ManualImportLine => ({
+export const createManualImportLine = (lineType: "item" | "adjustment" = "item"): ManualImportLine => ({
   id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
   description: "",
   itemId: "",
   quantity: "1",
   unitCost: "",
+  lineType,
+  parentItemId: "",
 })
 
 export const getOcrEngineDisplayName = (engine: string | null | undefined): string => {
@@ -228,6 +233,17 @@ export const computeImportLineStats = (
     const manualUnresolved = manualLines.filter((line) => {
       const qty = Number.parseInt(line.quantity, 10)
       const unitCostNum = Number.parseFloat(line.unitCost)
+      if (line.lineType === "adjustment") {
+        return (
+          !line.description.trim() ||
+          !line.itemId ||
+          !line.parentItemId ||
+          !Number.isFinite(qty) ||
+          qty <= 0 ||
+          !Number.isFinite(unitCostNum) ||
+          unitCostNum === 0
+        )
+      }
       return (
         !line.description.trim() ||
         !line.itemId ||
@@ -238,12 +254,17 @@ export const computeImportLineStats = (
       )
     }).length
 
+    // Include adjustment lines in subtotal (they have negative costs)
+    const manualSubtotalLines = manualLines.map((line) => ({
+      quantity: line.quantity,
+      unitCost: line.unitCost,
+      allowNegativeCost: line.lineType === "adjustment",
+    }))
+
     return {
       total: manualLines.length,
       unresolved: manualUnresolved,
-      lineSubtotal: computeImportLineItemsSubtotal(
-        manualLines.map((line) => ({ quantity: line.quantity, unitCost: line.unitCost }))
-      ),
+      lineSubtotal: computeImportLineItemsSubtotal(manualSubtotalLines),
     }
   }
 
@@ -270,6 +291,17 @@ export const computeImportLineStats = (
   const manualUnresolved = manualLines.filter((line) => {
     const qty = Number.parseInt(line.quantity, 10)
     const unitCostNum = Number.parseFloat(line.unitCost)
+    if (line.lineType === "adjustment") {
+      return (
+        !line.description.trim() ||
+        !line.itemId ||
+        !line.parentItemId ||
+        !Number.isFinite(qty) ||
+        qty <= 0 ||
+        !Number.isFinite(unitCostNum) ||
+        unitCostNum === 0
+      )
+    }
     return (
       !line.description.trim() ||
       !line.itemId ||
@@ -295,10 +327,12 @@ export const computeImportLineStats = (
       return { quantity: qty, unitCost }
     })
 
-  const manualSubtotalInput = manualLines.map((line) => ({
-    quantity: line.quantity,
-    unitCost: line.unitCost,
-  }))
+  const manualSubtotalInput = manualLines
+    .map((line) => ({
+      quantity: line.quantity,
+      unitCost: line.unitCost,
+      allowNegativeCost: line.lineType === "adjustment",
+    }))
 
   const totalParsedLines = parsedReceipt.line_items.filter(
     (_line, index) => !isLineDeleted(overrides.deletedLineIndexes, index)
@@ -363,6 +397,7 @@ export const computeMergePreview = (
   }
 
   for (const line of manualLines) {
+    if (line.lineType === "adjustment") continue // Adjustment lines don't merge
     const description = line.description.trim()
     const itemId = line.itemId.trim()
     const qty = Number.parseInt(line.quantity, 10)
@@ -375,7 +410,7 @@ export const computeMergePreview = (
     mappedLines.push({ itemId, description, quantity: qty, unitCost, notes: description })
   }
 
-  const mergedLines = mergeMappedImportLines(mappedLines)
+  const { mergedLines } = mergeMappedImportLines(mappedLines)
 
   return {
     mappedLineCount: mappedLines.length,
@@ -386,17 +421,19 @@ export const computeMergePreview = (
 
 // ── Save pipeline: build merged lines + learned mappings ──
 
-export type SubItemForSave = {
+export type AdjustmentImportLine = {
   parentItemId: string
   itemId: string
   quantity: number
-  unitCost: string
+  unitCost: number
+  description: string
   notes: string
 }
 
 export type BuildMergedLinesResult = {
   mergedLines: MergedMappedImportLine[]
-  subItemsForSave: SubItemForSave[]
+  adjustmentLines: AdjustmentImportLine[]
+  feeLines: FeeLineForSave[]
   learnedMappings: Array<{ sourceText: string; itemId: string }>
 }
 
@@ -460,6 +497,8 @@ export const buildMergedLinesForSave = (
     0
   )
 
+  const adjustmentLines: AdjustmentImportLine[] = []
+
   for (let i = 0; i < manualLines.length; i += 1) {
     const line = manualLines[i]
     const manualLineNumber = parsedLineCountForNumbering + i + 1
@@ -472,25 +511,45 @@ export const buildMergedLinesForSave = (
     if (!description) throw new Error(`Line ${manualLineNumber} description is required`)
     if (!itemId) throw new Error(`Line ${manualLineNumber} is not mapped to an item`)
     if (!Number.isFinite(qty) || qty <= 0) throw new Error(`Line ${manualLineNumber} has invalid quantity`)
-    if (!Number.isFinite(unitCostNumber) || unitCostNumber <= 0) throw new Error(`Line ${manualLineNumber} has invalid unit cost`)
 
-    mappedLinesForMerge.push({
-      itemId,
-      description,
-      quantity: qty,
-      unitCost: unitCostNumber,
-      notes: description,
-    })
+    if (line.lineType === "adjustment") {
+      // Adjustment lines allow negative unit cost and skip merge
+      if (!Number.isFinite(unitCostNumber) || unitCostNumber === 0) {
+        throw new Error(`Line ${manualLineNumber} has invalid unit cost`)
+      }
+      if (!line.parentItemId) {
+        throw new Error(`Adjustment line ${manualLineNumber} must have a parent item`)
+      }
+      adjustmentLines.push({
+        parentItemId: line.parentItemId,
+        itemId,
+        quantity: qty,
+        unitCost: unitCostNumber,
+        description,
+        notes: description,
+      })
+    } else {
+      if (!Number.isFinite(unitCostNumber) || unitCostNumber <= 0) {
+        throw new Error(`Line ${manualLineNumber} has invalid unit cost`)
+      }
+      mappedLinesForMerge.push({
+        itemId,
+        description,
+        quantity: qty,
+        unitCost: unitCostNumber,
+        notes: description,
+      })
+    }
 
     learnedMappings.push({ sourceText: description, itemId })
   }
 
-  const mergedLines = mergeMappedImportLines(mappedLinesForMerge)
+  const { mergedLines, feeLines } = mergeMappedImportLines(mappedLinesForMerge)
   if (mergedLines.length === 0) {
     throw new Error("No valid mapped line items to create")
   }
 
-  return { mergedLines, subItemsForSave: [], learnedMappings }
+  return { mergedLines, adjustmentLines, feeLines, learnedMappings }
 }
 
 // ── Shared receipt import execution ──
@@ -556,16 +615,51 @@ export const executeReceiptImport = async (
     createdReceiptId = created.id
 
     onStatus?.("Creating receipt line items...")
-    const { mergedLines, learnedMappings } = buildMergedLinesForSave(
+    const { mergedLines, adjustmentLines, feeLines, learnedMappings } = buildMergedLinesForSave(
       parsedReceipt, overrides, manualLines, autoMatchCtx, itemNameById
     )
 
+    // Create parent lines first, collecting itemId → lineItemId mapping
+    const itemIdToLineItemId = new Map<string, string>()
     for (const line of mergedLines) {
-      await receiptsApi.lineItems.create(createdReceiptId, {
+      const created = await receiptsApi.lineItems.create(createdReceiptId, {
         item_id: line.itemId,
         quantity: line.quantity,
         unit_cost: line.unitCost,
         notes: line.notes || undefined,
+      })
+      itemIdToLineItemId.set(line.itemId, created.id)
+    }
+
+    // Create fee lines as children with line_type = 'adjustment'
+    for (const fee of feeLines) {
+      const parentLineItemId = itemIdToLineItemId.get(fee.parentItemId)
+      if (!parentLineItemId) {
+        throw new Error(`Fee line "${fee.description}" references parent item that was not created`)
+      }
+      await receiptsApi.lineItems.create(createdReceiptId, {
+        item_id: fee.itemId,
+        quantity: fee.quantity,
+        unit_cost: fee.unitCost.toFixed(2),
+        notes: fee.notes || undefined,
+        parent_line_item_id: parentLineItemId,
+        line_type: "adjustment",
+      })
+    }
+
+    // Create manual adjustment lines with parent_line_item_id
+    for (const adj of adjustmentLines) {
+      const parentLineItemId = itemIdToLineItemId.get(adj.parentItemId)
+      if (!parentLineItemId) {
+        throw new Error(`Adjustment line "${adj.description}" references parent item that was not created`)
+      }
+      await receiptsApi.lineItems.create(createdReceiptId, {
+        item_id: adj.itemId,
+        quantity: adj.quantity,
+        unit_cost: adj.unitCost.toFixed(2),
+        notes: adj.notes || undefined,
+        parent_line_item_id: parentLineItemId,
+        line_type: "adjustment",
       })
     }
 

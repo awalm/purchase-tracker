@@ -1133,6 +1133,7 @@ async fn import_backup_zip_payload(
                     notes: line_item.notes.clone(),
                     parent_line_item_id: None,
                     state: None,
+                    line_type: None,
                 },
             )
             .await
@@ -1193,6 +1194,8 @@ async fn import_backup_zip_payload(
                 refunds_purchase_id: None,
                 purchase_type: purchase.purchase_type.clone(),
                 bonus_for_purchase_id: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             },
             user_id,
         )

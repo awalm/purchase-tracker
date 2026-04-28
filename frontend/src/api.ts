@@ -1,4 +1,5 @@
 import { compressUploadFile } from './lib/uploadCompression';
+import type { PurchaseEconomics } from './types';
 
 const API_BASE = '/api';
 
@@ -260,35 +261,7 @@ export const items = {
       updated_at: string;
     }>(`/items/${id}`),
   purchases: (id: string) =>
-    request<{
-      purchase_id: string;
-      purchase_date: string;
-      item_id: string;
-      item_name: string;
-      vendor_name: string | null;
-      destination_code: string | null;
-      quantity: number;
-      purchase_cost: string;
-      total_cost: string | null;
-      invoice_unit_price: string | null;
-      total_selling: string | null;
-      unit_commission: string | null;
-      total_commission: string | null;
-      tax_paid: string | null;
-      tax_owed: string | null;
-      status: string;
-      delivery_date: string | null;
-      invoice_id: string | null;
-      receipt_id: string | null;
-      receipt_number: string | null;
-      invoice_number: string | null;
-      allow_receipt_date_override: boolean;
-      notes: string | null;
-      refunds_purchase_id: string | null;
-      purchase_type: string | null;
-      bonus_for_purchase_id: string | null;
-      invoice_reconciliation_state: string | null;
-    }[]>(`/items/${id}/purchases`),
+    request<PurchaseEconomics[]>(`/items/${id}/purchases`),
   receiptLines: (id: string) =>
     request<{
       receipt_line_item_id: string;
@@ -356,38 +329,7 @@ export const invoices = {
       receipted_count: number | null;
     }>(`/invoices/${id}`),
   purchases: (id: string) =>
-    request<{
-      purchase_id: string;
-      purchase_date: string;
-      item_id: string;
-      item_name: string;
-      vendor_name: string | null;
-      destination_code: string | null;
-      quantity: number;
-      purchase_cost: string;
-      total_cost: string | null;
-      invoice_unit_price: string | null;
-      total_selling: string | null;
-      unit_commission: string | null;
-      total_commission: string | null;
-      tax_paid: string | null;
-      tax_owed: string | null;
-      status: string;
-      delivery_date: string | null;
-      invoice_id: string | null;
-      receipt_id: string | null;
-      receipt_number: string | null;
-      invoice_number: string | null;
-      allow_receipt_date_override: boolean;
-      notes: string | null;
-      refunds_purchase_id: string | null;
-      purchase_type: string | null;
-      bonus_for_purchase_id: string | null;
-      invoice_reconciliation_state: string | null;
-      bonus_parent_item_name: string | null;
-      bonus_parent_quantity: number | null;
-      bonus_parent_invoice_number: string | null;
-    }[]>(`/invoices/${id}/purchases`),
+    request<PurchaseEconomics[]>(`/invoices/${id}/purchases`),
   create: (data: {
     destination_id: string;
     invoice_number: string;
@@ -596,39 +538,13 @@ export const receipts = {
       locked_purchase_count: number | null;
     }>(`/receipts/${id}`),
   purchases: (id: string) =>
-    request<{
-      purchase_id: string;
-      purchase_date: string;
-      item_id: string;
-      item_name: string;
-      vendor_name: string | null;
-      destination_code: string | null;
-      quantity: number;
-      purchase_cost: string;
-      total_cost: string | null;
-      invoice_unit_price: string | null;
-      total_selling: string | null;
-      unit_commission: string | null;
-      total_commission: string | null;
-      tax_paid: string | null;
-      tax_owed: string | null;
-      status: string;
-      delivery_date: string | null;
-      invoice_id: string | null;
-      receipt_id: string | null;
-      receipt_number: string | null;
-      invoice_number: string | null;
-      allow_receipt_date_override: boolean;
-      notes: string | null;
-      refunds_purchase_id: string | null;
-      purchase_type: string | null;
-      bonus_for_purchase_id: string | null;
-      invoice_reconciliation_state: string | null;
-    }[]>(`/receipts/${id}/purchases`),
+    request<PurchaseEconomics[]>(`/receipts/${id}/purchases`),
+  unlinkPurchase: (receiptId: string, purchaseId: string) =>
+    request<void>(`/receipts/${receiptId}/purchases/${purchaseId}`, { method: 'DELETE' }),
   lineItems: {
     list: (id: string) =>
       request<ReceiptLineItem[]>(`/receipts/${id}/line-items`),
-    create: (id: string, data: { item_id: string; quantity: number; unit_cost: string; notes?: string; parent_line_item_id?: string; state?: string }) =>
+    create: (id: string, data: { item_id: string; quantity: number; unit_cost: string; notes?: string; parent_line_item_id?: string; line_type?: string; state?: string }) =>
       request<ReceiptLineItem>(`/receipts/${id}/line-items`, {
         method: 'POST',
         body: JSON.stringify(data),
@@ -707,35 +623,7 @@ export const purchases = {
     if (typeof params?.limit === 'number') searchParams.set('limit', String(params.limit));
     if (typeof params?.offset === 'number') searchParams.set('offset', String(params.offset));
     const query = searchParams.toString();
-    return request<{
-      purchase_id: string;
-      purchase_date: string;
-      item_id: string;
-      item_name: string;
-      vendor_name: string | null;
-      destination_code: string | null;
-      quantity: number;
-      purchase_cost: string;
-      total_cost: string | null;
-      invoice_unit_price: string | null;
-      total_selling: string | null;
-      unit_commission: string | null;
-      total_commission: string | null;
-      tax_paid: string | null;
-      tax_owed: string | null;
-      status: string;
-      delivery_date: string | null;
-      invoice_id: string | null;
-      receipt_id: string | null;
-      receipt_number: string | null;
-      invoice_number: string | null;
-      allow_receipt_date_override: boolean;
-      notes: string | null;
-      refunds_purchase_id: string | null;
-      purchase_type: string | null;
-      bonus_for_purchase_id: string | null;
-      invoice_reconciliation_state: string | null;
-    }[]>(`/purchases/economics${query ? `?${query}` : ''}`);
+    return request<PurchaseEconomics[]>(`/purchases/economics${query ? `?${query}` : ''}`);
   },
   create: (data: {
     item_id: string;
@@ -830,6 +718,51 @@ export interface UnreconciledReceiptItem {
   unreconciled_value: string;
 }
 
+export interface TaxReportAllocation {
+  receipt_id: string;
+  receipt_number: string;
+  receipt_date: string;
+  vendor_name: string;
+  allocated_qty: number;
+  unit_cost: string;
+  allocated_total: string;
+}
+
+export interface TaxReportPurchase {
+  item_name: string;
+  quantity: number;
+  invoice_unit_price: string;
+  total_cost: string;
+  total_revenue: string;
+  commission: string;
+  hst_on_cost: string;
+  hst_on_commission: string;
+  allocations: TaxReportAllocation[];
+}
+
+export interface TaxReportInvoice {
+  invoice_id: string;
+  invoice_number: string;
+  invoice_date: string;
+  delivery_date: string | null;
+  tax_rate: string;
+  total_cost: string;
+  total_revenue: string;
+  total_commission: string;
+  total_hst_on_cost: string;
+  total_hst_on_commission: string;
+  purchases: TaxReportPurchase[];
+}
+
+export interface TaxReportSummary {
+  total_commission: string;
+  total_hst_on_cost: string;
+  total_hst_on_commission: string;
+  total_cost: string;
+  total_revenue: string;
+  invoices: TaxReportInvoice[];
+}
+
 export const reports = {
   vendorSummary: () =>
     request<{
@@ -860,6 +793,14 @@ export const reports = {
     if (to) params.set('to', to);
     const query = params.toString();
     return request<UnreconciledReceiptItem[]>(`/reports/unreconciled-items${query ? `?${query}` : ''}`);
+  },
+  taxReport: (destinationId: string, from?: string, to?: string) => {
+    const params = new URLSearchParams();
+    params.set('destination_id', destinationId);
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    const query = params.toString();
+    return request<TaxReportSummary>(`/reports/tax?${query}`);
   },
 };
 
@@ -1256,6 +1197,7 @@ export interface ReceiptLineItem {
   notes: string | null;
   parent_line_item_id: string | null;
   state: string;
+  line_type: string;
   allocated_qty: number;
   remaining_qty: number;
   created_at: string;

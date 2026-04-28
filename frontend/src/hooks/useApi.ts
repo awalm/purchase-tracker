@@ -406,3 +406,11 @@ export function useUnreconciledItems(from?: string, to?: string) {
     queryFn: () => reports.unreconciledItems(from, to),
   })
 }
+
+export function useTaxReport(destinationId: string | undefined, from?: string, to?: string) {
+  return useQuery({
+    queryKey: ["reports", "tax", destinationId, from, to],
+    queryFn: () => reports.taxReport(destinationId!, from, to),
+    enabled: !!destinationId,
+  })
+}

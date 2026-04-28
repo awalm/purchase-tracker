@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useMemo } from "react"
 import { Link } from "react-router-dom"
 import { useQueryClient } from "@tanstack/react-query"
 import {
@@ -43,7 +43,7 @@ import { ImportDialog } from "@/components/ImportDialog"
 import { ExportCsvButton } from "@/components/ExportCsvButton"
 import { StatusSelect } from "@/components/StatusSelect"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
-import { Plus, Trash2, Pencil, AlertCircle } from "lucide-react"
+import { Plus, Trash2, Pencil, AlertCircle, Search } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
 import { PURCHASE_STATUSES } from "@/lib/constants"
 import { assessPurchaseReconciliation } from "@/lib/purchaseReconciliation"
@@ -84,6 +84,7 @@ export default function PurchasesPage() {
   const queryClient = useQueryClient()
   const [statusFilter, setStatusFilter] = useState<string>("")
   const [destFilter, setDestFilter] = useState<string>("")
+  const [searchQuery, setSearchQuery] = useState("")
   const [isImporting, setIsImporting] = useState(false)
   
   const { data: purchases = [], isLoading } = usePurchases({
@@ -98,6 +99,19 @@ export default function PurchasesPage() {
   const createPurchase = useCreatePurchase()
   const updatePurchase = useUpdatePurchase()
   const deletePurchase = useDeletePurchase()
+
+  const filteredPurchases = useMemo(() => {
+    if (!searchQuery.trim()) return purchases
+    const q = searchQuery.trim().toLowerCase()
+    return purchases.filter((p) =>
+      p.item_name.toLowerCase().includes(q) ||
+      (p.vendor_name && p.vendor_name.toLowerCase().includes(q)) ||
+      (p.invoice_number && p.invoice_number.toLowerCase().includes(q)) ||
+      (p.receipt_number && p.receipt_number.toLowerCase().includes(q)) ||
+      (p.destination_code && p.destination_code.toLowerCase().includes(q)) ||
+      (p.notes && p.notes.toLowerCase().includes(q))
+    )
+  }, [purchases, searchQuery])
 
   const [isOpen, setIsOpen] = useState(false)
   const [editingPurchaseId, setEditingPurchaseId] = useState<string | null>(null)
@@ -465,6 +479,18 @@ export default function PurchasesPage() {
       <Card>
         <CardContent className="pt-6">
           <div className="flex gap-4">
+            <div className="flex-1 min-w-[200px]">
+              <Label className="mb-2 block">Search</Label>
+              <div className="relative">
+                <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                <input
+                  placeholder="Search purchases..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 pl-9 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                />
+              </div>
+            </div>
             <div className="w-48">
               <Label className="mb-2 block">Status</Label>
               <Select value={statusFilter || "all"} onValueChange={(v) => setStatusFilter(v === "all" ? "" : v)}>
@@ -504,7 +530,7 @@ export default function PurchasesPage() {
       <Card>
         <CardHeader>
           <CardTitle>
-            Purchase Economics ({purchases.length} records)
+            Purchase Economics ({filteredPurchases.length !== purchases.length ? `${filteredPurchases.length} / ${purchases.length}` : purchases.length} records)
           </CardTitle>
         </CardHeader>
         <CardContent>
@@ -527,7 +553,7 @@ export default function PurchasesPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {purchases.map((p) => {
+              {filteredPurchases.map((p) => {
                 const reconciliation = assessPurchaseReconciliation({
                   quantity: p.quantity,
                   purchase_cost: p.purchase_cost,

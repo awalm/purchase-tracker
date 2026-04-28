@@ -99,7 +99,7 @@ else
   echo "🔎 Backend OCR endpoint: ${OCR_SERVICE_URL}"
 fi
 
-docker compose $COMPOSE_ARGS up -d
+docker compose $COMPOSE_ARGS up -d --build
 echo "⏳ Waiting for DB..."
 until docker exec bg-tracker-db pg_isready -U bg_tracker -q 2>/dev/null; do sleep 1; done
 echo "✅ DB ready"

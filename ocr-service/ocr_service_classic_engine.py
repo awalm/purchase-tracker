@@ -1,4 +1,3 @@
-import concurrent.futures
 import logging
 import os
 import tempfile
@@ -245,33 +244,12 @@ def _downscale_for_ocr(image: np.ndarray) -> np.ndarray:
     return resized
 
 
-def _build_image_candidates(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
+def _prepare_image(image: np.ndarray) -> np.ndarray:
+    """Crop, downscale, deskew, and convert to grayscale for OCR."""
     base = _auto_crop_document(image)
     base = _downscale_for_ocr(base)
     base = _deskew(base)
-    grayscale = _to_grayscale_bgr(base)
-    enhanced = _enhance_for_ocr(base)
-
-    variants: list[tuple[str, np.ndarray]] = [
-        ("grayscale", grayscale),
-        ("enhanced", enhanced),
-    ]
-
-    if env_bool("OCR_CLASSIC_ROTATION_FALLBACK_ENABLED", True):
-        variants.extend([
-            ("rot90", cv2.rotate(grayscale, cv2.ROTATE_90_CLOCKWISE)),
-            ("rot270", cv2.rotate(grayscale, cv2.ROTATE_90_COUNTERCLOCKWISE)),
-        ])
-
-    deduped: list[tuple[str, np.ndarray]] = []
-    seen_shapes: set[tuple[str, int, int]] = set()
-    for name, img in variants:
-        key = (name, img.shape[0], img.shape[1])
-        if key in seen_shapes:
-            continue
-        seen_shapes.add(key)
-        deduped.append((name, img))
-    return deduped
+    return _to_grayscale_bgr(base)
 
 
 def _score_lines(lines: list[dict[str, Any]]) -> float:
@@ -310,56 +288,11 @@ def _should_skip_rotation_fallback(lines: list[dict[str, Any]]) -> bool:
 _logger = logging.getLogger(__name__)
 
 
-def _run_classic_ocr_with_timeout(
-    ocr: PaddleOCR, image: np.ndarray, variant_name: str, timeout: int,
-) -> list[dict[str, Any]]:
-    """Run classic OCR on a single image variant with a timeout."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_run_classic_ocr, ocr, image)
-        try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            _logger.warning("Classic OCR variant '%s' timed out after %ds", variant_name, timeout)
-            return []
-
-
-def _ocr_best_from_candidates(candidates: list[tuple[str, np.ndarray]]) -> list[dict[str, Any]]:
+def _ocr_image(image: np.ndarray, label: str = "image") -> list[dict[str, Any]]:
+    """Run OCR on a single prepared image."""
     ocr = get_classic_ocr()
-    best_lines: list[dict[str, Any]] = []
-    best_score = -1.0
-    variant_timeout = env_int("OCR_CLASSIC_VARIANT_TIMEOUT_SECONDS", 10, 2)
-
-    candidate_map = {name: image for name, image in candidates}
-
-    primary_name = "grayscale" if "grayscale" in candidate_map else next(iter(candidate_map), None)
-    if primary_name is not None:
-        lines = _run_classic_ocr_with_timeout(ocr, candidate_map[primary_name], primary_name, variant_timeout)
-        score = _score_lines(lines)
-        if score > best_score:
-            best_score = score
-            best_lines = lines
-
-    enhanced_enabled = env_bool("OCR_CLASSIC_ENHANCED_FALLBACK_ENABLED", True)
-    if enhanced_enabled and "enhanced" in candidate_map and not _has_receipt_signals(best_lines):
-        enhanced_lines = _run_classic_ocr_with_timeout(ocr, candidate_map["enhanced"], "enhanced", variant_timeout)
-        enhanced_score = _score_lines(enhanced_lines)
-        if enhanced_score > best_score:
-            best_score = enhanced_score
-            best_lines = enhanced_lines
-
-    if best_lines and _should_skip_rotation_fallback(best_lines):
-        return best_lines
-
-    for name, image in candidates:
-        if not name.startswith("rot"):
-            continue
-        lines = _run_classic_ocr_with_timeout(ocr, image, name, variant_timeout)
-        score = _score_lines(lines)
-        if score > best_score:
-            best_score = score
-            best_lines = lines
-
-    return best_lines
+    _logger.info("Running classic OCR on '%s' (%dx%d)", label, image.shape[1], image.shape[0])
+    return _run_classic_ocr(ocr, image)
 
 
 def _images_from_pdf(path: str | Path) -> list[np.ndarray]:
@@ -384,10 +317,20 @@ def parse_receipt_path_with_score(path: str | Path) -> tuple[dict[str, Any], flo
 
     if path.lower().endswith(".pdf"):
         lines: list[dict[str, Any]] = []
+        max_pages = env_int("OCR_CLASSIC_MAX_PDF_PAGES", 5, 1)
         pages = _images_from_pdf(path)
-        for image in pages:
-            candidates = _build_image_candidates(image)
-            lines.extend(_ocr_best_from_candidates(candidates))
+        for page_idx, image in enumerate(pages[:max_pages]):
+            _logger.info(
+                "Processing PDF page %d/%d (capped at %d)",
+                page_idx + 1, len(pages), max_pages,
+            )
+            prepared = _prepare_image(image)
+            lines.extend(_ocr_image(prepared, label=f"pdf-page-{page_idx + 1}"))
+        if len(pages) > max_pages:
+            _logger.info(
+                "Skipped %d PDF page(s) beyond OCR_CLASSIC_MAX_PDF_PAGES=%d",
+                len(pages) - max_pages, max_pages,
+            )
         if not lines:
             raise ValueError("No text detected in receipt image")
         structured = extract_structured(lines)
@@ -397,8 +340,8 @@ def parse_receipt_path_with_score(path: str | Path) -> tuple[dict[str, Any], flo
     if image is None:
         raise ValueError("Unable to decode image")
 
-    candidates = _build_image_candidates(image)
-    best_lines = _ocr_best_from_candidates(candidates)
+    prepared = _prepare_image(image)
+    best_lines = _ocr_image(prepared, label="single-image")
     if not best_lines:
         raise ValueError("No text detected in receipt image")
 

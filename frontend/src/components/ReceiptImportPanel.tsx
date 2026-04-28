@@ -18,6 +18,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { ItemFormDialog } from "@/components/ItemFormDialog"
+import { VendorFormDialog } from "@/components/VendorFormDialog"
 import { ReceiptImportLineTable } from "@/components/ReceiptImportLineTable"
 import { Plus, Trash2, Loader2 } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
@@ -69,19 +70,23 @@ type ReceiptImportPanelProps = {
   /** Called when importing state changes (true = currently importing, false = done) */
   onImportingChange?: (importing: boolean) => void
   /** Called when the import finishes successfully */
-  onImported?: () => void
+  onImported?: (receiptId: string) => void
   /** Called when the panel's dirty/actionInProgress state changes */
   onActionInProgressChange?: (inProgress: boolean) => void
   /** Expose imperative handle to parent */
   onHandle?: (handle: ReceiptImportPanelHandle) => void
   /** Show a re-parse button instead of the file chooser */
   showReParse?: boolean
+  /** Whether parent is currently parsing this file (bulk import queue) */
+  externalParsing?: boolean
   /** Extra buttons to render in the action bar */
   extraButtons?: React.ReactNode
   /** Whether busy externally (e.g. another draft importing) */
   externalBusy?: boolean
   /** Additional validation: check for batch-level duplicate receipt numbers */
   batchDuplicateCheck?: (receiptNumber: string) => boolean
+  /** Called when the user selects multiple files — parent should redirect to bulk import */
+  onMultipleFilesSelected?: (files: File[]) => void
 }
 
 export function ReceiptImportPanel({
@@ -96,9 +101,11 @@ export function ReceiptImportPanel({
   onActionInProgressChange,
   onHandle,
   showReParse = false,
+  externalParsing = false,
   extraButtons,
   externalBusy = false,
   batchDuplicateCheck,
+  onMultipleFilesSelected,
 }: ReceiptImportPanelProps) {
   const queryClient = useQueryClient()
   const { data: vendors = [] } = useVendors()
@@ -132,6 +139,7 @@ export function ReceiptImportPanel({
   const [importDeletedLineIndexes, setImportDeletedLineIndexes] = useState<Record<number, true>>({})
   const [importManualLines, setImportManualLines] = useState<ManualImportLine[]>([])
   const [importNewItemTarget, setImportNewItemTarget] = useState<ImportNewItemTarget | null>(null)
+  const [showCreateVendor, setShowCreateVendor] = useState(false)
   const [importWarnings, setImportWarnings] = useState<string[]>([])
   const [importFilePreviewUrl, setImportFilePreviewUrl] = useState<string | null>(null)
   const [importParseStage, setImportParseStage] = useState<ReceiptImageParseProgress["stage"] | null>(null)
@@ -233,7 +241,7 @@ export function ReceiptImportPanel({
   const hasActionInProgress =
     importParsing || importCreating || importFile !== null || parsedReceipt !== null || importManualLines.length > 0
 
-  const isBusy = importParsing || importCreating || externalBusy
+  const isBusy = importParsing || importCreating || externalBusy || externalParsing
 
   // ── Notify parent of action-in-progress changes ──
 
@@ -294,10 +302,12 @@ export function ReceiptImportPanel({
     if (!initialFile || initialFile === lastParsedFileRef.current) return
     // If we have a previously parsed receipt for this file, don't re-parse
     if (initialParsedReceipt) return
+    // If parent is handling parsing (bulk queue), don't start our own
+    if (externalParsing) return
     lastParsedFileRef.current = initialFile
     setImportFile(initialFile)
     void parseFile(initialFile)
-  }, [initialFile, initialParsedReceipt])
+  }, [initialFile, initialParsedReceipt, externalParsing])
 
   // ── Populate form from initialParsedReceipt (restore on switch back) ──
 
@@ -347,6 +357,10 @@ export function ReceiptImportPanel({
 
   const addManualImportLine = () => {
     setImportManualLines((prev) => [...prev, createManualImportLine()])
+  }
+
+  const addAdjustmentLine = () => {
+    setImportManualLines((prev) => [...prev, createManualImportLine("adjustment")])
   }
 
   const updateManualImportLine = (id: string, updates: Partial<Omit<ManualImportLine, "id">>) => {
@@ -440,6 +454,10 @@ export function ReceiptImportPanel({
   const handleImportFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = Array.from(e.target.files || [])
     if (selectedFiles.length === 0) return
+    if (selectedFiles.length > 1 && onMultipleFilesSelected) {
+      onMultipleFilesSelected(selectedFiles)
+      return
+    }
     const file = selectedFiles[0]
     await parseFile(file)
   }
@@ -471,7 +489,7 @@ export function ReceiptImportPanel({
     setImportError("")
 
     try {
-      await executeReceiptImport({
+      const result = await executeReceiptImport({
         parsedReceipt,
         overrides: importOverrides,
         manualLines: importManualLines,
@@ -489,7 +507,7 @@ export function ReceiptImportPanel({
         onStatus: setImportStatus,
       })
       queryClient.invalidateQueries({ queryKey: ["receipts"] })
-      onImported?.()
+      onImported?.(result.receiptId)
     } catch (err) {
       setImportError(err instanceof Error ? err.message : "Failed to import receipt")
       queryClient.invalidateQueries({ queryKey: ["receipts"] })
@@ -503,7 +521,7 @@ export function ReceiptImportPanel({
 
   const finishImportDisabledReason = (() => {
     if (importCreating) return "Finishing import..."
-    if (importParsing) return "Still parsing..."
+    if (importParsing || externalParsing) return "Still parsing..."
     if (externalBusy) return "Another import is in progress."
     if (!importFile) return "Select a file first."
     if (!parsedReceipt) return "File has not been parsed yet."
@@ -536,7 +554,7 @@ export function ReceiptImportPanel({
             <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-md px-3 py-2">{importError}</div>
           )}
 
-          {!parsedReceipt && !importError && importParsing && (
+          {!parsedReceipt && !importError && (importParsing || externalParsing) && (
             <div className="rounded-md border bg-muted/20 px-4 py-8">
               <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
                 <Loader2 className="h-5 w-5 animate-spin" />
@@ -558,10 +576,10 @@ export function ReceiptImportPanel({
             </div>
           )}
 
-          {!parsedReceipt && !importError && !importParsing && (
+          {!parsedReceipt && !importError && !importParsing && !externalParsing && (
             <div className="rounded-md border border-dashed bg-muted/10 px-4 py-5 text-sm text-muted-foreground">
               {hideFilePicker
-                ? "Parse this file first, then review all extracted fields and lines before finishing import."
+                ? "Queued — will begin parsing shortly."
                 : "Choose a receipt file on the right to parse and review extracted fields."}
             </div>
           )}
@@ -579,10 +597,14 @@ export function ReceiptImportPanel({
                   <div className="space-y-1 min-w-[260px] flex-1 md:flex-none md:min-w-[320px]">
                     <Label className="text-xs font-medium">Mapped vendor</Label>
                     <div className="flex flex-col gap-2 sm:flex-row">
-                      <Select value={importVendorId} onValueChange={setImportVendorId}>
+                      <Select value={importVendorId} onValueChange={(v) => {
+                        if (v === "__create__") { setShowCreateVendor(true); return }
+                        setImportVendorId(v)
+                      }}>
                         <SelectTrigger className="sm:flex-1"><SelectValue placeholder="Select vendor" /></SelectTrigger>
                         <SelectContent>
                           {vendors.map((v) => (<SelectItem key={v.id} value={v.id}>{v.name}</SelectItem>))}
+                          <SelectItem value="__create__" className="text-primary font-medium">+ Create new vendor</SelectItem>
                         </SelectContent>
                       </Select>
                       <Button type="button" variant="outline" onClick={handleSaveVendorMapping} disabled={!importVendorLabel.trim() || !importVendorId}>
@@ -682,11 +704,16 @@ export function ReceiptImportPanel({
 
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <Label className="text-sm font-medium">Receipt Lines</Label>
-                <Button type="button" variant="outline" size="sm" onClick={addManualImportLine}>
-                  <Plus className="h-4 w-4 mr-2" />Add Line Item
-                </Button>
+                <div className="flex gap-2">
+                  <Button type="button" variant="outline" size="sm" onClick={addAdjustmentLine}>
+                    <Plus className="h-4 w-4 mr-2" />Add Cost Correction
+                  </Button>
+                  <Button type="button" variant="outline" size="sm" onClick={addManualImportLine}>
+                    <Plus className="h-4 w-4 mr-2" />Add Line Item
+                  </Button>
+                </div>
               </div>
-              <p className="text-xs text-muted-foreground -mt-2">Tip: Map fee lines (e.g. env fee) to the same item to merge them into one line on save.</p>
+              <p className="text-xs text-muted-foreground -mt-2">Tip: Map fee lines (e.g. env fee) to the same item — they'll be saved as sub-items and included in the effective unit cost.</p>
 
               <ReceiptImportLineTable
                 parsedReceipt={parsedReceipt}
@@ -720,17 +747,11 @@ export function ReceiptImportPanel({
               />
 
               <div className="text-xs text-muted-foreground space-y-1">
-                <p>
-                  Line-item subtotal: {formatCurrency(lineStats.lineSubtotal.toFixed(2))}
-                  {importSubtotalDifference !== null && (
-                    <>{" "}(difference vs receipt subtotal: {formatCurrency(importSubtotalDifference.toFixed(2))})</>
-                  )}
-                </p>
+                <p>Line-item subtotal: {formatCurrency(lineStats.lineSubtotal.toFixed(2))}</p>
                 <p>Confidence is OCR extraction confidence for parsed line text, not item-map confidence.</p>
                 {importMergePreview.collapsedLineCount > 0 && (
                   <p>
-                    Merge preview: {importMergePreview.mappedLineCount} mapped lines will save as {importMergePreview.mergedLineCount} item lines.
-                    Map fee lines (env/handling) to the same item to roll fee into that item's saved unit cost.
+                    Merge preview: {importMergePreview.mappedLineCount} mapped lines will save as {importMergePreview.mergedLineCount} item lines. Fee lines mapped to the same item will save as sub-items.
                   </p>
                 )}
               </div>
@@ -769,7 +790,7 @@ export function ReceiptImportPanel({
           {!hideFilePicker && (
             <div className="space-y-2">
               <Label htmlFor={importFileInputId}>Receipt file</Label>
-              <input id={importFileInputId} ref={importFileInputRef} type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" className="hidden" onChange={handleImportFileChange} />
+              <input id={importFileInputId} ref={importFileInputRef} type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.webp" className="hidden" onChange={handleImportFileChange} />
               <div className="rounded-md border bg-muted/10 p-3">
                 <div className="flex items-center gap-3 min-w-0">
                   <Button asChild type="button" variant="outline">
@@ -847,6 +868,13 @@ export function ReceiptImportPanel({
           </div>
         </div>
       </div>
+
+      <VendorFormDialog
+        open={showCreateVendor}
+        onOpenChange={setShowCreateVendor}
+        defaults={{ name: importVendorLabel }}
+        onCreated={(newVendorId) => setImportVendorId(newVendorId)}
+      />
 
       <ItemFormDialog
         open={importNewItemTarget !== null}

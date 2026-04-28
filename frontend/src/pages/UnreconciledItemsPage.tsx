@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useMemo } from "react"
 import { Link } from "react-router-dom"
 import { useUnreconciledItems } from "@/hooks/useApi"
 import { formatCurrency, formatDate } from "@/lib/utils"
@@ -14,6 +14,13 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import type { UnreconciledReceiptItem } from "@/api"
 import type { CsvColumn } from "@/lib/csv"
 
@@ -33,14 +40,25 @@ const csvColumns: CsvColumn<UnreconciledReceiptItem>[] = [
 export default function UnreconciledItemsPage() {
   const [fromDate, setFromDate] = useState("")
   const [toDate, setToDate] = useState("")
+  const [vendorFilter, setVendorFilter] = useState("")
 
   const { data: items = [], isLoading, error } = useUnreconciledItems(
     fromDate || undefined,
     toDate || undefined,
   )
 
-  const totalUnreconciledQty = items.reduce((s, r) => s + r.unreconciled_qty, 0)
-  const totalUnreconciledValue = items.reduce(
+  const vendorNames = useMemo(() => {
+    const names = new Set(items.map((i) => i.vendor_name))
+    return [...names].sort()
+  }, [items])
+
+  const filteredItems = useMemo(() => {
+    if (!vendorFilter) return items
+    return items.filter((i) => i.vendor_name === vendorFilter)
+  }, [items, vendorFilter])
+
+  const totalUnreconciledQty = filteredItems.reduce((s, r) => s + r.unreconciled_qty, 0)
+  const totalUnreconciledValue = filteredItems.reduce(
     (s, r) => s + parseFloat(r.unreconciled_value),
     0,
   )
@@ -52,7 +70,7 @@ export default function UnreconciledItemsPage() {
         <ExportCsvButton
           filename="unreconciled-items"
           columns={csvColumns}
-          data={items}
+          data={filteredItems}
           size="sm"
         />
       </div>
@@ -75,6 +93,20 @@ export default function UnreconciledItemsPage() {
             Clear
           </Button>
         )}
+        <div>
+          <label className="text-sm font-medium mb-1 block">Vendor</label>
+          <Select value={vendorFilter || "all"} onValueChange={(v) => setVendorFilter(v === "all" ? "" : v)}>
+            <SelectTrigger className="w-48">
+              <SelectValue placeholder="All vendors" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All vendors</SelectItem>
+              {vendorNames.map((name) => (
+                <SelectItem key={name} value={name}>{name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
       </div>
 
       <div className="grid grid-cols-2 gap-4">
@@ -100,7 +132,7 @@ export default function UnreconciledItemsPage() {
 
       {isLoading ? (
         <p className="text-muted-foreground">Loading…</p>
-      ) : items.length === 0 ? (
+      ) : filteredItems.length === 0 ? (
         <p className="text-muted-foreground">No unreconciled receipt items found.</p>
       ) : (
         <div className="border rounded-lg">
@@ -119,7 +151,7 @@ export default function UnreconciledItemsPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {items.map((item) => (
+              {filteredItems.map((item) => (
                 <TableRow key={item.receipt_line_item_id}>
                   <TableCell>
                     <Link

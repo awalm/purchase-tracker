@@ -118,6 +118,8 @@ export interface Purchase {
   refunds_purchase_id: string | null;
   purchase_type: string;
   bonus_for_purchase_id: string | null;
+  display_parent_purchase_id: string | null;
+  display_group: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -172,6 +174,8 @@ export interface PurchaseEconomics {
   bonus_parent_item_name: string | null;
   bonus_parent_quantity: number | null;
   bonus_parent_invoice_number: string | null;
+  display_parent_purchase_id: string | null;
+  display_group: string | null;
   invoice_reconciliation_state: string | null;
 }
 

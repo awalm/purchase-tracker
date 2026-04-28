@@ -27,6 +27,10 @@ pub fn router() -> Router<AppState> {
                 .delete(delete_receipt),
         )
         .route("/{id}/purchases", get(get_receipt_purchases))
+        .route(
+            "/{id}/purchases/{purchase_id}",
+            axum::routing::delete(unlink_purchase_from_receipt),
+        )
         .route("/{id}/metadata-audit", get(get_receipt_metadata_audit))
         .route(
             "/{id}/line-items",
@@ -102,6 +106,22 @@ async fn get_receipt_purchases(
         .await
         .map_err(map_receipt_reconciliation_error)?;
     Ok(Json(purchases))
+}
+
+async fn unlink_purchase_from_receipt(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path((receipt_id, purchase_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let unlinked = queries::unlink_purchase_from_receipt(&state.pool, purchase_id, receipt_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if unlinked {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "Purchase not linked to this receipt".to_string()))
+    }
 }
 
 async fn get_receipt_metadata_audit(
@@ -224,19 +244,6 @@ async fn create_receipt(
     user: AuthenticatedUser,
     Json(data): Json<CreateReceipt>,
 ) -> Result<(StatusCode, Json<Receipt>), (StatusCode, String)> {
-    let source_vendor_alias = data
-        .source_vendor_alias
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-
-    if let Some(alias) = source_vendor_alias.as_deref() {
-        queries::upsert_vendor_import_alias(&state.pool, alias, data.vendor_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-
     let receipt = queries::create_receipt(&state.pool, data, user.user_id)
         .await
         .map_err(map_receipt_write_error)?;

@@ -8,7 +8,6 @@ import {
   useUpdatePurchase,
   useDeletePurchase,
   useItems,
-  useDestinations,
   useReceipts,
   useVendors,
   useCreateReceipt,
@@ -45,10 +44,11 @@ import { StatusSelect } from "@/components/StatusSelect"
 import { DateInput } from "@/components/ui/date-input"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
 import { ReceiptForm, type ReceiptFormSubmitData } from "@/components/ReceiptForm"
-import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, FileDown, Upload, Loader2, ChevronDown, ChevronRight, Check, X, Scissors, Share2 } from "lucide-react"
+import { BulkReceiptImportDialog } from "@/components/BulkReceiptImportDialog"
+import { ArrowLeft, Plus, Trash2, Pencil, CheckCircle2, AlertCircle, Package, FileDown, Upload, Loader2, ChevronDown, ChevronRight, Check, X, Scissors, Share2, FolderInput } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
 import { assessPurchaseReconciliation } from "@/lib/purchaseReconciliation"
-import { getBonusAttribution, countUnattributedBonuses, buildDisplayRows } from "@/lib/bonusAttribution"
+import { getBonusAttribution, countUnattributedBonuses, buildDisplayRows, type DisplayRow } from "@/lib/bonusAttribution"
 import type { PurchaseEconomics } from "@/types"
 import { getOrLoadReceiptLineItems, invalidateReceiptLineItemsCache } from "@/lib/receiptLineItemsCache"
 import { ApiError, invoices as invoicesApi, receipts as receiptsApi, purchases as purchasesApi, type AutoAllocatePurchaseResult, type PurchaseAllocation, type ReceiptLineItem } from "@/api"
@@ -67,7 +67,6 @@ export default function InvoiceDetailPage() {
   const { data: invoice, isLoading: invoiceLoading } = useInvoice(id || "")
   const { data: purchases = [], isLoading: purchasesLoading } = useInvoicePurchases(id || "")
   const { data: items = [] } = useItems()
-  const { data: destinations = [] } = useDestinations()
   const { data: receipts = [] } = useReceipts()
   const { data: vendors = [] } = useVendors()
   const invoiceLocked = invoice?.reconciliation_state === "locked"
@@ -94,6 +93,19 @@ export default function InvoiceDetailPage() {
   const [editingDeliveryDate, setEditingDeliveryDate] = useState(false)
   const [deliveryDateDraft, setDeliveryDateDraft] = useState("")
 
+  // Edit invoice header dialog
+  const [editHeaderOpen, setEditHeaderOpen] = useState(false)
+  const [headerDraft, setHeaderDraft] = useState({
+    invoice_number: "",
+    order_number: "",
+    invoice_date: "",
+    subtotal: "",
+    tax_rate: "",
+    notes: "",
+  })
+  const [isSavingHeader, setIsSavingHeader] = useState(false)
+  const [headerSaveError, setHeaderSaveError] = useState("")
+
   // Split purchase dialog
   const [splitDialogOpen, setSplitDialogOpen] = useState(false)
   const [splitPurchase, setSplitPurchase] = useState<InvoicePurchase | null>(null)
@@ -109,6 +121,11 @@ export default function InvoiceDetailPage() {
   const [isDistributing, setIsDistributing] = useState(false)
   const [distributeError, setDistributeError] = useState("")
   const [distributeStage, setDistributeStage] = useState<"select" | "distribute">("select")
+
+  // New group dialog
+  const [newGroupDialogOpen, setNewGroupDialogOpen] = useState(false)
+  const [newGroupName, setNewGroupName] = useState("")
+  const [newGroupPurchaseId, setNewGroupPurchaseId] = useState<string | null>(null)
 
   const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -141,6 +158,63 @@ export default function InvoiceDetailPage() {
       setReconciliationActionError(
         err instanceof Error ? err.message : "Failed to update delivery date"
       )
+    }
+  }
+
+  const openEditHeader = () => {
+    if (!invoice) return
+    const taxAmt = parseFloat(invoice.total) - parseFloat(invoice.subtotal)
+    const computedRate = parseFloat(invoice.subtotal) > 0
+      ? (taxAmt / parseFloat(invoice.subtotal) * 100)
+      : parseFloat(invoice.tax_rate)
+    setHeaderDraft({
+      invoice_number: invoice.invoice_number,
+      order_number: invoice.order_number || "",
+      invoice_date: invoice.invoice_date,
+      subtotal: parseFloat(invoice.subtotal).toFixed(2),
+      tax_rate: computedRate.toFixed(2),
+      notes: invoice.notes || "",
+    })
+    setHeaderSaveError("")
+    setEditHeaderOpen(true)
+  }
+
+  const handleSaveHeader = async () => {
+    if (!id || !invoice) return
+    setIsSavingHeader(true)
+    setHeaderSaveError("")
+    try {
+      const payload: Record<string, unknown> = {}
+      if (headerDraft.invoice_number !== invoice.invoice_number)
+        payload.invoice_number = headerDraft.invoice_number
+      if (headerDraft.order_number !== (invoice.order_number || ""))
+        payload.order_number = headerDraft.order_number || null
+      if (headerDraft.invoice_date !== invoice.invoice_date)
+        payload.invoice_date = headerDraft.invoice_date
+      if (headerDraft.subtotal !== parseFloat(invoice.subtotal).toFixed(2))
+        payload.subtotal = headerDraft.subtotal
+      const currentRate = parseFloat(invoice.subtotal) > 0
+        ? ((parseFloat(invoice.total) - parseFloat(invoice.subtotal)) / parseFloat(invoice.subtotal) * 100)
+        : parseFloat(invoice.tax_rate)
+      if (headerDraft.tax_rate !== currentRate.toFixed(2))
+        payload.tax_rate = headerDraft.tax_rate
+      if (headerDraft.notes !== (invoice.notes || ""))
+        payload.notes = headerDraft.notes || null
+
+      if (Object.keys(payload).length === 0) {
+        setEditHeaderOpen(false)
+        return
+      }
+      await invoicesApi.update(id, payload)
+      queryClient.invalidateQueries({ queryKey: ["invoices", id] })
+      queryClient.invalidateQueries({ queryKey: ["invoices"] })
+      setEditHeaderOpen(false)
+    } catch (err) {
+      setHeaderSaveError(
+        err instanceof Error ? err.message : "Failed to update invoice"
+      )
+    } finally {
+      setIsSavingHeader(false)
     }
   }
 
@@ -262,7 +336,6 @@ export default function InvoiceDetailPage() {
   const [itemId, setItemId] = useState("")
   const [quantity, setQuantity] = useState("1")
   const [invoiceUnitPrice, setInvoiceUnitPrice] = useState("")
-  const [destinationId, setDestinationId] = useState("")
   const [notes, setNotes] = useState("")
   const [refundsPurchaseId, setRefundsPurchaseId] = useState("")
   const [purchaseType, setPurchaseType] = useState<"unit" | "bonus" | "refund">("unit")
@@ -294,6 +367,7 @@ export default function InvoiceDetailPage() {
   const [allocationQty, setAllocationQty] = useState("1")
   const [allocationUnitCost, setAllocationUnitCost] = useState("")
   const [showNewReceipt, setShowNewReceipt] = useState(false)
+  const [showReceiptImport, setShowReceiptImport] = useState(false)
   const [linkNotes, setLinkNotes] = useState("")
   const [allowReceiptDateOverride, setAllowReceiptDateOverride] = useState(false)
   const [expandedAllocations, setExpandedAllocations] = useState<Record<string, boolean>>({})
@@ -303,6 +377,7 @@ export default function InvoiceDetailPage() {
   const [autoAllocatingPurchaseId, setAutoAllocatingPurchaseId] = useState<string | null>(null)
   const [isAutoAllocatingAll, setIsAutoAllocatingAll] = useState(false)
   const [autoAllocateLineSummaryByPurchase, setAutoAllocateLineSummaryByPurchase] = useState<Record<string, AutoAllocateLineSummary>>({})
+  const [showUnallocatedOnly, setShowUnallocatedOnly] = useState(false)
   const receiptLineItemsCacheRef = useRef<Record<string, ReceiptLineItem[]>>({})
 
   const buildLegacyAllocations = (purchase: InvoicePurchase): PurchaseAllocation[] => {
@@ -315,7 +390,7 @@ export default function InvoiceDetailPage() {
       receipt_line_item_id: null,
       item_id: purchase.item_id,
       item_name: purchase.item_name,
-      allocated_qty: purchase.quantity,
+      allocated_qty: Math.abs(purchase.quantity),
       unit_cost: purchase.purchase_cost || "0",
       receipt_number: purchase.receipt_number || receipt?.receipt_number || "linked",
       vendor_name: purchase.vendor_name || receipt?.vendor_name || "Unknown vendor",
@@ -330,6 +405,14 @@ export default function InvoiceDetailPage() {
     if (rows.length > 0) return rows
     return buildLegacyAllocations(purchase)
   }
+
+  const getRequiredAllocationQty = (purchase: InvoicePurchase) => Math.abs(purchase.quantity)
+
+  const isRefundPurchase = (purchase: InvoicePurchase) =>
+    purchase.purchase_type === "refund" || purchase.quantity < 0
+
+  const requiredReceiptStateForPurchase = (purchase: InvoicePurchase) =>
+    isRefundPurchase(purchase) ? "returned" : "active"
 
   const getDisplayPurchaseCosts = (purchase: InvoicePurchase) => {
     const allocs = getEffectiveAllocations(purchase)
@@ -466,7 +549,7 @@ export default function InvoiceDetailPage() {
       .reduce((sum, a) => sum + a.allocated_qty, 0)
 
     const purchaseCapacity = linkingPurchase
-      ? Math.max(0, linkingPurchase.quantity - usedByOther)
+      ? Math.max(0, getRequiredAllocationQty(linkingPurchase) - usedByOther)
       : Math.max(0, line.remaining_qty + editingQtyOnLine)
     const receiptCapacity = Math.max(0, line.remaining_qty + editingQtyOnLine)
     const maxAllocatable = Math.max(0, Math.min(receiptCapacity, purchaseCapacity))
@@ -505,7 +588,11 @@ export default function InvoiceDetailPage() {
 
     const rows = await getReceiptLineItemsCached(receiptId)
     const sameItemRows = rows
-      .filter((row) => row.item_id === purchase.item_id)
+      .filter((row) => {
+        if (row.item_id !== purchase.item_id) return false
+        if (isRefundPurchase(purchase)) return row.state === "active" || row.state === "returned"
+        return row.state === "active"
+      })
       .sort((a, b) => b.remaining_qty - a.remaining_qty)
     setAllocationReceiptLineItems(sameItemRows)
 
@@ -550,7 +637,11 @@ export default function InvoiceDetailPage() {
             }
 
             const rows = await getReceiptLineItemsCached(receipt.id)
-            const sameItemRows = rows.filter((row) => row.item_id === purchase.item_id)
+            const sameItemRows = rows.filter((row) => {
+              if (row.item_id !== purchase.item_id) return false
+              if (isRefundPurchase(purchase)) return row.state === "active" || row.state === "returned"
+              return row.state === "active"
+            })
             const hasAllocatableLine = sameItemRows.some(
               (line) => getAllocationCapsForLine(line).maxAllocatable > 0
             )
@@ -725,8 +816,9 @@ export default function InvoiceDetailPage() {
     const usedByOther = allocations
       .filter(a => a.id !== editingAllocationId)
       .reduce((sum, a) => sum + a.allocated_qty, 0)
-    if (usedByOther + qty > linkingPurchase.quantity) {
-      setAllocationError(`Allocated qty exceeds line quantity (${usedByOther + qty}/${linkingPurchase.quantity})`)
+    const requiredQty = getRequiredAllocationQty(linkingPurchase)
+    if (usedByOther + qty > requiredQty) {
+      setAllocationError(`Allocated qty exceeds line quantity (${usedByOther + qty}/${requiredQty})`)
       return
     }
 
@@ -753,7 +845,7 @@ export default function InvoiceDetailPage() {
       clearReceiptLineItemsCache()
       const refreshedAllocations = await reloadAllocations(linkingPurchaseId)
       const allocatedQty = refreshedAllocations.reduce((sum, row) => sum + row.allocated_qty, 0)
-      const remainingQty = Math.max(0, linkingPurchase.quantity - allocatedQty)
+      const remainingQty = Math.max(0, getRequiredAllocationQty(linkingPurchase) - allocatedQty)
 
       if (!editingAllocationId && remainingQty === 0) {
         setLinkDialogOpen(false)
@@ -850,11 +942,11 @@ export default function InvoiceDetailPage() {
   }
 
   const isPurchaseEligibleForAutoAllocation = (purchase: InvoicePurchase) => {
-    if (purchase.purchase_type === "bonus" || purchase.quantity <= 0) {
+    if (purchase.purchase_type === "bonus" || purchase.quantity === 0) {
       return false
     }
 
-    return getAllocatedQtyForPurchase(purchase) < purchase.quantity
+    return getAllocatedQtyForPurchase(purchase) < getRequiredAllocationQty(purchase)
   }
 
   const handleAutoAllocatePurchase = async (
@@ -911,7 +1003,7 @@ export default function InvoiceDetailPage() {
         setAllocations([])
         setAllocatableReceiptIds([])
         resetAllocationForm()
-        setReconciliationActionNotice(`All ${purchase.quantity} units of ${purchase.item_name} fully allocated.`)
+        setReconciliationActionNotice(`All ${getRequiredAllocationQty(purchase)} units of ${purchase.item_name} fully allocated.`)
       } else if (
         linkingPurchaseId === purchase.purchase_id &&
         (result.remaining_qty > 0 || Boolean(result.warning))
@@ -966,13 +1058,33 @@ export default function InvoiceDetailPage() {
     }
 
     if (linkingPurchase) {
-      const remaining = Math.max(1, linkingPurchase.quantity - totalAllocatedQty)
+      const remaining = Math.max(1, getRequiredAllocationQty(linkingPurchase) - totalAllocatedQty)
       setAllocationQty(String(remaining))
     }
 
     queryClient.invalidateQueries({ queryKey: ["invoices"] })
     queryClient.invalidateQueries({ queryKey: ["receipts"] })
     setShowNewReceipt(false)
+  }
+
+  const handleReceiptImported = async (receiptId: string) => {
+    setShowReceiptImport(false)
+    queryClient.invalidateQueries({ queryKey: ["receipts"] })
+    queryClient.invalidateQueries({ queryKey: ["invoices"] })
+
+    setAllocationReceiptId(receiptId)
+    if (linkingPurchaseId) {
+      await reloadAllocations(linkingPurchaseId)
+    }
+    if (linkingPurchase) {
+      try {
+        await loadReceiptLineItemsForAllocation(receiptId, linkingPurchase)
+      } catch {
+        setAllocationWarning("Could not load line items from the imported receipt yet.")
+      }
+      const remaining = Math.max(1, getRequiredAllocationQty(linkingPurchase) - totalAllocatedQty)
+      setAllocationQty(String(remaining))
+    }
   }
 
   const totalAllocatedQty = allocations.reduce((sum, a) => sum + a.allocated_qty, 0)
@@ -1031,7 +1143,6 @@ export default function InvoiceDetailPage() {
         item_id: itemId,
         quantity: parseInt(quantity),
         invoice_unit_price: invoiceUnitPrice || undefined,
-        destination_id: destinationId || undefined,
         invoice_id: id,
         notes: notes || undefined,
         purchase_type: purchaseType,
@@ -1047,7 +1158,6 @@ export default function InvoiceDetailPage() {
         quantity: parseInt(quantity),
         purchase_cost: "0",
         invoice_unit_price: invoiceUnitPrice || undefined,
-        destination_id: destinationId || undefined,
         invoice_id: id,
         notes: notes || undefined,
         purchase_type: purchaseType,
@@ -1066,7 +1176,6 @@ export default function InvoiceDetailPage() {
     setItemId("")
     setQuantity("1")
     setInvoiceUnitPrice("")
-    setDestinationId("")
     setNotes("")
     setRefundsPurchaseId("")
     setPurchaseType("unit")
@@ -1076,15 +1185,6 @@ export default function InvoiceDetailPage() {
 
   const handleItemChange = (selectedId: string) => {
     setItemId(selectedId)
-    const item = items.find((i) => i.id === selectedId)
-    if (item) {
-      // Default to invoice destination if item has no default
-      if (item.default_destination_id) {
-        setDestinationId(item.default_destination_id)
-      } else if (invoice) {
-        setDestinationId(invoice.destination_id)
-      }
-    }
   }
 
   const handleAutoAllocateAllPurchases = async () => {
@@ -1180,9 +1280,6 @@ export default function InvoiceDetailPage() {
     setItemId(matchedItem?.id || "")
     setQuantity(String(p.quantity))
     setInvoiceUnitPrice(p.invoice_unit_price ? Number.parseFloat(p.invoice_unit_price).toFixed(2) : "")
-    // Find destination by code
-    const matchedDest = destinations.find((d) => d.code === p.destination_code)
-    setDestinationId(matchedDest?.id || "")
     setNotes(p.notes || "")
     setRefundsPurchaseId(p.refunds_purchase_id || "")
     setPurchaseType((p.purchase_type as "unit" | "bonus" | "refund") || "unit")
@@ -1208,6 +1305,32 @@ export default function InvoiceDetailPage() {
     setReconciliationActionError("")
     setPurchasePendingDeleteId(purchaseId)
     setDeletePurchaseDialogOpen(true)
+  }
+
+  const handleSetGroup = async (purchaseId: string, groupName: string | null) => {
+    if (groupName === "__new_group__") {
+      setNewGroupPurchaseId(purchaseId)
+      setNewGroupName("")
+      setNewGroupDialogOpen(true)
+      return
+    }
+    await updatePurchase.mutateAsync({
+      id: purchaseId,
+      ...(groupName ? { display_group: groupName } : { clear_display_group: true }),
+    })
+    queryClient.invalidateQueries({ queryKey: ["invoices"] })
+  }
+
+  const handleCreateGroup = async () => {
+    if (!newGroupPurchaseId || !newGroupName.trim()) return
+    await updatePurchase.mutateAsync({
+      id: newGroupPurchaseId,
+      display_group: newGroupName.trim(),
+    })
+    setNewGroupDialogOpen(false)
+    setNewGroupPurchaseId(null)
+    setNewGroupName("")
+    queryClient.invalidateQueries({ queryKey: ["invoices"] })
   }
 
   const handleOpenSplit = (p: InvoicePurchase) => {
@@ -1374,7 +1497,7 @@ export default function InvoiceDetailPage() {
     if (p.purchase_type === "bonus") return true
     const allocs = getEffectiveAllocations(p)
     const allocatedQty = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
-    return Boolean(p.receipt_id) || allocatedQty >= p.quantity
+    return Boolean(p.receipt_id) || allocatedQty >= getRequiredAllocationQty(p)
   }).length
 
   const lineItemAssessments = purchases.map((purchase) => {
@@ -1429,7 +1552,7 @@ export default function InvoiceDetailPage() {
     )
   }
   if (hasReceiptGap) {
-    finalizeBlockReasons.push(`${receiptedCount}/${totalPurchases} line items are receipted.`)
+    finalizeBlockReasons.push(`${receiptedCount}/${totalPurchases} line items have receipts.`)
   }
   if (unreconciledLineItemCount > 0) {
     const unattributedBonuses = countUnattributedBonuses(purchases)
@@ -1444,6 +1567,356 @@ export default function InvoiceDetailPage() {
         `${otherUnreconciled}/${totalPurchases} line items are unreconciled.`
       )
     }
+  }
+
+  const renderPurchaseRow = (row: DisplayRow): React.ReactNode[] => {
+    if (row.kind === "bonus-group") {
+      const { representative: p, totalQty, totalSelling, totalCommission, attributions } = row
+      return [(
+        <TableRow key={`bonus-group-${p.item_id}`} className="bg-blue-50/50">
+          <TableCell className="font-medium pl-8">
+            <div className="flex flex-col gap-0.5 border-l-2 border-blue-200 pl-3">
+              <div className="flex items-center gap-2">
+                <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
+                  {p.item_name}
+                </Link>
+                <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700">BONUS</span>
+              </div>
+              {attributions.map((a, i) => (
+                <span key={i} className="text-[10px] text-muted-foreground">
+                  ↳ {a.parentQty} × {a.parentItemName} (inv #{a.invoiceNumber})
+                </span>
+              ))}
+            </div>
+          </TableCell>
+          <TableCell>
+            <span className="text-xs text-muted-foreground italic">bonus — no allocation</span>
+          </TableCell>
+          <TableCell className="text-right">{totalQty}</TableCell>
+          <TableCell className="text-right text-muted-foreground">{formatCurrency(0)}</TableCell>
+          <TableCell className="text-right">{p.invoice_unit_price ? formatCurrency(p.invoice_unit_price) : "-"}</TableCell>
+          <TableCell className="text-right">{formatCurrency(totalSelling)}</TableCell>
+          <TableCell className="text-right text-muted-foreground">
+            {formatCurrency(totalCommission)}
+          </TableCell>
+          <TableCell>
+            <StatusSelect
+              value={p.status}
+              onValueChange={(value) => handleStatusChange(p.purchase_id, value)}
+              disabled={isFinalized}
+            />
+          </TableCell>
+          <TableCell />
+        </TableRow>
+      )]
+    }
+
+    if (row.kind === "display-group-header") return [] // handled in flatMap
+
+    const p = row.purchase
+    const allocs = getEffectiveAllocations(p)
+    const allocated = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
+    const autoAllocateLineSummary = autoAllocateLineSummaryByPurchase[p.purchase_id]
+    const isPartiallyAllocated = allocated > 0 && allocated < getRequiredAllocationQty(p)
+    const hasUserExpansionState = Object.prototype.hasOwnProperty.call(expandedAllocations, p.purchase_id)
+    const isExpanded = hasUserExpansionState
+      ? !!expandedAllocations[p.purchase_id]
+      : isPartiallyAllocated
+    const displayCosts = getDisplayPurchaseCosts(p)
+
+    return [
+      <Fragment key={p.purchase_id}>
+        <TableRow className={p.purchase_type === "bonus" ? "bg-blue-50/50" : p.purchase_type === "refund" ? "bg-red-50/50" : ""}>
+          <TableCell className="font-medium">
+            <div className="flex flex-col gap-0.5">
+              <div className="flex items-center gap-2">
+                <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
+                  {p.item_name}
+                </Link>
+                {p.purchase_type === "bonus" && (
+                  <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700">BONUS</span>
+                )}
+                {p.purchase_type === "refund" && (
+                  <span className="inline-flex items-center rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-semibold text-red-700">REFUND</span>
+                )}
+              </div>
+              {(() => {
+                const attr = getBonusAttribution(p)
+                return attr.label ? (
+                  <span className="text-[10px] text-muted-foreground">{attr.label}</span>
+                ) : null
+              })()}
+            </div>
+          </TableCell>
+          <TableCell>
+            {p.purchase_type === "bonus" ? (
+              <span className="text-xs text-muted-foreground italic">bonus — no allocation</span>
+            ) : allocs.length > 0 ? (
+              <div className="space-y-1">
+                <div className={`text-xs font-medium ${isPartiallyAllocated ? "text-amber-700" : "text-emerald-700"}`}>
+                  {allocated}/{getRequiredAllocationQty(p)} allocated
+                </div>
+                <div className="text-[11px] text-muted-foreground">{allocs.length} receipt link{allocs.length > 1 ? "s" : ""}</div>
+                <div className="flex items-center gap-3">
+                  {isPartiallyAllocated ? (
+                    <button
+                      onClick={() => toggleAllocationDrilldown(p.purchase_id, isPartiallyAllocated)}
+                      className="text-[11px] text-amber-700 hover:text-amber-800 hover:underline inline-flex items-center gap-1"
+                      title={isExpanded ? "Hide allocation breakdown" : "Show allocation breakdown"}
+                    >
+                      {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                      partially allocated
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => toggleAllocationDrilldown(p.purchase_id)}
+                      className="text-[11px] text-primary hover:underline inline-flex items-center gap-1"
+                      title="Show allocation breakdown"
+                    >
+                      {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                      {isExpanded ? "hide breakdown" : "view breakdown"}
+                    </button>
+                  )}
+                  {isPartiallyAllocated && (
+                    !isFinalized && (
+                    <button
+                      onClick={() => openLinkDialog(p)}
+                      className="text-[11px] text-amber-700 hover:text-amber-800 hover:underline inline-flex items-center gap-1"
+                      title="Link remaining quantity to a receipt"
+                    >
+                      <AlertCircle className="h-3 w-3" />
+                      link receipt
+                    </button>
+                    )
+                  )}
+                  {isPartiallyAllocated && !isFinalized && (
+                    <button
+                      type="button"
+                      onClick={() => void handleAutoAllocatePurchase(p)}
+                      disabled={
+                        allocationApiUnavailable ||
+                        autoAllocatingPurchaseId === p.purchase_id
+                      }
+                      className="text-[11px] text-muted-foreground hover:underline disabled:opacity-50 disabled:no-underline"
+                      title="Automatically allocate remaining from matching receipt line items"
+                    >
+                      {autoAllocatingPurchaseId === p.purchase_id ? (
+                        <span className="inline-flex items-center gap-1">
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          allocating...
+                        </span>
+                      ) : (
+                        "auto allocate"
+                      )}
+                    </button>
+                  )}
+                  {!isFinalized && (
+                    <button
+                      onClick={() => openLinkDialog(p)}
+                      className="text-[11px] text-muted-foreground hover:underline"
+                      title="Manage allocations"
+                    >
+                      manage allocations
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              isFinalized ? (
+                <span className="text-red-500 text-xs flex items-center gap-1">
+                  <AlertCircle className="h-3 w-3" />
+                  unallocated
+                </span>
+              ) : (
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => openLinkDialog(p)}
+                    className="text-red-500 text-xs flex items-center gap-1 hover:underline cursor-pointer"
+                    title="Click to allocate to receipts"
+                  >
+                    <AlertCircle className="h-3 w-3" />
+                    unallocated
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleAutoAllocatePurchase(p)}
+                    disabled={
+                      allocationApiUnavailable ||
+                      autoAllocatingPurchaseId === p.purchase_id
+                    }
+                    className="text-[11px] text-muted-foreground hover:underline disabled:opacity-50 disabled:no-underline"
+                    title="Automatically allocate from matching receipt line items"
+                  >
+                    {autoAllocatingPurchaseId === p.purchase_id ? (
+                      <span className="inline-flex items-center gap-1">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        allocating...
+                      </span>
+                    ) : (
+                      "auto allocate"
+                    )}
+                  </button>
+                </div>
+              )
+            )}
+            {autoAllocateLineSummary && (
+              <div
+                className={`mt-2 inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                  autoAllocateLineSummary.tone === "success"
+                    ? "bg-emerald-50 text-emerald-700"
+                    : autoAllocateLineSummary.tone === "warning"
+                      ? "bg-amber-50 text-amber-700"
+                      : "bg-muted text-muted-foreground"
+                }`}
+                title="Last auto-allocation result"
+              >
+                {autoAllocateLineSummary.message}
+              </div>
+            )}
+          </TableCell>
+          <TableCell className="text-right">{p.quantity}</TableCell>
+          <TableCell className="text-right text-muted-foreground">
+            {formatCurrency(displayCosts.unitCost)}
+            {p.cost_adjustment && Number.parseFloat(p.cost_adjustment) !== 0 && (
+              <span
+                className="ml-1 inline-flex items-center rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-semibold text-amber-700"
+                title={p.adjustment_note || `Cost adjustment: ${p.cost_adjustment}/unit`}
+              >
+                ADJ
+              </span>
+            )}
+          </TableCell>
+          <TableCell className="text-right">{p.invoice_unit_price ? formatCurrency(p.invoice_unit_price) : "-"}</TableCell>
+          <TableCell className="text-right">{p.total_selling ? formatCurrency(p.total_selling) : formatCurrency(p.total_cost)}</TableCell>
+          <TableCell className={`text-right ${p.total_commission ? (parseFloat(p.total_commission) >= 0 ? "text-green-600" : "text-red-600") : "text-muted-foreground"}`}>
+            {p.total_commission ? formatCurrency(p.total_commission) : "—"}
+          </TableCell>
+          <TableCell>
+            <StatusSelect
+              value={p.status}
+              onValueChange={(value) => handleStatusChange(p.purchase_id, value)}
+              disabled={isFinalized}
+            />
+          </TableCell>
+          <TableCell>
+            <div className="flex gap-1">
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={() => getBonusAttribution(p).showDistributeAction
+                  ? handleOpenDistribute(p)
+                  : handleEditPurchase(p)
+                }
+                disabled={isFinalized}
+                title={getBonusAttribution(p).showDistributeAction ? "Distribute bonus" : "Edit"}
+              >
+                {getBonusAttribution(p).showDistributeAction
+                  ? <Share2 className="h-4 w-4 text-blue-600" />
+                  : <Pencil className="h-4 w-4" />
+                }
+              </Button>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={() => handleOpenSplit(p)}
+                disabled={isFinalized}
+                title="Split into multiple items"
+              >
+                <Scissors className="h-4 w-4" />
+              </Button>
+              <Button
+                size="icon"
+                variant="ghost"
+                className="text-red-600"
+                onClick={() => handleDeletePurchase(p.purchase_id)}
+                disabled={isFinalized}
+                title="Delete"
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+              {!isFinalized && (
+                <Select
+                  value=""
+                  onValueChange={(groupName) => void handleSetGroup(p.purchase_id, groupName === "__ungroup__" ? null : groupName)}
+                >
+                  <SelectTrigger className="h-8 w-8 p-0 border-0 shadow-none [&>svg]:hidden" title="Assign to group">
+                    <FolderInput className="h-4 w-4" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {p.display_group && (
+                      <SelectItem value="__ungroup__">Remove from group</SelectItem>
+                    )}
+                    {[...new Set(purchases.map(s => s.display_group).filter((g): g is string => !!g && g !== p.display_group))].map((g) => (
+                      <SelectItem key={g} value={g}>{g}</SelectItem>
+                    ))}
+                    <SelectItem value="__new_group__">+ New group…</SelectItem>
+                  </SelectContent>
+                </Select>
+              )}
+            </div>
+          </TableCell>
+        </TableRow>
+
+        {isExpanded && (
+          <TableRow>
+            <TableCell colSpan={9} className="bg-muted/30 py-3">
+              <div className={`ml-6 border-l-2 pl-4 space-y-2 ${isPartiallyAllocated ? "border-amber-300" : "border-muted-foreground/20"}`}>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                    Receipt Allocation Breakdown
+                  </div>
+                  {!isFinalized && isPartiallyAllocated && (
+                    <button
+                      onClick={() => openLinkDialog(p)}
+                      className="text-[11px] text-amber-700 hover:text-amber-800 hover:underline inline-flex items-center gap-1"
+                      title="Link remaining quantity to a receipt"
+                    >
+                      <AlertCircle className="h-3 w-3" />
+                      link receipt
+                    </button>
+                  )}
+                </div>
+
+                <div className={`border rounded-md bg-background overflow-hidden ${isPartiallyAllocated ? "border-amber-200" : ""}`}>
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Receipt</TableHead>
+                        <TableHead>Vendor</TableHead>
+                        <TableHead>Date</TableHead>
+                        <TableHead className="text-right">Qty</TableHead>
+                        <TableHead className="text-right">Unit Cost</TableHead>
+                        <TableHead className="text-right">Allocated Total</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {allocs.map((a) => (
+                        <TableRow key={a.id}>
+                          <TableCell>
+                            <Link to={`/receipts/${a.receipt_id}`} className="text-primary hover:underline font-mono text-xs">
+                              {a.receipt_number}
+                            </Link>
+                          </TableCell>
+                          <TableCell>{a.vendor_name}</TableCell>
+                          <TableCell>{formatDate(a.receipt_date)}</TableCell>
+                          <TableCell className="text-right">{a.allocated_qty}</TableCell>
+                          <TableCell className="text-right">{formatCurrency(a.unit_cost)}</TableCell>
+                          <TableCell className="text-right">{formatCurrency(Number(a.unit_cost) * a.allocated_qty)}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+
+                <div className={`text-xs ${isPartiallyAllocated ? "text-amber-700" : "text-muted-foreground"}`}>
+                  Total allocated on this line: {allocated}/{getRequiredAllocationQty(p)} units
+                </div>
+              </div>
+            </TableCell>
+          </TableRow>
+        )}
+      </Fragment>,
+    ]
   }
 
   return (
@@ -1497,6 +1970,32 @@ export default function InvoiceDetailPage() {
                 "Confirm Finalize"
               )}
             </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* New Group Dialog */}
+      <Dialog open={newGroupDialogOpen} onOpenChange={setNewGroupDialogOpen}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Create New Group</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 pt-2">
+            <Input
+              placeholder="Group name"
+              value={newGroupName}
+              onChange={(e) => setNewGroupName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && newGroupName.trim()) {
+                  void handleCreateGroup()
+                }
+              }}
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setNewGroupDialogOpen(false)}>Cancel</Button>
+              <Button onClick={() => void handleCreateGroup()} disabled={!newGroupName.trim()}>Create</Button>
+            </div>
           </div>
         </DialogContent>
       </Dialog>
@@ -1900,13 +2399,100 @@ export default function InvoiceDetailPage() {
         </DialogContent>
       </Dialog>
 
+      {/* Edit Invoice Header Dialog */}
+      <Dialog open={editHeaderOpen} onOpenChange={setEditHeaderOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Edit Invoice Details</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="hdr-invoice-number">Invoice Number</Label>
+              <Input
+                id="hdr-invoice-number"
+                value={headerDraft.invoice_number}
+                onChange={(e) => setHeaderDraft((d) => ({ ...d, invoice_number: e.target.value }))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="hdr-order-number">Order Number</Label>
+              <Input
+                id="hdr-order-number"
+                value={headerDraft.order_number}
+                onChange={(e) => setHeaderDraft((d) => ({ ...d, order_number: e.target.value }))}
+                placeholder="Optional"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="hdr-invoice-date">Invoice Date</Label>
+              <DateInput
+                value={headerDraft.invoice_date}
+                onChange={(v) => setHeaderDraft((d) => ({ ...d, invoice_date: v }))}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="hdr-subtotal">Subtotal (pre-tax)</Label>
+                <Input
+                  id="hdr-subtotal"
+                  type="number"
+                  step="0.01"
+                  value={headerDraft.subtotal}
+                  onChange={(e) => setHeaderDraft((d) => ({ ...d, subtotal: e.target.value }))}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="hdr-tax-rate">Tax Rate (%)</Label>
+                <Input
+                  id="hdr-tax-rate"
+                  type="number"
+                  step="0.01"
+                  value={headerDraft.tax_rate}
+                  onChange={(e) => setHeaderDraft((d) => ({ ...d, tax_rate: e.target.value }))}
+                />
+              </div>
+            </div>
+            {headerDraft.subtotal && headerDraft.tax_rate && (
+              <p className="text-xs text-muted-foreground">
+                Total = {formatCurrency(parseFloat(headerDraft.subtotal) + parseFloat(headerDraft.subtotal) * parseFloat(headerDraft.tax_rate) / 100)}
+              </p>
+            )}
+            <div className="space-y-2">
+              <Label htmlFor="hdr-notes">Notes</Label>
+              <Input
+                id="hdr-notes"
+                value={headerDraft.notes}
+                onChange={(e) => setHeaderDraft((d) => ({ ...d, notes: e.target.value }))}
+                placeholder="Optional"
+              />
+            </div>
+            {headerSaveError && (
+              <div className="text-sm text-red-600">{headerSaveError}</div>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setEditHeaderOpen(false)}>Cancel</Button>
+              <Button onClick={handleSaveHeader} disabled={isSavingHeader}>
+                {isSavingHeader ? "Saving..." : "Save Changes"}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Header */}
       <div className="flex items-center gap-4">
         <Button variant="ghost" size="icon" onClick={() => navigate("/invoices")}>
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div className="flex-1">
-          <h1 className="text-2xl font-bold">Invoice {invoice.invoice_number}</h1>
+          <div className="flex items-center gap-2">
+            <h1 className="text-2xl font-bold">Invoice {invoice.invoice_number}</h1>
+            {!isFinalized && (
+              <Button variant="ghost" size="icon" className="h-7 w-7" onClick={openEditHeader}>
+                <Pencil className="h-3.5 w-3.5" />
+              </Button>
+            )}
+          </div>
           <p className="text-muted-foreground">
             {invoice.destination_code} - {invoice.destination_name} · {formatDate(invoice.invoice_date)}
             {invoice.order_number && ` · Order: ${invoice.order_number}`}
@@ -2116,7 +2702,7 @@ export default function InvoiceDetailPage() {
           {!isFinalized && hasReceiptGap && (
             <span className="flex items-center gap-1 text-amber-600 bg-amber-50 px-3 py-1.5 rounded-full text-sm font-medium">
               <AlertCircle className="h-4 w-4" />
-              {receiptedCount}/{totalPurchases} receipted
+              {receiptedCount}/{totalPurchases} have receipts
             </span>
           )}
           {!isFinalized && unreconciledLineItemCount > 0 && (
@@ -2220,6 +2806,15 @@ export default function InvoiceDetailPage() {
               <CardDescription>
                 {totalQuantity} units across {purchases.length} purchase{purchases.length !== 1 ? "s" : ""}
               </CardDescription>
+              <label className="flex items-center gap-2 text-sm font-normal mt-1">
+                <input
+                  type="checkbox"
+                  checked={showUnallocatedOnly}
+                  onChange={(e) => setShowUnallocatedOnly(e.target.checked)}
+                  className="h-4 w-4 rounded border-gray-300"
+                />
+                Unreconciled only
+              </label>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Button
@@ -2251,7 +2846,6 @@ export default function InvoiceDetailPage() {
                 <DialogTrigger asChild>
                   <Button onClick={() => {
                     resetForm()
-                    if (invoice) setDestinationId(invoice.destination_id)
                   }} disabled={isFinalized}>
                     <Plus className="h-4 w-4 mr-2" />
                     Add Line Item
@@ -2321,21 +2915,6 @@ export default function InvoiceDetailPage() {
                   </div>
                   <div className="text-xs text-muted-foreground bg-muted p-3 rounded-md">
                     Stage 1 (invoice line): quantity and invoice price only. Purchase cost is assigned during receipt allocation (Stage 2).
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="destination">Destination</Label>
-                    <Select value={destinationId} onValueChange={setDestinationId}>
-                      <SelectTrigger>
-                        <SelectValue placeholder="Select destination" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {destinations.map((d) => (
-                          <SelectItem key={d.id} value={d.id}>
-                            {d.code} - {d.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="notes">Notes</Label>
@@ -2451,333 +3030,33 @@ export default function InvoiceDetailPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {buildDisplayRows(purchases as PurchaseEconomics[]).map((row) => {
-                  if (row.kind === "bonus-group") {
-                    const { representative: p, totalQty, totalSelling, totalCommission, attributions } = row
-                    return (
-                      <TableRow key={`bonus-group-${p.item_id}`} className="bg-blue-50/50">
-                        <TableCell className="font-medium">
-                          <div className="flex flex-col gap-0.5">
-                            <div className="flex items-center gap-2">
-                              <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
-                                {p.item_name}
-                              </Link>
-                              <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700">BONUS</span>
-                            </div>
-                            {attributions.map((a, i) => (
-                              <span key={i} className="text-[10px] text-muted-foreground">
-                                ↳ {a.parentQty} × {a.parentItemName} (inv #{a.invoiceNumber})
-                              </span>
-                            ))}
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          <span className="text-xs text-muted-foreground italic">bonus — no allocation</span>
-                        </TableCell>
-                        <TableCell className="text-right">{totalQty}</TableCell>
-                        <TableCell className="text-right text-muted-foreground">{formatCurrency(0)}</TableCell>
-                        <TableCell className="text-right">{p.invoice_unit_price ? formatCurrency(p.invoice_unit_price) : "-"}</TableCell>
-                        <TableCell className="text-right">{formatCurrency(totalSelling)}</TableCell>
-                        <TableCell className="text-right text-muted-foreground">
-                          {formatCurrency(totalCommission)}
-                        </TableCell>
-                        <TableCell>
-                          <StatusSelect
-                            value={p.status}
-                            onValueChange={(value) => handleStatusChange(p.purchase_id, value)}
-                            disabled={isFinalized}
-                          />
-                        </TableCell>
-                        <TableCell />
-                      </TableRow>
-                    )
-                  }
-
-                  const p = row.purchase
-                  const allocs = getEffectiveAllocations(p)
-                  const allocated = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
-                  const autoAllocateLineSummary = autoAllocateLineSummaryByPurchase[p.purchase_id]
-                  const isPartiallyAllocated = allocated > 0 && allocated < p.quantity
-                  const hasUserExpansionState = Object.prototype.hasOwnProperty.call(expandedAllocations, p.purchase_id)
-                  const isExpanded = hasUserExpansionState
-                    ? !!expandedAllocations[p.purchase_id]
-                    : isPartiallyAllocated
-                  const displayCosts = getDisplayPurchaseCosts(p)
-
-                  return (
-                    <Fragment key={p.purchase_id}>
-                      <TableRow className={p.purchase_type === "bonus" ? "bg-blue-50/50" : p.purchase_type === "refund" ? "bg-red-50/50" : ""}>
-                        <TableCell className="font-medium">
-                          <div className="flex flex-col gap-0.5">
-                            <div className="flex items-center gap-2">
-                              <Link to={`/items/${p.item_id}`} className="hover:underline text-primary">
-                                {p.item_name}
-                              </Link>
-                              {p.purchase_type === "bonus" && (
-                                <span className="inline-flex items-center rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700">BONUS</span>
-                              )}
-                              {p.purchase_type === "refund" && (
-                                <span className="inline-flex items-center rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-semibold text-red-700">REFUND</span>
-                              )}
-                            </div>
-                            {(() => {
-                              const attr = getBonusAttribution(p)
-                              return attr.label ? (
-                                <span className="text-[10px] text-muted-foreground">{attr.label}</span>
-                              ) : null
-                            })()}
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          {p.purchase_type === "bonus" ? (
-                            <span className="text-xs text-muted-foreground italic">bonus — no allocation</span>
-                          ) : allocs.length > 0 ? (
-                            <div className="space-y-1">
-                              <div className={`text-xs font-medium ${isPartiallyAllocated ? "text-amber-700" : "text-emerald-700"}`}>
-                                {allocated}/{p.quantity} allocated
-                              </div>
-                              <div className="text-[11px] text-muted-foreground">{allocs.length} receipt link{allocs.length > 1 ? "s" : ""}</div>
-                              <div className="flex items-center gap-3">
-                                {isPartiallyAllocated ? (
-                                  <button
-                                    onClick={() => toggleAllocationDrilldown(p.purchase_id, isPartiallyAllocated)}
-                                    className="text-[11px] text-amber-700 hover:text-amber-800 hover:underline inline-flex items-center gap-1"
-                                    title={isExpanded ? "Hide allocation breakdown" : "Show allocation breakdown"}
-                                  >
-                                    {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-                                    partially allocated
-                                  </button>
-                                ) : (
-                                  <button
-                                    onClick={() => toggleAllocationDrilldown(p.purchase_id)}
-                                    className="text-[11px] text-primary hover:underline inline-flex items-center gap-1"
-                                    title="Show allocation breakdown"
-                                  >
-                                    {isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-                                    {isExpanded ? "hide breakdown" : "view breakdown"}
-                                  </button>
-                                )}
-                                {isPartiallyAllocated && (
-                                  !isFinalized && (
-                                  <button
-                                    onClick={() => openLinkDialog(p)}
-                                    className="text-[11px] text-amber-700 hover:text-amber-800 hover:underline inline-flex items-center gap-1"
-                                    title="Link remaining quantity to a receipt"
-                                  >
-                                    <AlertCircle className="h-3 w-3" />
-                                    link receipt
-                                  </button>
-                                  )
-                                )}
-                                {isPartiallyAllocated && !isFinalized && (
-                                  <button
-                                    type="button"
-                                    onClick={() => void handleAutoAllocatePurchase(p)}
-                                    disabled={
-                                      allocationApiUnavailable ||
-                                      autoAllocatingPurchaseId === p.purchase_id
-                                    }
-                                    className="text-[11px] text-muted-foreground hover:underline disabled:opacity-50 disabled:no-underline"
-                                    title="Automatically allocate remaining from matching receipt line items"
-                                  >
-                                    {autoAllocatingPurchaseId === p.purchase_id ? (
-                                      <span className="inline-flex items-center gap-1">
-                                        <Loader2 className="h-3 w-3 animate-spin" />
-                                        allocating...
-                                      </span>
-                                    ) : (
-                                      "auto allocate"
-                                    )}
-                                  </button>
-                                )}
-                                {!isFinalized && (
-                                  <button
-                                    onClick={() => openLinkDialog(p)}
-                                    className="text-[11px] text-muted-foreground hover:underline"
-                                    title="Manage allocations"
-                                  >
-                                    manage allocations
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          ) : (
-                            isFinalized ? (
-                              <span className="text-red-500 text-xs flex items-center gap-1">
-                                <AlertCircle className="h-3 w-3" />
-                                unallocated
-                              </span>
-                            ) : (
-                              <div className="flex items-center gap-3">
-                                <button
-                                  onClick={() => openLinkDialog(p)}
-                                  className="text-red-500 text-xs flex items-center gap-1 hover:underline cursor-pointer"
-                                  title="Click to allocate to receipts"
-                                >
-                                  <AlertCircle className="h-3 w-3" />
-                                  unallocated
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => void handleAutoAllocatePurchase(p)}
-                                  disabled={
-                                    allocationApiUnavailable ||
-                                    autoAllocatingPurchaseId === p.purchase_id
-                                  }
-                                  className="text-[11px] text-muted-foreground hover:underline disabled:opacity-50 disabled:no-underline"
-                                  title="Automatically allocate from matching receipt line items"
-                                >
-                                  {autoAllocatingPurchaseId === p.purchase_id ? (
-                                    <span className="inline-flex items-center gap-1">
-                                      <Loader2 className="h-3 w-3 animate-spin" />
-                                      allocating...
-                                    </span>
-                                  ) : (
-                                    "auto allocate"
-                                  )}
-                                </button>
-                              </div>
-                            )
-                          )}
-                          {autoAllocateLineSummary && (
-                            <div
-                              className={`mt-2 inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                                autoAllocateLineSummary.tone === "success"
-                                  ? "bg-emerald-50 text-emerald-700"
-                                  : autoAllocateLineSummary.tone === "warning"
-                                    ? "bg-amber-50 text-amber-700"
-                                    : "bg-muted text-muted-foreground"
-                              }`}
-                              title="Last auto-allocation result"
-                            >
-                              {autoAllocateLineSummary.message}
-                            </div>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-right">{p.quantity}</TableCell>
-                        <TableCell className="text-right text-muted-foreground">
-                          {formatCurrency(displayCosts.unitCost)}
-                          {p.cost_adjustment && Number.parseFloat(p.cost_adjustment) !== 0 && (
-                            <span
-                              className="ml-1 inline-flex items-center rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-semibold text-amber-700"
-                              title={p.adjustment_note || `Cost adjustment: ${p.cost_adjustment}/unit`}
-                            >
-                              ADJ
-                            </span>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-right">{p.invoice_unit_price ? formatCurrency(p.invoice_unit_price) : "-"}</TableCell>
-                        <TableCell className="text-right">{p.total_selling ? formatCurrency(p.total_selling) : formatCurrency(p.total_cost)}</TableCell>
-                        <TableCell className={`text-right ${p.total_commission ? (parseFloat(p.total_commission) >= 0 ? "text-green-600" : "text-red-600") : "text-muted-foreground"}`}>
-                          {p.total_commission ? formatCurrency(p.total_commission) : "—"}
-                        </TableCell>
-                        <TableCell>
-                          <StatusSelect
-                            value={p.status}
-                            onValueChange={(value) => handleStatusChange(p.purchase_id, value)}
-                            disabled={isFinalized}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <div className="flex gap-1">
-                            <Button
-                              size="icon"
-                              variant="ghost"
-                              onClick={() => getBonusAttribution(p).showDistributeAction
-                                ? handleOpenDistribute(p)
-                                : handleEditPurchase(p)
-                              }
-                              disabled={isFinalized}
-                              title={getBonusAttribution(p).showDistributeAction ? "Distribute bonus" : "Edit"}
-                            >
-                              {getBonusAttribution(p).showDistributeAction
-                                ? <Share2 className="h-4 w-4 text-blue-600" />
-                                : <Pencil className="h-4 w-4" />
-                              }
-                            </Button>
-                            <Button
-                              size="icon"
-                              variant="ghost"
-                              onClick={() => handleOpenSplit(p)}
-                              disabled={isFinalized}
-                              title="Split into multiple items"
-                            >
-                              <Scissors className="h-4 w-4" />
-                            </Button>
-                            <Button
-                              size="icon"
-                              variant="ghost"
-                              className="text-red-600"
-                              onClick={() => handleDeletePurchase(p.purchase_id)}
-                              disabled={isFinalized}
-                              title="Delete"
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          </div>
-                        </TableCell>
-                      </TableRow>
-
-                      {isExpanded && (
-                        <TableRow>
-                          <TableCell colSpan={9} className="bg-muted/30 py-3">
-                            <div className={`ml-6 border-l-2 pl-4 space-y-2 ${isPartiallyAllocated ? "border-amber-300" : "border-muted-foreground/20"}`}>
-                              <div className="flex items-center justify-between gap-3">
-                                <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-                                  Receipt Allocation Breakdown
-                                </div>
-                                {!isFinalized && isPartiallyAllocated && (
-                                  <button
-                                    onClick={() => openLinkDialog(p)}
-                                    className="text-[11px] text-amber-700 hover:text-amber-800 hover:underline inline-flex items-center gap-1"
-                                    title="Link remaining quantity to a receipt"
-                                  >
-                                    <AlertCircle className="h-3 w-3" />
-                                    link receipt
-                                  </button>
-                                )}
-                              </div>
-
-                              <div className={`border rounded-md bg-background overflow-hidden ${isPartiallyAllocated ? "border-amber-200" : ""}`}>
-                                <Table>
-                                  <TableHeader>
-                                    <TableRow>
-                                      <TableHead>Receipt</TableHead>
-                                      <TableHead>Vendor</TableHead>
-                                      <TableHead>Date</TableHead>
-                                      <TableHead className="text-right">Qty</TableHead>
-                                      <TableHead className="text-right">Unit Cost</TableHead>
-                                      <TableHead className="text-right">Allocated Total</TableHead>
-                                    </TableRow>
-                                  </TableHeader>
-                                  <TableBody>
-                                    {allocs.map((a) => (
-                                      <TableRow key={a.id}>
-                                        <TableCell>
-                                          <Link to={`/receipts/${a.receipt_id}`} className="text-primary hover:underline font-mono text-xs">
-                                            {a.receipt_number}
-                                          </Link>
-                                        </TableCell>
-                                        <TableCell>{a.vendor_name}</TableCell>
-                                        <TableCell>{formatDate(a.receipt_date)}</TableCell>
-                                        <TableCell className="text-right">{a.allocated_qty}</TableCell>
-                                        <TableCell className="text-right">{formatCurrency(a.unit_cost)}</TableCell>
-                                        <TableCell className="text-right">{formatCurrency(Number(a.unit_cost) * a.allocated_qty)}</TableCell>
-                                      </TableRow>
-                                    ))}
-                                  </TableBody>
-                                </Table>
-                              </div>
-
-                              <div className={`text-xs ${isPartiallyAllocated ? "text-amber-700" : "text-muted-foreground"}`}>
-                                Total allocated on this line: {allocated}/{p.quantity} units
-                              </div>
-                            </div>
-                          </TableCell>
-                        </TableRow>
-                      )}
-                    </Fragment>
+                {buildDisplayRows((() => {
+                  const sorted = [...purchases].sort((a, b) =>
+                    a.item_name.localeCompare(b.item_name, undefined, { numeric: true, sensitivity: "base" })
                   )
+                  if (!showUnallocatedOnly) return sorted as PurchaseEconomics[]
+                  return sorted.filter(p => {
+                    if (p.purchase_type === "bonus") return false
+                    const allocs = getEffectiveAllocations(p)
+                    const allocatedQty = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
+                    return allocatedQty < getRequiredAllocationQty(p)
+                  }) as PurchaseEconomics[]
+                })()).flatMap((row) => {
+                  if (row.kind === "display-group-header") {
+                    return [
+                      <TableRow key={`group-header-${row.groupName}`} className="bg-muted/40 border-t-2 border-muted-foreground/20">
+                        <TableCell colSpan={9} className="py-2">
+                          <div className="flex items-center gap-2">
+                            <FolderInput className="h-4 w-4 text-muted-foreground" />
+                            <span className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">{row.groupName}</span>
+                            <span className="text-xs text-muted-foreground">({row.rows.length} item{row.rows.length !== 1 ? "s" : ""})</span>
+                          </div>
+                        </TableCell>
+                      </TableRow>,
+                      ...row.rows.flatMap((innerRow) => renderPurchaseRow(innerRow)),
+                    ]
+                  }
+                  return renderPurchaseRow(row)
                 })}
                 {purchases.length === 0 && (
                   <EmptyTableRow colSpan={9}>
@@ -2788,6 +3067,19 @@ export default function InvoiceDetailPage() {
                     </div>
                   </EmptyTableRow>
                 )}
+                {purchases.length > 0 && showUnallocatedOnly && (() => {
+                  const filtered = purchases.filter(p => {
+                    if (p.purchase_type === "bonus") return false
+                    const allocs = getEffectiveAllocations(p)
+                    const allocatedQty = allocs.reduce((sum, a) => sum + a.allocated_qty, 0)
+                    return !p.receipt_id && allocatedQty < getRequiredAllocationQty(p)
+                  })
+                  return filtered.length === 0 ? (
+                    <EmptyTableRow colSpan={9}>
+                      All line items are fully allocated!
+                    </EmptyTableRow>
+                  ) : null
+                })()}
               </TableBody>
             </Table>
           )}
@@ -2798,6 +3090,13 @@ export default function InvoiceDetailPage() {
               </div>
             )}
       </Card>
+
+      {/* Receipt Import Dialog (opened from allocation dialog) */}
+      <BulkReceiptImportDialog
+        open={showReceiptImport}
+        onOpenChange={setShowReceiptImport}
+        onReceiptImported={handleReceiptImported}
+      />
 
       {/* Focused Receipt Link Dialog */}
       <Dialog open={linkDialogOpen} onOpenChange={(open) => {
@@ -2828,8 +3127,7 @@ export default function InvoiceDetailPage() {
               onCancel={() => setLinkDialogOpen(false)}
               onBack={() => setShowNewReceipt(false)}
               onImport={() => {
-                setLinkDialogOpen(false)
-                navigate("/receipts?import=1")
+                setShowReceiptImport(true)
               }}
               importButtonLabel="Import Receipt"
             />
@@ -2840,7 +3138,7 @@ export default function InvoiceDetailPage() {
                   <strong className="block break-words">{linkingPurchase?.item_name || "Item"}</strong>
                 </div>
                 <div className="text-muted-foreground">
-                  Available quantity to allocate: {linkingPurchase?.quantity ?? 0}
+                  Available quantity to allocate: {linkingPurchase ? getRequiredAllocationQty(linkingPurchase) : 0}
                 </div>
                 <div className="text-muted-foreground">
                   Already allocated: {totalAllocatedQty}
@@ -2985,8 +3283,7 @@ export default function InvoiceDetailPage() {
                     variant="outline"
                     disabled={isFinalized}
                     onClick={() => {
-                      setLinkDialogOpen(false)
-                      navigate("/receipts?import=1")
+                      setShowReceiptImport(true)
                     }}
                   >
                     <Upload className="h-4 w-4 mr-2" />

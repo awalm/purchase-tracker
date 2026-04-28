@@ -774,3 +774,118 @@ LEFT JOIN receipts r ON r.id = p.receipt_id
 LEFT JOIN vendors v ON v.id = r.vendor_id
 LEFT JOIN destinations d ON d.id = p.destination_id
 LEFT JOIN invoices inv ON inv.id = p.invoice_id;
+
+-- ============================================
+-- RECEIPT LINE ITEM ADJUSTMENTS (cost correction lines)
+-- ============================================
+-- Allows adding discount/promo lines on receipts that flow into
+-- purchase cost_adjustment. Mirrors how invoice bonuses work.
+
+-- Add line_type column: 'item' (default) | 'adjustment'
+ALTER TABLE receipt_line_items
+  ADD COLUMN IF NOT EXISTS line_type VARCHAR(20) NOT NULL DEFAULT 'item';
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'chk_receipt_line_items_line_type'
+  ) THEN
+    ALTER TABLE receipt_line_items ADD CONSTRAINT chk_receipt_line_items_line_type
+      CHECK (line_type IN ('item', 'adjustment'));
+  END IF;
+END $$;
+
+-- Relax the unique constraint: only enforce for root lines (no parent).
+-- Child lines (fees, adjustments) can reference the same item.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'receipt_line_items_receipt_id_item_id_key'
+  ) THEN
+    ALTER TABLE receipt_line_items DROP CONSTRAINT receipt_line_items_receipt_id_item_id_key;
+  END IF;
+END $$;
+
+-- Recreate unique index with state so active + returned lines for the same item can coexist
+DROP INDEX IF EXISTS receipt_line_items_receipt_item_root_unique;
+CREATE UNIQUE INDEX receipt_line_items_receipt_item_root_unique
+  ON receipt_line_items(receipt_id, item_id, state)
+  WHERE parent_line_item_id IS NULL AND line_type = 'item';
+
+-- Fix child receipt lines that were created before line_type feature
+UPDATE receipt_line_items
+SET line_type = 'adjustment'
+WHERE parent_line_item_id IS NOT NULL
+  AND line_type = 'item';
+
+-- Prevent allocations to adjustment/child receipt line items at DB level
+CREATE OR REPLACE FUNCTION trg_check_allocation_line_type()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.receipt_line_item_id IS NOT NULL THEN
+    IF EXISTS (
+      SELECT 1 FROM receipt_line_items
+      WHERE id = NEW.receipt_line_item_id
+        AND (line_type <> 'item' OR parent_line_item_id IS NOT NULL)
+    ) THEN
+      RAISE EXCEPTION 'Cannot allocate to adjustment or child receipt line items';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS check_allocation_line_type ON purchase_allocations;
+CREATE TRIGGER check_allocation_line_type
+  BEFORE INSERT OR UPDATE ON purchase_allocations
+  FOR EACH ROW
+  EXECUTE FUNCTION trg_check_allocation_line_type();
+
+-- ============================================
+-- SINGLE SOURCE OF TRUTH: allocation effective costs
+-- Accounts for adjustment children on receipt line items.
+-- ALL economics queries must use this view instead of raw purchase_allocations math.
+-- ============================================
+CREATE OR REPLACE VIEW v_allocation_costs AS
+SELECT
+    pa.id AS allocation_id,
+    pa.purchase_id,
+    pa.receipt_id,
+    pa.receipt_line_item_id,
+    pa.allocated_qty,
+    pa.unit_cost AS raw_unit_cost,
+    pa.unit_cost + COALESCE(adj.per_unit_adjustment, 0) AS effective_unit_cost,
+    pa.allocated_qty * (pa.unit_cost + COALESCE(adj.per_unit_adjustment, 0)) AS effective_allocated_cost,
+    pa.created_at,
+    pa.updated_at
+FROM purchase_allocations pa
+LEFT JOIN LATERAL (
+    SELECT
+        CASE WHEN rli.quantity > 0
+             THEN SUM(child.unit_cost * child.quantity) / rli.quantity
+             ELSE 0
+        END AS per_unit_adjustment
+    FROM receipt_line_items child
+    JOIN receipt_line_items rli ON rli.id = child.parent_line_item_id
+    WHERE child.parent_line_item_id = pa.receipt_line_item_id
+      AND child.line_type = 'adjustment'
+    GROUP BY rli.quantity
+) adj ON TRUE;
+
+-- ============================================
+-- MANUAL PURCHASE GROUPING (display_parent_purchase_id)
+-- ============================================
+-- Allows manually nesting any purchase under another for organizational display.
+-- Purely visual grouping — does not affect economics.
+
+ALTER TABLE purchases
+  ADD COLUMN IF NOT EXISTS display_parent_purchase_id UUID REFERENCES purchases(id);
+
+-- ============================================
+-- NAMED DISPLAY GROUPS (display_group)
+-- ============================================
+-- Allows organizing purchases into arbitrary named sections for display.
+-- Purely visual — does not affect economics.
+
+ALTER TABLE purchases
+  ADD COLUMN IF NOT EXISTS display_group VARCHAR(100);

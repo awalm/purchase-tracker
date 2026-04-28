@@ -12,9 +12,9 @@ export interface BonusAttributionLine {
   invoiceNumber: string
 }
 
-/** A display row — either a regular purchase or a collapsed group of attributed bonuses. */
+/** A display row — either a regular purchase, a collapsed group of attributed bonuses, or a section header for a named group. */
 export type DisplayRow =
-  | { kind: "purchase"; purchase: PurchaseEconomics }
+  | { kind: "purchase"; purchase: PurchaseEconomics; children?: DisplayRow[] }
   | {
       kind: "bonus-group"
       /** The first purchase in the group (used for item link, price, status, etc.) */
@@ -29,6 +29,13 @@ export type DisplayRow =
       totalCommission: number
       /** Per-parent attribution lines */
       attributions: BonusAttributionLine[]
+    }
+  | {
+      kind: "display-group-header"
+      /** The group name */
+      groupName: string
+      /** Rows within this group */
+      rows: DisplayRow[]
     }
 
 /**
@@ -82,60 +89,110 @@ export function countUnattributedBonuses(
 /**
  * Build a display-row list from raw purchases.
  *
- * Attributed bonuses for the same item_id are collapsed into a single
- * "bonus-group" row. Everything else passes through as a "purchase" row.
- * Original ordering is preserved: the group appears at the position of
- * the first member encountered.
+ * 1. Purchases with the same `display_group` are collected under a
+ *    "display-group-header" section row.
+ * 2. Within each section (or for ungrouped purchases), attributed bonuses
+ *    for the same item_id are collapsed into "bonus-group" rows placed
+ *    after the matching unit purchase.
+ *
+ * Everything else passes through as a "purchase" row.
  */
 export function buildDisplayRows(purchases: PurchaseEconomics[]): DisplayRow[] {
-  const rows: DisplayRow[] = []
-  // Map from item_id to the bonus-group row already emitted
-  const bonusGroups = new Map<string, DisplayRow & { kind: "bonus-group" }>()
+  // ── Separate by display_group ──
+  const grouped = new Map<string, PurchaseEconomics[]>()
+  const ungrouped: PurchaseEconomics[] = []
 
   for (const p of purchases) {
-    const isAttributedBonus =
-      p.purchase_type === "bonus" && !!p.bonus_for_purchase_id
-
-    if (!isAttributedBonus) {
-      rows.push({ kind: "purchase", purchase: p })
-      continue
-    }
-
-    const existing = bonusGroups.get(p.item_id)
-    if (existing) {
-      // Merge into existing group
-      existing.purchaseIds.push(p.purchase_id)
-      existing.totalQty += p.quantity
-      existing.totalSelling += p.total_selling ? parseFloat(p.total_selling) : 0
-      existing.totalCommission += p.total_commission ? parseFloat(p.total_commission) : 0
-      if (p.bonus_parent_item_name) {
-        existing.attributions.push({
-          parentItemName: p.bonus_parent_item_name,
-          parentQty: p.bonus_parent_quantity ?? p.quantity,
-          invoiceNumber: p.bonus_parent_invoice_number ?? "?",
-        })
-      }
+    if (p.display_group) {
+      const existing = grouped.get(p.display_group)
+      if (existing) existing.push(p)
+      else grouped.set(p.display_group, [p])
     } else {
-      // Start a new group
-      const group: DisplayRow & { kind: "bonus-group" } = {
-        kind: "bonus-group",
-        representative: p,
-        purchaseIds: [p.purchase_id],
-        totalQty: p.quantity,
-        totalSelling: p.total_selling ? parseFloat(p.total_selling) : 0,
-        totalCommission: p.total_commission ? parseFloat(p.total_commission) : 0,
-        attributions: p.bonus_parent_item_name
-          ? [{
-              parentItemName: p.bonus_parent_item_name,
-              parentQty: p.bonus_parent_quantity ?? p.quantity,
-              invoiceNumber: p.bonus_parent_invoice_number ?? "?",
-            }]
-          : [],
-      }
-      bonusGroups.set(p.item_id, group)
-      rows.push(group)
+      ungrouped.push(p)
     }
   }
 
-  return rows
+  // ── Build rows for a set of purchases (shared logic) ──
+  const buildSection = (sectionPurchases: PurchaseEconomics[]): DisplayRow[] => {
+    const bonusGroups = new Map<string, DisplayRow & { kind: "bonus-group" }>()
+    const unplacedBonusGroups = new Set<string>()
+
+    for (const p of sectionPurchases) {
+      const isAttributedBonus =
+        p.purchase_type === "bonus" && !!p.bonus_for_purchase_id
+      if (!isAttributedBonus) continue
+
+      const existing = bonusGroups.get(p.item_id)
+      if (existing) {
+        existing.purchaseIds.push(p.purchase_id)
+        existing.totalQty += p.quantity
+        existing.totalSelling += p.total_selling ? parseFloat(p.total_selling) : 0
+        existing.totalCommission += p.total_commission ? parseFloat(p.total_commission) : 0
+        if (p.bonus_parent_item_name) {
+          existing.attributions.push({
+            parentItemName: p.bonus_parent_item_name,
+            parentQty: p.bonus_parent_quantity ?? p.quantity,
+            invoiceNumber: p.bonus_parent_invoice_number ?? "?",
+          })
+        }
+      } else {
+        const group: DisplayRow & { kind: "bonus-group" } = {
+          kind: "bonus-group",
+          representative: p,
+          purchaseIds: [p.purchase_id],
+          totalQty: p.quantity,
+          totalSelling: p.total_selling ? parseFloat(p.total_selling) : 0,
+          totalCommission: p.total_commission ? parseFloat(p.total_commission) : 0,
+          attributions: p.bonus_parent_item_name
+            ? [{
+                parentItemName: p.bonus_parent_item_name,
+                parentQty: p.bonus_parent_quantity ?? p.quantity,
+                invoiceNumber: p.bonus_parent_invoice_number ?? "?",
+              }]
+            : [],
+        }
+        bonusGroups.set(p.item_id, group)
+        unplacedBonusGroups.add(p.item_id)
+      }
+    }
+
+    const rows: DisplayRow[] = []
+    for (const p of sectionPurchases) {
+      const isAttributedBonus =
+        p.purchase_type === "bonus" && !!p.bonus_for_purchase_id
+      if (isAttributedBonus) continue
+
+      rows.push({ kind: "purchase", purchase: p })
+
+      // Place bonus group after parent unit row
+      const bonusGroup = bonusGroups.get(p.item_id)
+      if (bonusGroup && unplacedBonusGroups.has(p.item_id)) {
+        rows.push(bonusGroup)
+        unplacedBonusGroups.delete(p.item_id)
+      }
+    }
+
+    // Remaining bonus groups without a matching parent
+    for (const itemId of unplacedBonusGroups) {
+      const group = bonusGroups.get(itemId)
+      if (group) rows.push(group)
+    }
+
+    return rows
+  }
+
+  // ── Assemble: named groups first, then ungrouped ──
+  const result: DisplayRow[] = []
+
+  for (const [groupName, groupPurchases] of grouped) {
+    result.push({
+      kind: "display-group-header",
+      groupName,
+      rows: buildSection(groupPurchases),
+    })
+  }
+
+  result.push(...buildSection(ungrouped))
+
+  return result
 }

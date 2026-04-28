@@ -445,20 +445,22 @@ pub async fn get_vendor_summary(pool: &PgPool) -> Result<Vec<VendorSummary>, sql
         VendorSummary,
         r#"WITH allocation_totals AS (
             SELECT
-                pa.purchase_id,
-                COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty
-            FROM purchase_allocations pa
-            GROUP BY pa.purchase_id
+                vac.purchase_id,
+                COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
+                COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+            FROM v_allocation_costs vac
+            GROUP BY vac.purchase_id
         ),
         allocation_rows AS (
             SELECT
                 p.id AS purchase_id,
                 pa.receipt_id,
                 pa.allocated_qty AS quantity,
-                pa.unit_cost AS unit_cost
+                vac.effective_unit_cost AS unit_cost
             FROM purchases p
             JOIN invoices inv ON inv.id = p.invoice_id
             JOIN purchase_allocations pa ON pa.purchase_id = p.id
+            JOIN v_allocation_costs vac ON vac.allocation_id = pa.id
             WHERE p.invoice_id IS NOT NULL
               AND p.invoice_unit_price IS NOT NULL
               AND p.destination_id IS NOT NULL
@@ -779,11 +781,11 @@ pub async fn get_destination_summary(
         DestinationSummary,
         r#"WITH allocation_totals AS (
             SELECT
-                pa.purchase_id,
-                COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
-                COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
-            FROM purchase_allocations pa
-            GROUP BY pa.purchase_id
+                vac.purchase_id,
+                COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
+                COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+            FROM v_allocation_costs vac
+            GROUP BY vac.purchase_id
         ),
         finalized_purchases AS (
             SELECT
@@ -860,11 +862,11 @@ pub async fn get_active_items(pool: &PgPool) -> Result<Vec<ActiveItem>, sqlx::Er
            ),
            allocation_summary AS (
                SELECT
-                   pa.purchase_id,
-                   COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
-                   COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
-               FROM purchase_allocations pa
-               GROUP BY pa.purchase_id
+                   vac.purchase_id,
+                   COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
+                   COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+               FROM v_allocation_costs vac
+               GROUP BY vac.purchase_id
            ),
            bonus_sums AS (
                SELECT
@@ -1346,7 +1348,7 @@ pub async fn create_invoice_from_pdf_atomic(
                RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, cost_adjustment, adjustment_note, invoice_unit_price,
                          destination_id, status as "status: DeliveryStatus",
                          delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id,
-                         created_at, updated_at"#,
+                         display_parent_purchase_id, display_group, created_at, updated_at"#,
             line.item_id,
             invoice.id,
             line.qty,
@@ -1691,11 +1693,11 @@ pub async fn get_invoice_with_destination(
         InvoiceWithDestination,
                 r#"WITH allocation_totals AS (
                              SELECT
-                                     pa.purchase_id,
-                                     COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
-                                     COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
-                             FROM purchase_allocations pa
-                             GROUP BY pa.purchase_id
+                                     vac.purchase_id,
+                                     COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
+                                     COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+                             FROM v_allocation_costs vac
+                             GROUP BY vac.purchase_id
                      ),
                      invoice_purchase_totals AS (
                              SELECT
@@ -1737,7 +1739,8 @@ pub async fn get_invoice_with_destination(
               COALESCE((SELECT SUM(rp.quantity * (COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost) - rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0)
             ELSE 0 END AS total_commission,
             COUNT(p.id) FILTER (
-                WHERE p.receipt_id IS NOT NULL
+                WHERE p.purchase_type = 'bonus'
+                   OR p.receipt_id IS NOT NULL
                    OR COALESCE((SELECT SUM(pa.allocated_qty) FROM purchase_allocations pa WHERE pa.purchase_id = p.id), 0) >= p.quantity
             ) AS receipted_count
         FROM invoices inv
@@ -1759,11 +1762,11 @@ pub async fn get_invoices_with_destination(
         InvoiceWithDestination,
                 r#"WITH allocation_totals AS (
                              SELECT
-                                     pa.purchase_id,
-                                     COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
-                                     COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
-                             FROM purchase_allocations pa
-                             GROUP BY pa.purchase_id
+                                     vac.purchase_id,
+                                     COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
+                                     COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+                             FROM v_allocation_costs vac
+                             GROUP BY vac.purchase_id
                      ),
                      invoice_purchase_totals AS (
                              SELECT
@@ -1805,7 +1808,8 @@ pub async fn get_invoices_with_destination(
               COALESCE((SELECT SUM(rp.quantity * (COALESCE(rp.invoice_unit_price, rp.effective_purchase_cost) - rp.effective_purchase_cost)) FROM invoice_purchase_totals rp WHERE rp.invoice_id = inv.id), 0)
             ELSE 0 END AS total_commission,
             COUNT(p.id) FILTER (
-                WHERE p.receipt_id IS NOT NULL
+                WHERE p.purchase_type = 'bonus'
+                   OR p.receipt_id IS NOT NULL
                    OR COALESCE((SELECT SUM(pa.allocated_qty) FROM purchase_allocations pa WHERE pa.purchase_id = p.id), 0) >= p.quantity
             ) AS receipted_count
         FROM invoices inv
@@ -1827,12 +1831,12 @@ pub async fn get_purchases_by_invoice(
         PurchaseEconomics,
         r#"WITH allocation_summary AS (
                SELECT
-                   pa.purchase_id,
-                   (ARRAY_AGG(DISTINCT pa.receipt_id))[1] AS any_receipt_id,
-                   COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
-                   COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
-               FROM purchase_allocations pa
-               GROUP BY pa.purchase_id
+                   vac.purchase_id,
+                   (ARRAY_AGG(DISTINCT vac.receipt_id))[1] AS any_receipt_id,
+                   COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
+                   COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+               FROM v_allocation_costs vac
+               GROUP BY vac.purchase_id
            ),
            bonus_sums AS (
                SELECT b.bonus_for_purchase_id AS parent_id,
@@ -1858,6 +1862,8 @@ pub async fn get_purchases_by_invoice(
                    p.refunds_purchase_id,
                    p.purchase_type,
                    p.bonus_for_purchase_id,
+                   p.display_parent_purchase_id,
+                   p.display_group,
                    p.created_at,
                    p.cost_adjustment,
                    p.adjustment_note,
@@ -1931,7 +1937,9 @@ pub async fn get_purchases_by_invoice(
                inv.reconciliation_state AS invoice_reconciliation_state,
                parent_i.name AS "bonus_parent_item_name?",
                parent_p.quantity AS "bonus_parent_quantity?",
-               parent_inv.invoice_number AS "bonus_parent_invoice_number?"
+               parent_inv.invoice_number AS "bonus_parent_invoice_number?",
+               pr.display_parent_purchase_id,
+               pr.display_group
            FROM purchase_rows pr
            LEFT JOIN items i ON i.id = pr.item_id
            LEFT JOIN receipts r ON r.id = pr.resolved_receipt_id
@@ -1960,7 +1968,7 @@ pub async fn get_all_purchases(
         Purchase,
         r#"SELECT p.id, p.item_id, p.invoice_id, p.receipt_id, p.quantity, p.purchase_cost, p.cost_adjustment, p.adjustment_note, p.invoice_unit_price,
                   p.destination_id, p.status as "status: DeliveryStatus", 
-                  p.delivery_date, p.notes, p.refunds_purchase_id, p.purchase_type, p.bonus_for_purchase_id, p.created_at, p.updated_at
+                  p.delivery_date, p.notes, p.refunds_purchase_id, p.purchase_type, p.bonus_for_purchase_id, p.display_parent_purchase_id, p.display_group, p.created_at, p.updated_at
            FROM purchases p
            LEFT JOIN receipts r ON r.id = p.receipt_id
            WHERE ($1::delivery_status IS NULL OR p.status = $1)
@@ -1988,7 +1996,7 @@ pub async fn get_purchase_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Purcha
         Purchase,
         r#"SELECT id, item_id, invoice_id, receipt_id, quantity, purchase_cost, cost_adjustment, adjustment_note, invoice_unit_price,
                   destination_id, status as "status: DeliveryStatus", 
-                  delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, created_at, updated_at
+                  delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, display_parent_purchase_id, display_group, created_at, updated_at
            FROM purchases WHERE id = $1"#,
         id
     )
@@ -2010,13 +2018,14 @@ pub async fn get_purchase_allocations(
             rli.item_id,
             i.name as item_name,
             pa.allocated_qty,
-            pa.unit_cost,
+            COALESCE(vac.effective_unit_cost, pa.unit_cost) as "unit_cost!",
             r.receipt_number,
             v.name as vendor_name,
             r.receipt_date,
             pa.created_at,
             pa.updated_at
         FROM purchase_allocations pa
+        JOIN v_allocation_costs vac ON vac.allocation_id = pa.id
         JOIN receipts r ON r.id = pa.receipt_id
         JOIN vendors v ON v.id = r.vendor_id
         LEFT JOIN receipt_line_items rli ON rli.id = pa.receipt_line_item_id
@@ -2072,11 +2081,8 @@ pub async fn create_purchase_allocation(
         ));
     }
 
-    if purchase.quantity < 0 {
-        return Err(PurchaseAllocationError::Validation(
-            "Cannot create allocations for refund purchases (negative quantity). Link via refunds_purchase_id instead.".to_string(),
-        ));
-    }
+    let is_refund_purchase = purchase.purchase_type == "refund" || purchase.quantity < 0;
+    let required_purchase_qty = purchase.quantity.abs();
 
     let receipt_line = sqlx::query!(
           r#"SELECT
@@ -2086,6 +2092,7 @@ pub async fn create_purchase_allocation(
                   rli.quantity,
                   rli.unit_cost,
                   rli.state,
+                  rli.line_type,
                   r.receipt_date
            FROM receipt_line_items rli
               JOIN receipts r ON r.id = rli.receipt_id
@@ -2096,7 +2103,19 @@ pub async fn create_purchase_allocation(
     .await?
     .ok_or_else(|| PurchaseAllocationError::NotFound("Receipt line item not found".to_string()))?;
 
-    if receipt_line.state != "active" {
+    if receipt_line.line_type != "item" {
+        return Err(PurchaseAllocationError::Validation(
+            "Cannot allocate to an adjustment line item. Adjustments flow through cost_adjustment on the purchase.".to_string(),
+        ));
+    }
+
+    if is_refund_purchase {
+        if receipt_line.state == "damaged" {
+            return Err(PurchaseAllocationError::Validation(
+                "Cannot allocate to a damaged receipt line item.".to_string(),
+            ));
+        }
+    } else if receipt_line.state != "active" {
         return Err(PurchaseAllocationError::Validation(
             format!("Cannot allocate to a {} receipt line item.", receipt_line.state),
         ));
@@ -2124,10 +2143,10 @@ pub async fn create_purchase_allocation(
     .await?
     .unwrap_or(0);
 
-    if allocated_for_purchase_sum + data.allocated_qty > purchase.quantity {
+    if allocated_for_purchase_sum + data.allocated_qty > required_purchase_qty {
         return Err(PurchaseAllocationError::Validation(format!(
-            "Allocated quantity exceeds purchase quantity (allocated: {}, requested: {}, purchase qty: {})",
-            allocated_for_purchase_sum, data.allocated_qty, purchase.quantity
+            "Allocated quantity exceeds purchase quantity (allocated: {}, requested: {}, allocatable qty: {})",
+            allocated_for_purchase_sum, data.allocated_qty, required_purchase_qty
         )));
     }
 
@@ -2210,6 +2229,7 @@ pub async fn update_purchase_allocation(
               p.id,
               p.item_id,
               p.quantity,
+              p.purchase_type,
               p.allow_receipt_date_override,
                   inv.invoice_date AS "invoice_date?"
            FROM purchases p
@@ -2256,6 +2276,8 @@ pub async fn update_purchase_allocation(
               rli.item_id,
               rli.quantity,
               rli.unit_cost,
+              rli.state,
+              rli.line_type,
               r.receipt_date
            FROM receipt_line_items rli
            JOIN receipts r ON r.id = rli.receipt_id
@@ -2266,6 +2288,27 @@ pub async fn update_purchase_allocation(
     .await?
     .ok_or_else(|| PurchaseAllocationError::NotFound("Receipt line item not found".to_string()))?;
 
+    if receipt_line.line_type != "item" {
+        return Err(PurchaseAllocationError::Validation(
+            "Cannot allocate to an adjustment line item. Adjustments flow through cost_adjustment on the purchase.".to_string(),
+        ));
+    }
+let is_refund_purchase = purchase.purchase_type == "refund" || purchase.quantity < 0;
+    let required_purchase_qty = purchase.quantity.abs();
+
+    if is_refund_purchase {
+        if receipt_line.state == "damaged" {
+            return Err(PurchaseAllocationError::Validation(
+                "Cannot allocate to a damaged receipt line item.".to_string(),
+            ));
+        }
+    } else if receipt_line.state != "active" {
+        return Err(PurchaseAllocationError::Validation(
+            format!("Cannot allocate to a {} receipt line item.", receipt_line.state),
+        ));
+    }
+
+    
     if receipt_line.item_id != purchase.item_id {
         return Err(PurchaseAllocationError::Validation(
             "Receipt line item item must match invoice line item".to_string(),
@@ -2318,10 +2361,10 @@ pub async fn update_purchase_allocation(
     .await?
     .unwrap_or(0);
 
-    if other_allocated_purchase_sum + next_allocated_qty > purchase.quantity {
+    if other_allocated_purchase_sum + next_allocated_qty > required_purchase_qty {
         return Err(PurchaseAllocationError::Validation(format!(
-            "Allocated quantity exceeds purchase quantity (allocated by others: {}, requested: {}, purchase qty: {})",
-            other_allocated_purchase_sum, next_allocated_qty, purchase.quantity
+            "Allocated quantity exceeds purchase quantity (allocated by others: {}, requested: {}, allocatable qty: {})",
+            other_allocated_purchase_sum, next_allocated_qty, required_purchase_qty
         )));
     }
 
@@ -2411,6 +2454,7 @@ pub async fn get_receipt_line_items(
             rli.notes,
             rli.parent_line_item_id,
             rli.state,
+            rli.line_type,
             COALESCE(SUM(CASE WHEN p.id IS NOT NULL THEN pa.allocated_qty ELSE 0 END), 0)::INT AS "allocated_qty!: i32",
             (rli.quantity - COALESCE(SUM(CASE WHEN p.id IS NOT NULL THEN pa.allocated_qty ELSE 0 END), 0))::INT AS "remaining_qty!: i32",
             rli.created_at,
@@ -2422,7 +2466,7 @@ pub async fn get_receipt_line_items(
          AND pa.receipt_id = rli.receipt_id
         LEFT JOIN purchases p ON p.id = pa.purchase_id
         WHERE rli.receipt_id = $1
-        GROUP BY rli.id, rli.receipt_id, rli.item_id, i.name, rli.quantity, rli.unit_cost, rli.notes, rli.parent_line_item_id, rli.state, rli.created_at, rli.updated_at
+        GROUP BY rli.id, rli.receipt_id, rli.item_id, i.name, rli.quantity, rli.unit_cost, rli.notes, rli.parent_line_item_id, rli.state, rli.line_type, rli.created_at, rli.updated_at
         ORDER BY rli.parent_line_item_id NULLS FIRST, i.name"#,
         receipt_id
     )
@@ -2435,6 +2479,22 @@ pub async fn create_receipt_line_item(
     receipt_id: Uuid,
     data: CreateReceiptLineItem,
 ) -> Result<ReceiptLineItemWithItem, PurchaseAllocationError> {
+    let line_type = data.line_type.as_deref().unwrap_or("item");
+    if !["item", "adjustment"].contains(&line_type) {
+        return Err(PurchaseAllocationError::Validation(
+            format!("Invalid line_type: {}. Must be item or adjustment.", line_type),
+        ));
+    }
+
+    if line_type == "adjustment" {
+        // Adjustment lines require a parent_line_item_id
+        if data.parent_line_item_id.is_none() {
+            return Err(PurchaseAllocationError::Validation(
+                "Adjustment lines must reference a parent line item.".to_string(),
+            ));
+        }
+    }
+
     if data.quantity <= 0 {
         return Err(PurchaseAllocationError::Validation(
             "quantity must be greater than zero".to_string(),
@@ -2457,9 +2517,9 @@ pub async fn create_receipt_line_item(
 
     let created = sqlx::query_as!(
         ReceiptLineItem,
-        r#"INSERT INTO receipt_line_items (receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id, state)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
-           RETURNING id, receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id, state, created_at, updated_at"#,
+        r#"INSERT INTO receipt_line_items (receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id, state, line_type)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           RETURNING id, receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id, state, line_type, created_at, updated_at"#,
         receipt_id,
         data.item_id,
         data.quantity,
@@ -2467,12 +2527,16 @@ pub async fn create_receipt_line_item(
         data.notes,
         data.parent_line_item_id,
         state,
+        line_type,
     )
     .fetch_one(pool)
     .await
     .map_err(|e| {
         if let sqlx::Error::Database(db_err) = &e {
-            if db_err.constraint() == Some("receipt_line_items_receipt_id_item_id_key") {
+            let constraint = db_err.constraint().unwrap_or("");
+            if constraint == "receipt_line_items_receipt_id_item_id_key"
+                || constraint == "receipt_line_items_receipt_item_root_unique"
+            {
                 return PurchaseAllocationError::Validation(
                     "Receipt already has a line for this item. Edit the existing line instead."
                         .to_string(),
@@ -2505,7 +2569,7 @@ pub async fn update_receipt_line_item(
 
     let current = sqlx::query_as!(
         ReceiptLineItem,
-        r#"SELECT id, receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id, state, created_at, updated_at
+        r#"SELECT id, receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id, state, line_type, created_at, updated_at
            FROM receipt_line_items
            WHERE id = $1 AND receipt_id = $2"#,
         line_item_id,
@@ -2578,7 +2642,7 @@ pub async fn update_receipt_line_item(
                notes = $6,
                state = $7
            WHERE id = $1 AND receipt_id = $2
-           RETURNING id, receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id, state, created_at, updated_at"#,
+           RETURNING id, receipt_id, item_id, quantity, unit_cost, notes, parent_line_item_id, state, line_type, created_at, updated_at"#,
         line_item_id,
         receipt_id,
         next_item_id,
@@ -2591,7 +2655,10 @@ pub async fn update_receipt_line_item(
     .await
     .map_err(|e| {
         if let sqlx::Error::Database(db_err) = &e {
-            if db_err.constraint() == Some("receipt_line_items_receipt_id_item_id_key") {
+            let constraint = db_err.constraint().unwrap_or("");
+            if constraint == "receipt_line_items_receipt_id_item_id_key"
+                || constraint == "receipt_line_items_receipt_item_root_unique"
+            {
                 return PurchaseAllocationError::Validation(
                     "Receipt already has a line for this item. Edit the existing line instead."
                         .to_string(),
@@ -2646,6 +2713,44 @@ pub async fn delete_receipt_line_item(
     .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+pub async fn unlink_purchase_from_receipt(
+    pool: &PgPool,
+    purchase_id: Uuid,
+    receipt_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    ensure_purchase_not_linked_to_locked_invoice(
+        pool,
+        purchase_id,
+        "Cannot modify allocations for purchases on a locked invoice. Reopen the invoice first.",
+    )
+    .await?;
+
+    // Remove all allocations linking this purchase to this receipt
+    let alloc_result = sqlx::query!(
+        r#"DELETE FROM purchase_allocations WHERE purchase_id = $1 AND receipt_id = $2"#,
+        purchase_id,
+        receipt_id
+    )
+    .execute(pool)
+    .await?;
+
+    // Clear direct receipt_id link if it points to this receipt
+    let direct_result = sqlx::query!(
+        r#"UPDATE purchases SET receipt_id = NULL WHERE id = $1 AND receipt_id = $2"#,
+        purchase_id,
+        receipt_id
+    )
+    .execute(pool)
+    .await?;
+
+    let affected = alloc_result.rows_affected() + direct_result.rows_affected();
+
+    // Clean up orphaned purchases (no invoice, no receipt, no allocations)
+    let _ = delete_orphan_purchases(pool).await?;
+
+    Ok(affected > 0)
 }
 
 pub async fn delete_purchase_allocation(
@@ -2718,6 +2823,9 @@ pub async fn auto_allocate_purchase(
     } else {
         purchase.invoice_date
     };
+    let is_refund_purchase = purchase.purchase_type == "refund" || purchase.quantity < 0;
+    let target_receipt_state = if is_refund_purchase { None } else { Some("active") };
+    let required_purchase_qty = purchase.quantity.abs();
 
     let existing_allocations = sqlx::query!(
         r#"SELECT id, receipt_id, allocated_qty
@@ -2737,7 +2845,7 @@ pub async fn auto_allocate_purchase(
         .iter()
         .map(|row| row.allocated_qty)
         .sum::<i32>();
-    let mut remaining_qty = (purchase.quantity - previously_allocated_qty).max(0);
+    let mut remaining_qty = (required_purchase_qty - previously_allocated_qty).max(0);
     let mut auto_allocated_qty = 0;
     let mut allocations_created = 0;
     let mut allocations_updated = 0;
@@ -2756,12 +2864,17 @@ pub async fn auto_allocate_purchase(
             JOIN receipts r ON r.id = rli.receipt_id
             LEFT JOIN purchase_allocations pa ON pa.receipt_line_item_id = rli.id
             WHERE rli.item_id = $2
+                            AND rli.line_type = 'item'
+                            AND rli.parent_line_item_id IS NULL
+                            AND rli.state != 'damaged'
+                            AND ($4::text IS NULL OR rli.state = $4)
                             AND ($3::date IS NULL OR r.receipt_date <= $3)
-            GROUP BY rli.id, rli.receipt_id, rli.quantity, rli.unit_cost, r.receipt_date
-            ORDER BY r.receipt_date ASC, rli.receipt_id ASC"#,
+            GROUP BY rli.id, rli.receipt_id, rli.quantity, rli.unit_cost, r.receipt_date, r.created_at
+            ORDER BY r.receipt_date ASC, r.created_at ASC, rli.id ASC"#,
             purchase_id,
                         purchase.item_id,
-                        invoice_date_cutoff
+                        invoice_date_cutoff,
+                        target_receipt_state as _
         )
         .fetch_all(&mut *tx)
         .await?;
@@ -2844,7 +2957,7 @@ pub async fn auto_allocate_purchase(
     tx.commit().await?;
 
     let total_allocated_qty = previously_allocated_qty + auto_allocated_qty;
-    let remaining_qty = (purchase.quantity - total_allocated_qty).max(0);
+    let remaining_qty = (required_purchase_qty - total_allocated_qty).max(0);
     let warning = if invoice_date_cutoff.is_some() && remaining_qty > 0 && auto_allocated_qty <= 0 {
         Some(no_eligible_receipts_before_invoice_warning(
             invoice_date_cutoff.expect("cutoff is_some checked"),
@@ -2855,7 +2968,7 @@ pub async fn auto_allocate_purchase(
 
     Ok(AutoAllocatePurchaseResult {
         purchase_id,
-        purchase_qty: purchase.quantity,
+        purchase_qty: required_purchase_qty,
         previously_allocated_qty,
         auto_allocated_qty,
         total_allocated_qty,
@@ -2898,8 +3011,8 @@ pub async fn create_purchase(
 
     let purchase = sqlx::query_as!(
         Purchase,
-                    r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price, destination_id, status, delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, created_at, updated_at) 
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    r#"INSERT INTO purchases (item_id, invoice_id, receipt_id, quantity, purchase_cost, invoice_unit_price, destination_id, status, delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, display_parent_purchase_id, display_group, created_at, updated_at) 
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
                                      COALESCE((SELECT invoice_date::timestamptz FROM invoices WHERE id = $2),
                                                         (SELECT receipt_date::timestamptz FROM receipts WHERE id = $3),
                                                         TIMESTAMPTZ '1970-01-01 00:00:00+00'),
@@ -2908,7 +3021,7 @@ pub async fn create_purchase(
                                                         TIMESTAMPTZ '1970-01-01 00:00:00+00')) 
               RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, cost_adjustment, adjustment_note, invoice_unit_price,
                      destination_id, status as "status: DeliveryStatus", 
-                     delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, created_at, updated_at"#,
+                     delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, display_parent_purchase_id, display_group, created_at, updated_at"#,
         data.item_id,
         data.invoice_id,
         data.receipt_id,
@@ -2921,7 +3034,9 @@ pub async fn create_purchase(
         data.notes,
         data.refunds_purchase_id,
         purchase_type,
-        data.bonus_for_purchase_id
+        data.bonus_for_purchase_id,
+        data.display_parent_purchase_id,
+        data.display_group
     )
     .fetch_one(pool)
     .await?;
@@ -3019,6 +3134,8 @@ pub async fn split_purchase(
                 refunds_purchase_id: None,
                 purchase_type: Some(purchase_type.to_string()),
                 bonus_for_purchase_id: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             },
             user_id,
         )
@@ -3254,7 +3371,7 @@ pub async fn distribute_bonus(
                 r#"SELECT id, item_id, invoice_id, receipt_id, quantity, purchase_cost, cost_adjustment, adjustment_note, invoice_unit_price,
                           destination_id, status as "status: DeliveryStatus",
                           delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id,
-                          created_at, updated_at
+                          display_parent_purchase_id, display_group, created_at, updated_at
                    FROM purchases
                    WHERE invoice_id = $1
                      AND bonus_for_purchase_id = $2
@@ -3305,7 +3422,7 @@ pub async fn distribute_bonus(
                        RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, cost_adjustment, adjustment_note, invoice_unit_price,
                                  destination_id, status as "status: DeliveryStatus",
                                  delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id,
-                                 created_at, updated_at"#,
+                                 display_parent_purchase_id, display_group, created_at, updated_at"#,
                     item.item_id,
                     invoice_id,
                     alloc_qty,
@@ -3344,7 +3461,7 @@ pub async fn distribute_bonus(
             r#"SELECT id, item_id, invoice_id, receipt_id, quantity, purchase_cost, cost_adjustment, adjustment_note, invoice_unit_price,
                       destination_id, status as "status: DeliveryStatus",
                       delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id,
-                      created_at, updated_at
+                      display_parent_purchase_id, display_group, created_at, updated_at
                FROM purchases
                WHERE invoice_id = $1
                  AND item_id = $2
@@ -3399,7 +3516,7 @@ pub async fn distribute_bonus(
                    RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, cost_adjustment, adjustment_note, invoice_unit_price,
                              destination_id, status as "status: DeliveryStatus",
                              delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id,
-                             created_at, updated_at"#,
+                             display_parent_purchase_id, display_group, created_at, updated_at"#,
                 original.item_id,
                 invoice_id,
                 remaining_budget,
@@ -3534,6 +3651,16 @@ pub async fn update_purchase(
         } else {
             data.bonus_for_purchase_id.or(old_purchase.bonus_for_purchase_id)
         };
+        let display_parent_purchase_id = if data.clear_display_parent_purchase {
+            None
+        } else {
+            data.display_parent_purchase_id.or(old_purchase.display_parent_purchase_id)
+        };
+        let display_group = if data.clear_display_group {
+            None
+        } else {
+            data.display_group.or(old_purchase.display_group.clone())
+        };
 
         let purchase = sqlx::query_as!(
             Purchase,
@@ -3552,11 +3679,13 @@ pub async fn update_purchase(
                 purchase_type = $13,
                 bonus_for_purchase_id = $14,
                 cost_adjustment = $15,
-                adjustment_note = $16
+                adjustment_note = $16,
+                display_parent_purchase_id = $17,
+                display_group = $18
                WHERE id = $1 
                RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, cost_adjustment, adjustment_note, invoice_unit_price,
                          destination_id, status as "status: DeliveryStatus", 
-                         delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, created_at, updated_at"#,
+                         delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, display_parent_purchase_id, display_group, created_at, updated_at"#,
             id,
             item_id,
             invoice_id,
@@ -3572,7 +3701,9 @@ pub async fn update_purchase(
             purchase_type,
             bonus_for_purchase_id,
             cost_adjustment,
-            adjustment_note
+            adjustment_note,
+            display_parent_purchase_id,
+            display_group
         )
         .fetch_optional(pool)
         .await?;
@@ -3618,7 +3749,7 @@ pub async fn update_purchase_status(
                WHERE id = $1 
                RETURNING id, item_id, invoice_id, receipt_id, quantity, purchase_cost, cost_adjustment, adjustment_note, invoice_unit_price,
                          destination_id, status as "status: DeliveryStatus", 
-                         delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, created_at, updated_at"#,
+                         delivery_date, notes, refunds_purchase_id, purchase_type, bonus_for_purchase_id, display_parent_purchase_id, display_group, created_at, updated_at"#,
             id,
             status as DeliveryStatus
         )
@@ -3686,12 +3817,12 @@ pub async fn get_purchase_economics(
         PurchaseEconomics,
         r#"WITH allocation_summary AS (
                SELECT
-                   pa.purchase_id,
-                   (ARRAY_AGG(DISTINCT pa.receipt_id))[1] AS any_receipt_id,
-                   COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
-                   COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
-               FROM purchase_allocations pa
-               GROUP BY pa.purchase_id
+                   vac.purchase_id,
+                   (ARRAY_AGG(DISTINCT vac.receipt_id))[1] AS any_receipt_id,
+                   COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
+                   COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+               FROM v_allocation_costs vac
+               GROUP BY vac.purchase_id
            ),
            bonus_sums AS (
                SELECT b.bonus_for_purchase_id AS parent_id,
@@ -3825,7 +3956,9 @@ pub async fn get_purchase_economics(
                pr.reconciliation_state AS "invoice_reconciliation_state?",
                NULL::text AS bonus_parent_item_name,
                NULL::int AS bonus_parent_quantity,
-               NULL::text AS bonus_parent_invoice_number
+               NULL::text AS bonus_parent_invoice_number,
+               NULL::uuid AS display_parent_purchase_id,
+               NULL::text AS display_group
            FROM purchase_rows pr
            LEFT JOIN items i ON i.id = pr.item_id
            LEFT JOIN receipts r ON r.id = pr.resolved_receipt_id
@@ -4330,18 +4463,18 @@ pub async fn get_receipt_with_vendor(
             r.updated_at,
             (SELECT COUNT(*)::BIGINT FROM receipt_line_items rli WHERE rli.receipt_id = r.id) AS "receipt_line_item_count!",
                         COUNT(DISTINCT p.id) AS purchase_count,
-                        COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0)
-                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * p.purchase_cost ELSE 0 END), 0) AS purchases_total,
-                        COALESCE(SUM(pa.allocated_qty * COALESCE(p.invoice_unit_price, 0)), 0)
-                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * COALESCE(p.invoice_unit_price, 0) ELSE 0 END), 0) AS total_selling,
-                        COALESCE(SUM(pa.allocated_qty * (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost)), 0)
-                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) ELSE 0 END), 0) AS total_commission,
+                        COALESCE(SUM(vac.effective_allocated_cost), 0)
+                            + COALESCE(SUM(CASE WHEN vac.allocation_id IS NULL THEN p.quantity * p.purchase_cost ELSE 0 END), 0) AS purchases_total,
+                        COALESCE(SUM(vac.allocated_qty * COALESCE(p.invoice_unit_price, 0)), 0)
+                            + COALESCE(SUM(CASE WHEN vac.allocation_id IS NULL THEN p.quantity * COALESCE(p.invoice_unit_price, 0) ELSE 0 END), 0) AS total_selling,
+                        COALESCE(SUM(vac.allocated_qty * (COALESCE(p.invoice_unit_price, vac.effective_unit_cost) - vac.effective_unit_cost)), 0)
+                            + COALESCE(SUM(CASE WHEN vac.allocation_id IS NULL THEN p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) ELSE 0 END), 0) AS total_commission,
                         COUNT(DISTINCT p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count,
                         COUNT(DISTINCT p.id) FILTER (WHERE inv.reconciliation_state = 'locked') AS locked_purchase_count
         FROM receipts r
         JOIN vendors v ON v.id = r.vendor_id
-                LEFT JOIN purchase_allocations pa ON pa.receipt_id = r.id
-                LEFT JOIN purchases p ON p.id = pa.purchase_id OR (pa.id IS NULL AND p.receipt_id = r.id)
+                LEFT JOIN v_allocation_costs vac ON vac.receipt_id = r.id
+                LEFT JOIN purchases p ON p.id = vac.purchase_id OR (vac.allocation_id IS NULL AND p.receipt_id = r.id)
                     LEFT JOIN invoices inv ON inv.id = p.invoice_id
         WHERE r.id = $1
            GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_amount, r.total,
@@ -4375,18 +4508,18 @@ pub async fn get_receipts_with_vendor(
             r.updated_at,
             (SELECT COUNT(*)::BIGINT FROM receipt_line_items rli WHERE rli.receipt_id = r.id) AS "receipt_line_item_count!",
                         COUNT(DISTINCT p.id) AS purchase_count,
-                        COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0)
-                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * p.purchase_cost ELSE 0 END), 0) AS purchases_total,
-                        COALESCE(SUM(pa.allocated_qty * COALESCE(p.invoice_unit_price, 0)), 0)
-                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * COALESCE(p.invoice_unit_price, 0) ELSE 0 END), 0) AS total_selling,
-                        COALESCE(SUM(pa.allocated_qty * (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost)), 0)
-                            + COALESCE(SUM(CASE WHEN pa.id IS NULL THEN p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) ELSE 0 END), 0) AS total_commission,
+                        COALESCE(SUM(vac.effective_allocated_cost), 0)
+                            + COALESCE(SUM(CASE WHEN vac.allocation_id IS NULL THEN p.quantity * p.purchase_cost ELSE 0 END), 0) AS purchases_total,
+                        COALESCE(SUM(vac.allocated_qty * COALESCE(p.invoice_unit_price, 0)), 0)
+                            + COALESCE(SUM(CASE WHEN vac.allocation_id IS NULL THEN p.quantity * COALESCE(p.invoice_unit_price, 0) ELSE 0 END), 0) AS total_selling,
+                        COALESCE(SUM(vac.allocated_qty * (COALESCE(p.invoice_unit_price, vac.effective_unit_cost) - vac.effective_unit_cost)), 0)
+                            + COALESCE(SUM(CASE WHEN vac.allocation_id IS NULL THEN p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) ELSE 0 END), 0) AS total_commission,
                         COUNT(DISTINCT p.id) FILTER (WHERE p.invoice_id IS NOT NULL) AS invoiced_count,
                         COUNT(DISTINCT p.id) FILTER (WHERE inv.reconciliation_state = 'locked') AS locked_purchase_count
         FROM receipts r
         JOIN vendors v ON v.id = r.vendor_id
-                LEFT JOIN purchase_allocations pa ON pa.receipt_id = r.id
-                LEFT JOIN purchases p ON p.id = pa.purchase_id OR (pa.id IS NULL AND p.receipt_id = r.id)
+                LEFT JOIN v_allocation_costs vac ON vac.receipt_id = r.id
+                LEFT JOIN purchases p ON p.id = vac.purchase_id OR (vac.allocation_id IS NULL AND p.receipt_id = r.id)
                     LEFT JOIN invoices inv ON inv.id = p.invoice_id
         GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_amount, r.total,
              r.payment_method, r.ingestion_metadata,
@@ -4411,16 +4544,16 @@ pub async fn get_purchases_by_receipt(
                    i.name AS item_name,
                    v.name AS vendor_name,
                    d.code AS destination_code,
-                   pa.allocated_qty AS quantity,
-                   pa.unit_cost AS purchase_cost,
-                   (pa.allocated_qty * pa.unit_cost) AS total_cost,
+                   vac.allocated_qty AS quantity,
+                   vac.effective_unit_cost AS purchase_cost,
+                   vac.effective_allocated_cost AS total_cost,
                    p.invoice_unit_price,
-                   (pa.allocated_qty * p.invoice_unit_price) AS total_selling,
-                   (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost) AS unit_commission,
-                   (pa.allocated_qty * (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost)) AS total_commission,
+                   (vac.allocated_qty * p.invoice_unit_price) AS total_selling,
+                   (COALESCE(p.invoice_unit_price, vac.effective_unit_cost) - vac.effective_unit_cost) AS unit_commission,
+                   (vac.allocated_qty * (COALESCE(p.invoice_unit_price, vac.effective_unit_cost) - vac.effective_unit_cost)) AS total_commission,
                    inv.tax_rate,
-                   (pa.allocated_qty * pa.unit_cost * (inv.tax_rate / 100.0)) AS tax_paid,
-                   (pa.allocated_qty * (COALESCE(p.invoice_unit_price, pa.unit_cost) - pa.unit_cost) * (inv.tax_rate / 100.0)) AS tax_owed,
+                   vac.effective_allocated_cost * (inv.tax_rate / 100.0) AS tax_paid,
+                   (vac.allocated_qty * (COALESCE(p.invoice_unit_price, vac.effective_unit_cost) - vac.effective_unit_cost) * (inv.tax_rate / 100.0)) AS tax_owed,
                    p.status,
                    p.delivery_date,
                    p.invoice_id,
@@ -4436,17 +4569,18 @@ pub async fn get_purchases_by_receipt(
                    p.cost_adjustment,
                    p.adjustment_note,
                    p.created_at AS sort_created_at
-               FROM purchase_allocations pa
-               JOIN purchases p ON p.id = pa.purchase_id
+               FROM v_allocation_costs vac
+               JOIN purchase_allocations pa ON pa.id = vac.allocation_id
+               JOIN purchases p ON p.id = vac.purchase_id
                JOIN items i ON i.id = p.item_id
-               JOIN receipts r ON r.id = pa.receipt_id
+               JOIN receipts r ON r.id = vac.receipt_id
                JOIN vendors v ON v.id = r.vendor_id
                LEFT JOIN destinations d ON d.id = p.destination_id
                LEFT JOIN invoices inv ON inv.id = p.invoice_id
-               LEFT JOIN receipt_line_items rli ON rli.id = pa.receipt_line_item_id
-               WHERE pa.receipt_id = $1
+               LEFT JOIN receipt_line_items rli ON rli.id = vac.receipt_line_item_id
+               WHERE vac.receipt_id = $1
                  AND (
-                     pa.receipt_line_item_id IS NULL
+                     vac.receipt_line_item_id IS NULL
                      OR rli.id IS NULL
                      OR rli.item_id IS DISTINCT FROM p.item_id
                  ) IS NOT TRUE
@@ -4530,7 +4664,9 @@ pub async fn get_purchases_by_receipt(
                c.invoice_reconciliation_state,
                NULL::text AS bonus_parent_item_name,
                NULL::int AS bonus_parent_quantity,
-               NULL::text AS bonus_parent_invoice_number
+               NULL::text AS bonus_parent_invoice_number,
+               NULL::uuid AS display_parent_purchase_id,
+               NULL::text AS display_group
            FROM (
                SELECT * FROM allocation_rows
                UNION ALL
@@ -4552,12 +4688,12 @@ pub async fn get_purchases_by_item(
         PurchaseEconomics,
         r#"WITH allocation_summary AS (
                SELECT
-                   pa.purchase_id,
-                   (ARRAY_AGG(DISTINCT pa.receipt_id))[1] AS any_receipt_id,
-                   COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
-                   COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
-               FROM purchase_allocations pa
-               GROUP BY pa.purchase_id
+                   vac.purchase_id,
+                   (ARRAY_AGG(DISTINCT vac.receipt_id))[1] AS any_receipt_id,
+                   COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
+                   COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+               FROM v_allocation_costs vac
+               GROUP BY vac.purchase_id
            ),
            bonus_sums AS (
                SELECT b.bonus_for_purchase_id AS parent_id,
@@ -4661,7 +4797,9 @@ pub async fn get_purchases_by_item(
                inv.reconciliation_state AS invoice_reconciliation_state,
                NULL::text AS bonus_parent_item_name,
                NULL::int AS bonus_parent_quantity,
-               NULL::text AS bonus_parent_invoice_number
+               NULL::text AS bonus_parent_invoice_number,
+               NULL::uuid AS display_parent_purchase_id,
+               NULL::text AS display_group
            FROM purchase_rows pr
            LEFT JOIN items i ON i.id = pr.item_id
            LEFT JOIN receipts r ON r.id = pr.resolved_receipt_id
@@ -4756,6 +4894,53 @@ pub async fn get_unreconciled_receipt_items(
     .await
 }
 
+pub async fn get_tax_report(
+    pool: &PgPool,
+    destination_id: Uuid,
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+) -> Result<Vec<TaxReportFlatRow>, sqlx::Error> {
+    sqlx::query_as!(
+        TaxReportFlatRow,
+        r#"SELECT
+            p.id AS "purchase_id!",
+            inv.id AS "invoice_id!",
+            inv.invoice_number AS "invoice_number!",
+            inv.invoice_date AS "invoice_date!",
+            inv.delivery_date AS "delivery_date?",
+            inv.tax_rate AS "tax_rate!",
+            i.name AS "item_name!",
+            p.quantity AS "quantity!",
+            p.invoice_unit_price AS "invoice_unit_price!",
+            vac.receipt_id AS "receipt_id?",
+            r.receipt_number AS "receipt_number?",
+            r.receipt_date AS "receipt_date?",
+            v.name AS "vendor_name?",
+            vac.allocated_qty AS "allocated_qty?: i32",
+            vac.effective_unit_cost AS "allocation_unit_cost?",
+            vac.effective_allocated_cost AS "allocation_total?"
+        FROM purchases p
+        JOIN invoices inv ON inv.id = p.invoice_id
+        JOIN items i ON i.id = p.item_id
+        LEFT JOIN v_allocation_costs vac ON vac.purchase_id = p.id
+        LEFT JOIN receipts r ON r.id = vac.receipt_id
+        LEFT JOIN vendors v ON v.id = r.vendor_id
+        WHERE p.invoice_id IS NOT NULL
+          AND p.invoice_unit_price IS NOT NULL
+          AND p.destination_id IS NOT NULL
+          AND p.destination_id = $1
+          AND inv.reconciliation_state = 'locked'
+          AND ($2::date IS NULL OR inv.invoice_date >= $2)
+          AND ($3::date IS NULL OR inv.invoice_date <= $3)
+        ORDER BY inv.invoice_date, inv.invoice_number, i.name, r.receipt_date"#,
+        destination_id,
+        from,
+        to,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn get_profit_report(
     pool: &PgPool,
     from: Option<NaiveDate>,
@@ -4765,11 +4950,11 @@ pub async fn get_profit_report(
         ProfitReport,
                 r#"WITH allocation_totals AS (
                         SELECT
-                            pa.purchase_id,
-                            COALESCE(SUM(pa.allocated_qty), 0)::INT AS allocated_qty,
-                            COALESCE(SUM(pa.allocated_qty * pa.unit_cost), 0::numeric) AS allocated_total_cost
-                        FROM purchase_allocations pa
-                        GROUP BY pa.purchase_id
+                            vac.purchase_id,
+                            COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
+                            COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+                        FROM v_allocation_costs vac
+                        GROUP BY vac.purchase_id
                 ),
                 finalized_purchases AS (
                         SELECT
@@ -6529,6 +6714,8 @@ mod tests {
                 refunds_purchase_id: None,
                 purchase_type: None,
                 bonus_for_purchase_id: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             },
             Uuid::new_v4(),
         )
@@ -6724,6 +6911,8 @@ mod tests {
                 refunds_purchase_id: None,
                 purchase_type: None,
                 bonus_for_purchase_id: None,
+                display_parent_purchase_id: None,
+                display_group: None,
             },
             Uuid::new_v4(),
         )

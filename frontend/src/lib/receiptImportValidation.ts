@@ -1,6 +1,7 @@
 export type ImportLineSubtotalInput = {
   quantity: number | string
   unitCost: number | string | null | undefined
+  allowNegativeCost?: boolean
 }
 
 export type ReceiptDuplicateRecord = {
@@ -40,6 +41,20 @@ export type MergedMappedImportLine = {
   notes: string
 }
 
+export type FeeLineForSave = {
+  parentItemId: string
+  itemId: string
+  description: string
+  quantity: number
+  unitCost: number
+  notes: string
+}
+
+export type MergeResult = {
+  mergedLines: MergedMappedImportLine[]
+  feeLines: FeeLineForSave[]
+}
+
 const normalizeReceiptNumber = (value: string): string => value.trim().toLowerCase()
 
 const toFiniteNumber = (value: number | string | null | undefined): number | null => {
@@ -68,7 +83,12 @@ export const computeImportLineItemsSubtotal = (
     const quantity = toFiniteNumber(line.quantity)
     const unitCost = toFiniteNumber(line.unitCost)
 
-    if (quantity === null || unitCost === null || quantity <= 0 || unitCost <= 0) {
+    if (quantity === null || unitCost === null || quantity <= 0) {
+      return sum
+    }
+
+    // Normal lines require positive cost; adjustment lines allow negative
+    if (unitCost === 0 || (!line.allowNegativeCost && unitCost < 0)) {
       return sum
     }
 
@@ -155,22 +175,11 @@ export const findDuplicateMappedImportItems = (
   return Array.from(grouped.values()).filter((entry) => entry.lineNumbers.length > 1)
 }
 
-const normalizeDescriptionForFeeDetection = (value: string): string =>
+const normalizeDescriptionForComparison = (value: string): string =>
   value
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .trim()
-
-const isFeeLikeDescription = (description: string): boolean => {
-  const normalized = normalizeDescriptionForFeeDetection(description)
-  if (!normalized) return false
-
-  return (
-    /\b(env|enu|environmental|eco)\s*fee\b/.test(normalized) ||
-    /\bfee\b.*\b(env|enu|environmental|eco|handling)\b/.test(normalized) ||
-    /\bhandling\s*fee\b/.test(normalized)
-  )
-}
 
 const toPositiveFiniteNumber = (value: number | string): number | null => {
   const parsed = toFiniteNumber(value)
@@ -180,14 +189,16 @@ const toPositiveFiniteNumber = (value: number | string): number | null => {
 
 export const mergeMappedImportLines = (
   lines: MappedImportLineForMerge[]
-): MergedMappedImportLine[] => {
+): MergeResult => {
   type Group = {
     itemId: string
     firstIndex: number
+    primaryDescription: string
     totalAmount: number
     quantityAll: number
-    quantityNonFee: number
+    quantityPrimary: number
     notes: string[]
+    feeLines: Array<{ description: string; quantity: number; unitCost: number; notes: string }>
   }
 
   const groups = new Map<string, Group>()
@@ -201,47 +212,69 @@ export const mergeMappedImportLines = (
     const unitCost = toPositiveFiniteNumber(line.unitCost)
     if (quantity === null || unitCost === null) continue
 
-    const amount = quantity * unitCost
-    const feeLike = isFeeLikeDescription(line.description)
+    const normalizedDesc = normalizeDescriptionForComparison(line.description)
 
     const existing = groups.get(itemId)
     if (!existing) {
       groups.set(itemId, {
         itemId,
         firstIndex: index,
-        totalAmount: amount,
+        primaryDescription: normalizedDesc,
+        totalAmount: quantity * unitCost,
         quantityAll: quantity,
-        quantityNonFee: feeLike ? 0 : quantity,
+        quantityPrimary: quantity,
         notes: line.notes?.trim() ? [line.notes.trim()] : [],
+        feeLines: [],
       })
       continue
     }
 
-    existing.totalAmount += amount
     existing.quantityAll += quantity
-    if (!feeLike) {
-      existing.quantityNonFee += quantity
-    }
-
-    const note = line.notes?.trim()
-    if (note && !existing.notes.includes(note)) {
-      existing.notes.push(note)
+    // Same description as the first line for this item → more of the same product, add quantity.
+    // Different description → it's a fee/surcharge line, save as sub-item.
+    if (normalizedDesc === existing.primaryDescription) {
+      existing.totalAmount += quantity * unitCost
+      existing.quantityPrimary += quantity
+      const note = line.notes?.trim()
+      if (note && !existing.notes.includes(note)) {
+        existing.notes.push(note)
+      }
+    } else {
+      existing.feeLines.push({
+        description: line.description,
+        quantity,
+        unitCost,
+        notes: line.notes?.trim() || line.description,
+      })
     }
   }
 
-  return Array.from(groups.values())
-    .sort((a, b) => a.firstIndex - b.firstIndex)
-    .map((group) => {
-      const quantity = group.quantityNonFee > 0 ? group.quantityNonFee : group.quantityAll
-      const unitCost = quantity > 0 ? group.totalAmount / quantity : 0
-      const note = group.notes.join(" | ").trim()
+  const mergedLines: MergedMappedImportLine[] = []
+  const feeLines: FeeLineForSave[] = []
 
-      return {
-        itemId: group.itemId,
-        quantity: Math.max(1, Math.round(quantity)),
-        unitCost: unitCost.toFixed(2),
-        notes: note,
-      }
+  for (const group of Array.from(groups.values()).sort((a, b) => a.firstIndex - b.firstIndex)) {
+    const quantity = group.quantityPrimary > 0 ? group.quantityPrimary : group.quantityAll
+    const unitCost = quantity > 0 ? group.totalAmount / quantity : 0
+    if (quantity <= 0 || unitCost <= 0) continue
+
+    mergedLines.push({
+      itemId: group.itemId,
+      quantity: Math.max(1, Math.round(quantity)),
+      unitCost: unitCost.toFixed(2),
+      notes: group.notes.join(" | ").trim(),
     })
-    .filter((line) => line.quantity > 0 && Number.parseFloat(line.unitCost) > 0)
+
+    for (const fee of group.feeLines) {
+      feeLines.push({
+        parentItemId: group.itemId,
+        itemId: group.itemId,
+        description: fee.description,
+        quantity: fee.quantity,
+        unitCost: fee.unitCost,
+        notes: fee.notes,
+      })
+    }
+  }
+
+  return { mergedLines, feeLines }
 }

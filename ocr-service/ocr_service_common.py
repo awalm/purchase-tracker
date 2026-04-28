@@ -32,7 +32,14 @@ def _apply_amazon_description_cleanup(
         return
     prefixes: list[str] = cfg.get("product_prefixes", [])
     colors: list[str] = cfg.get("color_variants", [])
-    scan_after: int = cfg.get("color_scan_lines_after", 10)
+    scan_after_cfg = cfg.get("color_scan_lines_after", 10)
+    try:
+        scan_after = int(scan_after_cfg)
+    except (TypeError, ValueError):
+        scan_after = 10
+    # Colors often appear several OCR lines after the base product title.
+    # Enforce a floor so small config values do not silently drop variants.
+    scan_after = max(scan_after, 10)
     if not prefixes:
         return
 
