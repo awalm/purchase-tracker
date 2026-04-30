@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { useParams, useNavigate, Link } from "react-router-dom"
 import { useQueryClient } from "@tanstack/react-query"
 import {
@@ -30,6 +30,10 @@ export default function ItemDetailPage() {
 
   const { data: item, isLoading: itemLoading } = useItem(id || "")
   const { data: receiptLines = [], isLoading: linesLoading } = useItemReceiptLines(id || "")
+
+  useEffect(() => {
+    document.title = item ? `${item.name} — BG Tracker` : "Item — BG Tracker"
+  }, [item?.name])
 
   // Edit / Transfer dialog state
   const [editDialogOpen, setEditDialogOpen] = useState(false)

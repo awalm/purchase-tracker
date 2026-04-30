@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useMemo, useEffect, useState } from "react"
 import { Link, useNavigate, useParams } from "react-router-dom"
 import {
   useVendor,
@@ -50,6 +50,11 @@ export default function VendorDetailPage() {
 
   const { data: vendor, isLoading: vendorLoading } = useVendor(vendorId)
   const { data: aliases = [], isLoading: aliasesLoading } = useVendorImportAliases(vendorId)
+
+  useEffect(() => {
+    document.title = vendor ? `${vendor.name} — BG Tracker` : "Vendor — BG Tracker"
+  }, [vendor?.name])
+
   const { data: purchases = [], isLoading: purchasesLoading } = usePurchases({
     vendor_id: vendorId,
     limit: 1000,

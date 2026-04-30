@@ -70,6 +70,10 @@ export default function InvoiceDetailPage() {
   const { data: receipts = [] } = useReceipts()
   const { data: vendors = [] } = useVendors()
   const invoiceLocked = invoice?.reconciliation_state === "locked"
+
+  useEffect(() => {
+    document.title = invoice ? `Invoice #${invoice.invoice_number} — BG Tracker` : "Invoice — BG Tracker"
+  }, [invoice?.invoice_number])
   const invoiceReopened = invoice?.reconciliation_state === "reopened"
 
   const createPurchase = useCreatePurchase()
@@ -373,6 +377,7 @@ export default function InvoiceDetailPage() {
   const [expandedAllocations, setExpandedAllocations] = useState<Record<string, boolean>>({})
   const [allocationApiUnavailable, setAllocationApiUnavailable] = useState(false)
   const [allocatableReceiptIds, setAllocatableReceiptIds] = useState<string[]>([])
+  const [allocatableReceiptInfo, setAllocatableReceiptInfo] = useState<Record<string, { available: number; total: number }>>({})
   const [loadingAllocatableReceipts, setLoadingAllocatableReceipts] = useState(false)
   const [autoAllocatingPurchaseId, setAutoAllocatingPurchaseId] = useState<string | null>(null)
   const [isAutoAllocatingAll, setIsAutoAllocatingAll] = useState(false)
@@ -590,7 +595,7 @@ export default function InvoiceDetailPage() {
     const sameItemRows = rows
       .filter((row) => {
         if (row.item_id !== purchase.item_id) return false
-        if (isRefundPurchase(purchase)) return row.state === "active" || row.state === "returned"
+        if (isRefundPurchase(purchase)) return row.state === "returned"
         return row.state === "active"
       })
       .sort((a, b) => b.remaining_qty - a.remaining_qty)
@@ -629,7 +634,7 @@ export default function InvoiceDetailPage() {
     setLoadingAllocatableReceipts(true)
 
     try {
-      const candidateIds = (
+      const candidateResults = (
         await Promise.all(
           receipts.map(async (receipt) => {
             if (!isReceiptDateEligibleForInvoice(receipt.receipt_date, allowReceiptDateOverride)) {
@@ -639,18 +644,27 @@ export default function InvoiceDetailPage() {
             const rows = await getReceiptLineItemsCached(receipt.id)
             const sameItemRows = rows.filter((row) => {
               if (row.item_id !== purchase.item_id) return false
-              if (isRefundPurchase(purchase)) return row.state === "active" || row.state === "returned"
+              if (isRefundPurchase(purchase)) return row.state === "returned"
               return row.state === "active"
             })
-            const hasAllocatableLine = sameItemRows.some(
-              (line) => getAllocationCapsForLine(line).maxAllocatable > 0
+            const totalQty = sameItemRows.reduce((sum, line) => sum + line.quantity, 0)
+            const availableQty = sameItemRows.reduce(
+              (sum, line) => sum + getAllocationCapsForLine(line).maxAllocatable, 0
             )
-            return hasAllocatableLine ? receipt.id : null
+            if (availableQty <= 0) return null
+            return { id: receipt.id, available: availableQty, total: totalQty }
           })
         )
-      ).filter((candidateId): candidateId is string => Boolean(candidateId))
+      ).filter((r): r is { id: string; available: number; total: number } => r !== null)
+
+      const candidateIds = candidateResults.map((r) => r.id)
+      const infoMap: Record<string, { available: number; total: number }> = {}
+      for (const r of candidateResults) {
+        infoMap[r.id] = { available: r.available, total: r.total }
+      }
 
       setAllocatableReceiptIds(candidateIds)
+      setAllocatableReceiptInfo(infoMap)
 
       if (candidateIds.length === 0) {
         setAllocationReceiptId("")
@@ -942,7 +956,10 @@ export default function InvoiceDetailPage() {
   }
 
   const isPurchaseEligibleForAutoAllocation = (purchase: InvoicePurchase) => {
-    if (purchase.purchase_type === "bonus" || purchase.quantity === 0) {
+    if (purchase.purchase_type === "bonus" || purchase.purchase_type === "refund" || purchase.quantity === 0) {
+      return false
+    }
+    if (purchase.quantity < 0) {
       return false
     }
 
@@ -1689,7 +1706,7 @@ export default function InvoiceDetailPage() {
                     </button>
                     )
                   )}
-                  {isPartiallyAllocated && !isFinalized && (
+                  {isPartiallyAllocated && !isFinalized && !isRefundPurchase(p) && (
                     <button
                       type="button"
                       onClick={() => void handleAutoAllocatePurchase(p)}
@@ -1737,6 +1754,7 @@ export default function InvoiceDetailPage() {
                     <AlertCircle className="h-3 w-3" />
                     unallocated
                   </button>
+                  {!isRefundPurchase(p) && (
                   <button
                     type="button"
                     onClick={() => void handleAutoAllocatePurchase(p)}
@@ -1756,6 +1774,7 @@ export default function InvoiceDetailPage() {
                       "auto allocate"
                     )}
                   </button>
+                  )}
                 </div>
               )
             )}
@@ -1890,12 +1909,31 @@ export default function InvoiceDetailPage() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {allocs.map((a) => (
+                      {allocs.map((a) => {
+                        const itemMismatch = a.item_name && a.item_name !== p.item_name
+                        return (
                         <TableRow key={a.id}>
                           <TableCell>
-                            <Link to={`/receipts/${a.receipt_id}`} className="text-primary hover:underline font-mono text-xs">
-                              {a.receipt_number}
-                            </Link>
+                            <div className="flex items-center gap-2">
+                              <Link to={`/receipts/${a.receipt_id}`} className="text-primary hover:underline font-mono text-xs">
+                                {a.receipt_number}
+                              </Link>
+                              {a.refunded_on_invoice && (
+                                <span className="inline-flex items-center rounded-full bg-red-50 px-1.5 py-0.5 text-[10px] font-medium text-red-700 ring-1 ring-inset ring-red-600/10">
+                                  REFUNDED
+                                </span>
+                              )}
+                            </div>
+                            {a.item_name && (
+                              <div className={`text-[10px] mt-0.5 ${itemMismatch ? "text-red-600 font-medium" : "text-muted-foreground/60"}`} title={itemMismatch ? `Item mismatch! Expected "${p.item_name}"` : "Receipt line item"}>
+                                {itemMismatch && "⚠ "}{a.item_name}
+                              </div>
+                            )}
+                            {a.refunded_on_invoice && (
+                              <div className="text-[10px] mt-0.5 text-red-600/70">
+                                Refunded — Inv {a.refunded_on_invoice}
+                              </div>
+                            )}
                           </TableCell>
                           <TableCell>{a.vendor_name}</TableCell>
                           <TableCell>{formatDate(a.receipt_date)}</TableCell>
@@ -1903,7 +1941,8 @@ export default function InvoiceDetailPage() {
                           <TableCell className="text-right">{formatCurrency(a.unit_cost)}</TableCell>
                           <TableCell className="text-right">{formatCurrency(Number(a.unit_cost) * a.allocated_qty)}</TableCell>
                         </TableRow>
-                      ))}
+                        )
+                      })}
                     </TableBody>
                   </Table>
                 </div>
@@ -3181,7 +3220,27 @@ export default function InvoiceDetailPage() {
                 <p className="text-sm text-muted-foreground">Loading allocations...</p>
               ) : allocations.length > 0 ? (
                 <div className="space-y-2">
-                  <Label>Current Allocations</Label>
+                  <div className="flex items-center justify-between">
+                    <Label>Current Allocations</Label>
+                    {allocations.length > 1 && !isFinalized && (
+                      <button
+                        type="button"
+                        className="text-[11px] text-red-600 hover:text-red-700 hover:underline"
+                        onClick={async () => {
+                          if (!linkingPurchaseId) return
+                          for (const a of allocations) {
+                            await purchasesApi.allocations.delete(linkingPurchaseId, a.id)
+                          }
+                          clearReceiptLineItemsCache()
+                          await reloadAllocations(linkingPurchaseId)
+                          queryClient.invalidateQueries({ queryKey: ["invoices"] })
+                          queryClient.invalidateQueries({ queryKey: ["receipts"] })
+                        }}
+                      >
+                        remove all
+                      </button>
+                    )}
+                  </div>
                   <div className="border rounded-md divide-y">
                     {allocations.map((a) => (
                       <div key={a.id} className="p-3 text-sm flex flex-wrap items-center justify-between gap-2 sm:flex-nowrap">
@@ -3255,11 +3314,14 @@ export default function InvoiceDetailPage() {
                     </SelectItem>
                     {receipts
                       .filter((r) => allocatableReceiptIds.includes(r.id))
-                      .map((r) => (
+                      .map((r) => {
+                      const info = allocatableReceiptInfo[r.id]
+                      return (
                       <SelectItem key={r.id} value={r.id}>
-                        {r.receipt_number} - {r.vendor_name} ({formatCurrency(r.total)})
+                        {r.receipt_number} - {r.vendor_name}{info ? ` — ${info.available}/${info.total} avail` : ""} ({formatCurrency(r.total)})
                       </SelectItem>
-                    ))}
+                      )
+                    })}
                   </SelectContent>
                 </Select>
                 {loadingAllocatableReceipts ? (
@@ -3372,6 +3434,7 @@ export default function InvoiceDetailPage() {
                     Reset
                   </Button>
                 )}
+                {linkingPurchase && !isRefundPurchase(linkingPurchase) && (
                 <Button
                   variant="outline"
                   onClick={() => linkingPurchase && void handleAutoAllocatePurchase(linkingPurchase, {
@@ -3393,6 +3456,7 @@ export default function InvoiceDetailPage() {
                     "Auto Allocate"
                   )}
                 </Button>
+                )}
                 <Button variant="outline" onClick={() => setLinkDialogOpen(false)}>Cancel</Button>
                 <Button
                   onClick={handleSaveAllocation}

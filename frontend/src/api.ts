@@ -732,9 +732,11 @@ export interface TaxReportPurchase {
   item_name: string;
   quantity: number;
   invoice_unit_price: string;
+  purchase_type: string;
   total_cost: string;
   total_revenue: string;
   commission: string;
+  bonus_revenue: string;
   hst_on_cost: string;
   hst_on_commission: string;
   allocations: TaxReportAllocation[];
@@ -746,6 +748,7 @@ export interface TaxReportInvoice {
   invoice_date: string;
   delivery_date: string | null;
   tax_rate: string;
+  hst_charged: string;
   total_cost: string;
   total_revenue: string;
   total_commission: string;
@@ -754,12 +757,28 @@ export interface TaxReportInvoice {
   purchases: TaxReportPurchase[];
 }
 
+export interface TaxReportLostItem {
+  receipt_id: string;
+  receipt_number: string;
+  receipt_date: string;
+  vendor_name: string;
+  item_name: string;
+  quantity: number;
+  unit_cost: string;
+  line_total: string;
+  tax_amount: string;
+}
+
 export interface TaxReportSummary {
   total_commission: string;
   total_hst_on_cost: string;
   total_hst_on_commission: string;
+  total_hst_charged: string;
   total_cost: string;
   total_revenue: string;
+  lost_items_cost: string;
+  lost_items_tax: string;
+  lost_items: TaxReportLostItem[];
   invoices: TaxReportInvoice[];
 }
 
@@ -1170,6 +1189,7 @@ export interface PurchaseAllocation {
   receipt_number: string;
   vendor_name: string;
   receipt_date: string;
+  refunded_on_invoice: string | null;
   created_at: string;
   updated_at: string;
 }

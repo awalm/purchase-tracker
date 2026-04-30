@@ -182,6 +182,7 @@ pub struct PurchaseAllocationWithReceipt {
     pub receipt_number: String,
     pub vendor_name: String,
     pub receipt_date: NaiveDate,
+    pub refunded_on_invoice: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -336,9 +337,12 @@ pub struct TaxReportFlatRow {
     pub invoice_date: NaiveDate,
     pub delivery_date: Option<NaiveDate>,
     pub tax_rate: Decimal,
+    pub invoice_tax_amount: Option<Decimal>,
     pub item_name: String,
     pub quantity: i32,
     pub invoice_unit_price: Decimal,
+    pub purchase_type: String,
+    pub bonus_for_purchase_id: Option<Uuid>,
     pub receipt_id: Option<Uuid>,
     pub receipt_number: Option<String>,
     pub receipt_date: Option<NaiveDate>,
@@ -364,9 +368,11 @@ pub struct TaxReportPurchase {
     pub item_name: String,
     pub quantity: i32,
     pub invoice_unit_price: Decimal,
+    pub purchase_type: String,
     pub total_cost: Decimal,
     pub total_revenue: Decimal,
     pub commission: Decimal,
+    pub bonus_revenue: Decimal,
     pub hst_on_cost: Decimal,
     pub hst_on_commission: Decimal,
     pub allocations: Vec<TaxReportAllocation>,
@@ -379,6 +385,7 @@ pub struct TaxReportInvoice {
     pub invoice_date: NaiveDate,
     pub delivery_date: Option<NaiveDate>,
     pub tax_rate: Decimal,
+    pub hst_charged: Decimal,
     pub total_cost: Decimal,
     pub total_revenue: Decimal,
     pub total_commission: Decimal,
@@ -388,12 +395,29 @@ pub struct TaxReportInvoice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxReportLostItem {
+    pub receipt_id: Uuid,
+    pub receipt_number: String,
+    pub receipt_date: NaiveDate,
+    pub vendor_name: String,
+    pub item_name: String,
+    pub quantity: i32,
+    pub unit_cost: Decimal,
+    pub line_total: Decimal,
+    pub tax_amount: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaxReportSummary {
     pub total_commission: Decimal,
     pub total_hst_on_cost: Decimal,
     pub total_hst_on_commission: Decimal,
+    pub total_hst_charged: Decimal,
     pub total_cost: Decimal,
     pub total_revenue: Decimal,
+    pub lost_items_cost: Decimal,
+    pub lost_items_tax: Decimal,
+    pub lost_items: Vec<TaxReportLostItem>,
     pub invoices: Vec<TaxReportInvoice>,
 }
 

@@ -819,16 +819,32 @@ WHERE parent_line_item_id IS NOT NULL
   AND line_type = 'item';
 
 -- Prevent allocations to adjustment/child receipt line items at DB level
+-- AND enforce that the receipt line item's item_id matches the purchase's item_id
 CREATE OR REPLACE FUNCTION trg_check_allocation_line_type()
 RETURNS TRIGGER AS $$
+DECLARE
+  v_rli_line_type TEXT;
+  v_rli_parent    UUID;
+  v_rli_item_id   UUID;
+  v_purchase_item_id UUID;
 BEGIN
   IF NEW.receipt_line_item_id IS NOT NULL THEN
-    IF EXISTS (
-      SELECT 1 FROM receipt_line_items
-      WHERE id = NEW.receipt_line_item_id
-        AND (line_type <> 'item' OR parent_line_item_id IS NOT NULL)
-    ) THEN
+    SELECT line_type, parent_line_item_id, item_id
+      INTO v_rli_line_type, v_rli_parent, v_rli_item_id
+      FROM receipt_line_items
+     WHERE id = NEW.receipt_line_item_id;
+
+    IF v_rli_line_type <> 'item' OR v_rli_parent IS NOT NULL THEN
       RAISE EXCEPTION 'Cannot allocate to adjustment or child receipt line items';
+    END IF;
+
+    SELECT item_id INTO v_purchase_item_id
+      FROM purchases
+     WHERE id = NEW.purchase_id;
+
+    IF v_rli_item_id IS DISTINCT FROM v_purchase_item_id THEN
+      RAISE EXCEPTION 'Allocation item mismatch: receipt line item (%) does not match purchase item (%)',
+        v_rli_item_id, v_purchase_item_id;
     END IF;
   END IF;
   RETURN NEW;
@@ -889,3 +905,17 @@ ALTER TABLE purchases
 
 ALTER TABLE purchases
   ADD COLUMN IF NOT EXISTS display_group VARCHAR(100);
+
+-- ============================================
+-- ADD 'lost' TO RECEIPT LINE ITEM STATE
+-- ============================================
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'chk_receipt_line_items_state'
+  ) THEN
+    ALTER TABLE receipt_line_items DROP CONSTRAINT chk_receipt_line_items_state;
+  END IF;
+  ALTER TABLE receipt_line_items ADD CONSTRAINT chk_receipt_line_items_state
+    CHECK (state IN ('active', 'returned', 'damaged', 'lost'));
+END $$;

@@ -1,4 +1,5 @@
 import { NavLink, useLocation } from "react-router-dom"
+import { useEffect } from "react"
 import { useAuth } from "@/AuthContext"
 import {
   LayoutDashboard,
@@ -38,6 +39,26 @@ const navItems = [
 export function Layout({ children }: { children: React.ReactNode }) {
   const { user, logout } = useAuth()
   const location = useLocation()
+
+  useEffect(() => {
+    const path = location.pathname
+    let title = "BG Tracker"
+    if (path === "/") title = "Dashboard — BG Tracker"
+    else if (path === "/receipts") title = "Receipts — BG Tracker"
+    else if (path.startsWith("/receipts/")) title = "Receipt — BG Tracker"
+    else if (path === "/invoices") title = "Invoices — BG Tracker"
+    else if (path.startsWith("/invoices/")) title = "Invoice — BG Tracker"
+    else if (path === "/purchases") title = "Purchases — BG Tracker"
+    else if (path === "/items") title = "Items — BG Tracker"
+    else if (path.startsWith("/items/")) title = "Item — BG Tracker"
+    else if (path === "/vendors") title = "Vendors — BG Tracker"
+    else if (path.startsWith("/vendors/")) title = "Vendor — BG Tracker"
+    else if (path === "/destinations") title = "Destinations — BG Tracker"
+    else if (path === "/reports/unreconciled") title = "Unreconciled — BG Tracker"
+    else if (path === "/reports/tax") title = "Tax Report — BG Tracker"
+    else if (path === "/options") title = "Options — BG Tracker"
+    document.title = title
+  }, [location.pathname])
 
   return (
     <div className="flex min-h-screen">

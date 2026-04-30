@@ -287,7 +287,7 @@ export default function ReceiptsPage() {
               { header: "Subtotal", accessor: (r) => r.subtotal },
               { header: "Tax Amount", accessor: (r) => r.tax_amount },
               { header: "Total", accessor: (r) => r.total },
-              { header: "Receipt Line Count", accessor: (r) => r.receipt_line_item_count },
+              { header: "Total Item Qty", accessor: (r) => r.receipt_line_item_count },
               { header: "Purchase Count", accessor: (r) => r.purchase_count },
               { header: "Purchases Total", accessor: (r) => r.purchases_total },
               { header: "Has Document", accessor: (r) => r.has_pdf ? "Yes" : "No" },
@@ -429,7 +429,13 @@ export default function ReceiptsPage() {
                 const source = r.ingestion_metadata?.source || "manual"
                 const isAutoParsed = r.ingestion_metadata?.auto_parsed === true
                 return (
-                  <TableRow key={r.id} className="cursor-pointer hover:bg-muted/50" onClick={() => navigate(`/receipts/${r.id}`)}>
+                  <TableRow key={r.id} className="cursor-pointer hover:bg-muted/50" onClick={(e) => {
+                    if (e.ctrlKey || e.metaKey || e.button === 1) {
+                      window.open(`/receipts/${r.id}`, '_blank')
+                    } else {
+                      navigate(`/receipts/${r.id}`)
+                    }
+                  }}>
                     <TableCell>{formatDate(r.receipt_date)}</TableCell>
                     <TableCell className="font-mono font-medium">{r.receipt_number}</TableCell>
                     <TableCell>{r.vendor_name}</TableCell>

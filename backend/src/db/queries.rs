@@ -783,8 +783,10 @@ pub async fn get_destination_summary(
             SELECT
                 vac.purchase_id,
                 COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
-                COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+                COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost,
+                SUM(vac.effective_allocated_cost * r.tax_amount / NULLIF(r.subtotal, 0)) AS allocated_tax_paid
             FROM v_allocation_costs vac
+            JOIN receipts r ON r.id = vac.receipt_id
             GROUP BY vac.purchase_id
         ),
         finalized_purchases AS (
@@ -795,15 +797,23 @@ pub async fn get_destination_summary(
                 p.invoice_unit_price,
                 inv.tax_rate,
                 CASE
-                    WHEN at.allocated_qty = p.quantity
+                    WHEN at.allocated_qty = ABS(p.quantity)
                          AND at.allocated_qty > 0
-                         AND p.quantity > 0
-                    THEN at.allocated_total_cost / p.quantity::numeric
+                         AND p.quantity != 0
+                    THEN at.allocated_total_cost / ABS(p.quantity)::numeric
                     ELSE (p.purchase_cost + p.cost_adjustment)
-                END AS effective_purchase_cost
+                END AS effective_purchase_cost,
+                CASE
+                    WHEN at.allocated_qty = ABS(p.quantity)
+                         AND at.allocated_qty > 0
+                         AND p.quantity != 0
+                    THEN (CASE WHEN p.quantity < 0 THEN -1 ELSE 1 END) * COALESCE(at.allocated_tax_paid, 0)
+                    ELSE p.quantity * (p.purchase_cost + p.cost_adjustment) * COALESCE(r_direct.tax_amount / NULLIF(r_direct.subtotal, 0), inv.tax_rate / 100.0)
+                END AS receipt_tax_paid
             FROM purchases p
             JOIN invoices inv ON inv.id = p.invoice_id
             LEFT JOIN allocation_totals at ON at.purchase_id = p.id
+            LEFT JOIN receipts r_direct ON r_direct.id = p.receipt_id
             WHERE p.invoice_id IS NOT NULL
               AND p.invoice_unit_price IS NOT NULL
               AND p.destination_id IS NOT NULL
@@ -819,8 +829,8 @@ pub async fn get_destination_summary(
             (SELECT COALESCE(SUM(fp.quantity * fp.effective_purchase_cost), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_cost?",
             (SELECT COALESCE(SUM(fp.quantity * fp.invoice_unit_price), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_revenue?",
             (SELECT COALESCE(SUM(fp.quantity * (fp.invoice_unit_price - fp.effective_purchase_cost)), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_commission?",
-            (SELECT COALESCE(SUM(fp.quantity * fp.effective_purchase_cost * (fp.tax_rate / 100.0)), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_tax_paid?",
-            (SELECT COALESCE(SUM(fp.quantity * (fp.invoice_unit_price - fp.effective_purchase_cost) * (fp.tax_rate / 100.0)), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_tax_owed?"
+            (SELECT COALESCE(SUM(fp.receipt_tax_paid), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_tax_paid?",
+            (SELECT COALESCE(SUM(fp.quantity * fp.invoice_unit_price * (fp.tax_rate / 100.0) - fp.receipt_tax_paid), 0) FROM finalized_purchases fp WHERE fp.destination_id = d.id) as "total_tax_owed?"
         FROM destinations d
         ORDER BY d.code"#
     )
@@ -881,10 +891,10 @@ pub async fn get_active_items(pool: &PgPool) -> Result<Vec<ActiveItem>, sqlx::Er
                    p.item_id,
                    p.quantity,
                    CASE
-                       WHEN alloc.allocated_qty = p.quantity
+                       WHEN alloc.allocated_qty = ABS(p.quantity)
                             AND alloc.allocated_qty > 0
-                            AND p.quantity > 0
-                       THEN alloc.allocated_total_cost / p.quantity::numeric
+                            AND p.quantity != 0
+                       THEN alloc.allocated_total_cost / ABS(p.quantity)::numeric
                        ELSE (p.purchase_cost + p.cost_adjustment)
                    END AS effective_purchase_cost,
                    p.invoice_unit_price,
@@ -1705,10 +1715,10 @@ pub async fn get_invoice_with_destination(
                                      p.quantity,
                                      p.invoice_unit_price,
                                      CASE
-                                         WHEN at.allocated_qty = p.quantity
+                                         WHEN at.allocated_qty = ABS(p.quantity)
                                               AND at.allocated_qty > 0
-                                              AND p.quantity > 0
-                                         THEN at.allocated_total_cost / p.quantity::numeric
+                                              AND p.quantity != 0
+                                         THEN at.allocated_total_cost / ABS(p.quantity)::numeric
                                          ELSE (p.purchase_cost + p.cost_adjustment)
                                      END AS effective_purchase_cost
                              FROM purchases p
@@ -1774,10 +1784,10 @@ pub async fn get_invoices_with_destination(
                                      p.quantity,
                                      p.invoice_unit_price,
                                      CASE
-                                         WHEN at.allocated_qty = p.quantity
+                                         WHEN at.allocated_qty = ABS(p.quantity)
                                               AND at.allocated_qty > 0
-                                              AND p.quantity > 0
-                                         THEN at.allocated_total_cost / p.quantity::numeric
+                                              AND p.quantity != 0
+                                         THEN at.allocated_total_cost / ABS(p.quantity)::numeric
                                          ELSE (p.purchase_cost + p.cost_adjustment)
                                      END AS effective_purchase_cost
                              FROM purchases p
@@ -1834,8 +1844,10 @@ pub async fn get_purchases_by_invoice(
                    vac.purchase_id,
                    (ARRAY_AGG(DISTINCT vac.receipt_id))[1] AS any_receipt_id,
                    COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
-                   COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+                   COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost,
+                   SUM(vac.effective_allocated_cost * r.tax_amount / NULLIF(r.subtotal, 0)) AS allocated_tax_paid
                FROM v_allocation_costs vac
+               JOIN receipts r ON r.id = vac.receipt_id
                GROUP BY vac.purchase_id
            ),
            bonus_sums AS (
@@ -1868,17 +1880,25 @@ pub async fn get_purchases_by_invoice(
                    p.cost_adjustment,
                    p.adjustment_note,
                    CASE
-                       WHEN alloc.allocated_qty = p.quantity
+                       WHEN alloc.allocated_qty = ABS(p.quantity)
                             AND alloc.allocated_qty > 0
-                            AND p.quantity > 0
-                       THEN alloc.allocated_total_cost / p.quantity::numeric
+                            AND p.quantity != 0
+                       THEN alloc.allocated_total_cost / ABS(p.quantity)::numeric
                        ELSE (p.purchase_cost + p.cost_adjustment)
                    END AS effective_purchase_cost,
+                   CASE
+                       WHEN alloc.allocated_qty = ABS(p.quantity)
+                            AND alloc.allocated_qty > 0
+                            AND p.quantity != 0
+                       THEN (CASE WHEN p.quantity < 0 THEN -1 ELSE 1 END) * COALESCE(alloc.allocated_tax_paid, 0)
+                       ELSE p.quantity * (p.purchase_cost + p.cost_adjustment) * COALESCE(r_direct.tax_amount / NULLIF(r_direct.subtotal, 0), inv.tax_rate / 100.0)
+                   END AS receipt_tax_paid,
                    COALESCE(bs.bonus_selling, 0) AS bonus_selling
                FROM purchases p
                LEFT JOIN allocation_summary alloc ON alloc.purchase_id = p.id
                LEFT JOIN bonus_sums bs ON bs.parent_id = p.id
                LEFT JOIN invoices inv ON inv.id = p.invoice_id
+               LEFT JOIN receipts r_direct ON r_direct.id = p.receipt_id
                WHERE p.invoice_id = $1
            )
            SELECT
@@ -1914,14 +1934,13 @@ pub async fn get_purchases_by_invoice(
                    ELSE (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
                         + pr.bonus_selling
                END AS total_commission,
-               (pr.quantity * pr.effective_purchase_cost * (pr.tax_rate / 100.0)) AS tax_paid,
+               pr.receipt_tax_paid AS tax_paid,
                CASE
                    WHEN pr.bonus_for_purchase_id IS NOT NULL THEN 0::numeric
                    WHEN pr.purchase_type = 'bonus'
                        THEN (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) * (pr.tax_rate / 100.0))
                    WHEN pr.effective_purchase_cost = 0 THEN NULL
-                   ELSE ((pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
-                        + pr.bonus_selling) * (pr.tax_rate / 100.0)
+                   ELSE ((pr.quantity * pr.invoice_unit_price) + pr.bonus_selling) * (pr.tax_rate / 100.0) - pr.receipt_tax_paid
                END AS tax_owed,
                pr.status AS "status!: DeliveryStatus",
                pr.delivery_date,
@@ -2022,6 +2041,18 @@ pub async fn get_purchase_allocations(
             r.receipt_number,
             v.name as vendor_name,
             r.receipt_date,
+            (
+                SELECT inv.invoice_number
+                FROM receipt_line_items sib
+                JOIN purchase_allocations spa ON spa.receipt_line_item_id = sib.id
+                JOIN purchases sp ON sp.id = spa.purchase_id
+                LEFT JOIN invoices inv ON inv.id = sp.invoice_id
+                WHERE sib.receipt_id = pa.receipt_id
+                  AND sib.item_id = rli.item_id
+                  AND sib.state = 'returned'
+                  AND (sp.purchase_type = 'refund' OR sp.quantity < 0)
+                LIMIT 1
+            ) as refunded_on_invoice,
             pa.created_at,
             pa.updated_at
         FROM purchase_allocations pa
@@ -2110,9 +2141,9 @@ pub async fn create_purchase_allocation(
     }
 
     if is_refund_purchase {
-        if receipt_line.state == "damaged" {
+        if receipt_line.state != "returned" {
             return Err(PurchaseAllocationError::Validation(
-                "Cannot allocate to a damaged receipt line item.".to_string(),
+                format!("Refund purchases can only be allocated to returned receipt lines (got '{}').", receipt_line.state),
             ));
         }
     } else if receipt_line.state != "active" {
@@ -2297,9 +2328,9 @@ let is_refund_purchase = purchase.purchase_type == "refund" || purchase.quantity
     let required_purchase_qty = purchase.quantity.abs();
 
     if is_refund_purchase {
-        if receipt_line.state == "damaged" {
+        if receipt_line.state != "returned" {
             return Err(PurchaseAllocationError::Validation(
-                "Cannot allocate to a damaged receipt line item.".to_string(),
+                format!("Refund purchases can only be allocated to returned receipt lines (got '{}').", receipt_line.state),
             ));
         }
     } else if receipt_line.state != "active" {
@@ -2509,9 +2540,9 @@ pub async fn create_receipt_line_item(
     .await?;
 
     let state = data.state.as_deref().unwrap_or("active");
-    if !["active", "returned", "damaged"].contains(&state) {
+    if !["active", "returned", "damaged", "lost"].contains(&state) {
         return Err(PurchaseAllocationError::Validation(
-            format!("Invalid state: {}. Must be active, returned, or damaged.", state),
+            format!("Invalid state: {}. Must be active, returned, damaged, or lost.", state),
         ));
     }
 
@@ -2585,9 +2616,9 @@ pub async fn update_receipt_line_item(
     let next_notes = data.notes.or(current.notes);
     let next_state = data.state.unwrap_or(current.state);
 
-    if !["active", "returned", "damaged"].contains(&next_state.as_str()) {
+    if !["active", "returned", "damaged", "lost"].contains(&next_state.as_str()) {
         return Err(PurchaseAllocationError::Validation(
-            format!("Invalid state: {}. Must be active, returned, or damaged.", next_state),
+            format!("Invalid state: {}. Must be active, returned, damaged, or lost.", next_state),
         ));
     }
 
@@ -2605,7 +2636,7 @@ pub async fn update_receipt_line_item(
 
         if alloc_count > 0 {
             return Err(PurchaseAllocationError::Validation(
-                "Cannot mark as returned/damaged while allocations exist. Remove allocations first.".to_string(),
+                "Cannot mark as returned/damaged/lost while allocations exist. Remove allocations first.".to_string(),
             ));
         }
     }
@@ -2816,6 +2847,13 @@ pub async fn auto_allocate_purchase(
         ));
     }
 
+    let is_refund_purchase = purchase.purchase_type == "refund" || purchase.quantity < 0;
+    if is_refund_purchase {
+        return Err(PurchaseAllocationError::Validation(
+            "Refund purchases cannot be auto-allocated. Use manual allocation to link to a returned receipt line.".to_string(),
+        ));
+    }
+
     let effective_allow_receipt_date_override =
         allow_receipt_date_override || purchase.allow_receipt_date_override;
     let invoice_date_cutoff = if effective_allow_receipt_date_override {
@@ -2823,8 +2861,7 @@ pub async fn auto_allocate_purchase(
     } else {
         purchase.invoice_date
     };
-    let is_refund_purchase = purchase.purchase_type == "refund" || purchase.quantity < 0;
-    let target_receipt_state = if is_refund_purchase { None } else { Some("active") };
+    let target_receipt_state = Some("active");
     let required_purchase_qty = purchase.quantity.abs();
 
     let existing_allocations = sqlx::query!(
@@ -2866,7 +2903,7 @@ pub async fn auto_allocate_purchase(
             WHERE rli.item_id = $2
                             AND rli.line_type = 'item'
                             AND rli.parent_line_item_id IS NULL
-                            AND rli.state != 'damaged'
+                            AND rli.state NOT IN ('damaged', 'lost')
                             AND ($4::text IS NULL OR rli.state = $4)
                             AND ($3::date IS NULL OR r.receipt_date <= $3)
             GROUP BY rli.id, rli.receipt_id, rli.quantity, rli.unit_cost, r.receipt_date, r.created_at
@@ -3820,8 +3857,10 @@ pub async fn get_purchase_economics(
                    vac.purchase_id,
                    (ARRAY_AGG(DISTINCT vac.receipt_id))[1] AS any_receipt_id,
                    COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
-                   COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+                   COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost,
+                   SUM(vac.effective_allocated_cost * r.tax_amount / NULLIF(r.subtotal, 0)) AS allocated_tax_paid
                FROM v_allocation_costs vac
+               JOIN receipts r ON r.id = vac.receipt_id
                GROUP BY vac.purchase_id
            ),
            bonus_sums AS (
@@ -3855,17 +3894,25 @@ pub async fn get_purchase_economics(
                    inv.reconciliation_state,
                    inv.tax_rate,
                    CASE
-                       WHEN alloc.allocated_qty = p.quantity
+                       WHEN alloc.allocated_qty = ABS(p.quantity)
                             AND alloc.allocated_qty > 0
-                            AND p.quantity > 0
-                       THEN alloc.allocated_total_cost / p.quantity::numeric
+                            AND p.quantity != 0
+                       THEN alloc.allocated_total_cost / ABS(p.quantity)::numeric
                        ELSE (p.purchase_cost + p.cost_adjustment)
                    END AS effective_purchase_cost,
+                   CASE
+                       WHEN alloc.allocated_qty = ABS(p.quantity)
+                            AND alloc.allocated_qty > 0
+                            AND p.quantity != 0
+                       THEN (CASE WHEN p.quantity < 0 THEN -1 ELSE 1 END) * COALESCE(alloc.allocated_tax_paid, 0)
+                       ELSE p.quantity * (p.purchase_cost + p.cost_adjustment) * COALESCE(r_direct.tax_amount / NULLIF(r_direct.subtotal, 0), inv.tax_rate / 100.0)
+                   END AS receipt_tax_paid,
                    COALESCE(bs.bonus_selling, 0) AS bonus_selling
                FROM purchases p
                LEFT JOIN allocation_summary alloc ON alloc.purchase_id = p.id
                LEFT JOIN bonus_sums bs ON bs.parent_id = p.id
                LEFT JOIN invoices inv ON inv.id = p.invoice_id
+               LEFT JOIN receipts r_direct ON r_direct.id = p.receipt_id
            )
            SELECT
                pr.purchase_id AS "purchase_id!",
@@ -3925,7 +3972,7 @@ pub async fn get_purchase_economics(
                    END
                    ELSE NULL
                END AS total_commission,
-               (pr.quantity * pr.effective_purchase_cost * (pr.tax_rate / 100.0)) AS tax_paid,
+               pr.receipt_tax_paid AS tax_paid,
                CASE
                    WHEN pr.invoice_id IS NOT NULL
                         AND pr.invoice_unit_price IS NOT NULL
@@ -3937,8 +3984,7 @@ pub async fn get_purchase_economics(
                        WHEN pr.purchase_type = 'bonus'
                            THEN (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) * (pr.tax_rate / 100.0))
                        WHEN pr.effective_purchase_cost = 0 THEN NULL
-                       ELSE ((pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
-                            + pr.bonus_selling) * (pr.tax_rate / 100.0)
+                       ELSE ((pr.quantity * pr.invoice_unit_price) + pr.bonus_selling) * (pr.tax_rate / 100.0) - pr.receipt_tax_paid
                    END
                    ELSE NULL
                END AS tax_owed,
@@ -4461,7 +4507,7 @@ pub async fn get_receipt_with_vendor(
             r.notes,
             r.created_at,
             r.updated_at,
-            (SELECT COUNT(*)::BIGINT FROM receipt_line_items rli WHERE rli.receipt_id = r.id) AS "receipt_line_item_count!",
+            (SELECT COALESCE(SUM(rli.quantity), 0)::BIGINT FROM receipt_line_items rli WHERE rli.receipt_id = r.id) AS "receipt_line_item_count!",
                         COUNT(DISTINCT p.id) AS purchase_count,
                         COALESCE(SUM(vac.effective_allocated_cost), 0)
                             + COALESCE(SUM(CASE WHEN vac.allocation_id IS NULL THEN p.quantity * p.purchase_cost ELSE 0 END), 0) AS purchases_total,
@@ -4506,7 +4552,7 @@ pub async fn get_receipts_with_vendor(
             r.notes,
             r.created_at,
             r.updated_at,
-            (SELECT COUNT(*)::BIGINT FROM receipt_line_items rli WHERE rli.receipt_id = r.id) AS "receipt_line_item_count!",
+            (SELECT COALESCE(SUM(rli.quantity), 0)::BIGINT FROM receipt_line_items rli WHERE rli.receipt_id = r.id) AS "receipt_line_item_count!",
                         COUNT(DISTINCT p.id) AS purchase_count,
                         COALESCE(SUM(vac.effective_allocated_cost), 0)
                             + COALESCE(SUM(CASE WHEN vac.allocation_id IS NULL THEN p.quantity * p.purchase_cost ELSE 0 END), 0) AS purchases_total,
@@ -4552,8 +4598,9 @@ pub async fn get_purchases_by_receipt(
                    (COALESCE(p.invoice_unit_price, vac.effective_unit_cost) - vac.effective_unit_cost) AS unit_commission,
                    (vac.allocated_qty * (COALESCE(p.invoice_unit_price, vac.effective_unit_cost) - vac.effective_unit_cost)) AS total_commission,
                    inv.tax_rate,
-                   vac.effective_allocated_cost * (inv.tax_rate / 100.0) AS tax_paid,
-                   (vac.allocated_qty * (COALESCE(p.invoice_unit_price, vac.effective_unit_cost) - vac.effective_unit_cost) * (inv.tax_rate / 100.0)) AS tax_owed,
+                   vac.effective_allocated_cost * COALESCE(r.tax_amount / NULLIF(r.subtotal, 0), inv.tax_rate / 100.0) AS tax_paid,
+                   (vac.allocated_qty * COALESCE(p.invoice_unit_price, vac.effective_unit_cost) * COALESCE(inv.tax_rate / 100.0, 0))
+                       - (vac.effective_allocated_cost * COALESCE(r.tax_amount / NULLIF(r.subtotal, 0), inv.tax_rate / 100.0)) AS tax_owed,
                    p.status,
                    p.delivery_date,
                    p.invoice_id,
@@ -4601,8 +4648,9 @@ pub async fn get_purchases_by_receipt(
                    (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) AS unit_commission,
                    (p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost)) AS total_commission,
                    inv.tax_rate,
-                   (p.quantity * p.purchase_cost * (inv.tax_rate / 100.0)) AS tax_paid,
-                   (p.quantity * (COALESCE(p.invoice_unit_price, p.purchase_cost) - p.purchase_cost) * (inv.tax_rate / 100.0)) AS tax_owed,
+                   (p.quantity * p.purchase_cost * COALESCE(r.tax_amount / NULLIF(r.subtotal, 0), inv.tax_rate / 100.0)) AS tax_paid,
+                   (p.quantity * COALESCE(p.invoice_unit_price, p.purchase_cost) * COALESCE(inv.tax_rate / 100.0, 0))
+                       - (p.quantity * p.purchase_cost * COALESCE(r.tax_amount / NULLIF(r.subtotal, 0), inv.tax_rate / 100.0)) AS tax_owed,
                    p.status,
                    p.delivery_date,
                    p.invoice_id,
@@ -4691,8 +4739,10 @@ pub async fn get_purchases_by_item(
                    vac.purchase_id,
                    (ARRAY_AGG(DISTINCT vac.receipt_id))[1] AS any_receipt_id,
                    COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
-                   COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+                   COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost,
+                   SUM(vac.effective_allocated_cost * r.tax_amount / NULLIF(r.subtotal, 0)) AS allocated_tax_paid
                FROM v_allocation_costs vac
+               JOIN receipts r ON r.id = vac.receipt_id
                GROUP BY vac.purchase_id
            ),
            bonus_sums AS (
@@ -4723,17 +4773,25 @@ pub async fn get_purchases_by_item(
                    p.cost_adjustment,
                    p.adjustment_note,
                    CASE
-                       WHEN alloc.allocated_qty = p.quantity
+                       WHEN alloc.allocated_qty = ABS(p.quantity)
                             AND alloc.allocated_qty > 0
-                            AND p.quantity > 0
-                       THEN alloc.allocated_total_cost / p.quantity::numeric
+                            AND p.quantity != 0
+                       THEN alloc.allocated_total_cost / ABS(p.quantity)::numeric
                        ELSE (p.purchase_cost + p.cost_adjustment)
                    END AS effective_purchase_cost,
+                   CASE
+                       WHEN alloc.allocated_qty = ABS(p.quantity)
+                            AND alloc.allocated_qty > 0
+                            AND p.quantity != 0
+                       THEN (CASE WHEN p.quantity < 0 THEN -1 ELSE 1 END) * COALESCE(alloc.allocated_tax_paid, 0)
+                       ELSE p.quantity * (p.purchase_cost + p.cost_adjustment) * COALESCE(r_direct.tax_amount / NULLIF(r_direct.subtotal, 0), inv.tax_rate / 100.0)
+                   END AS receipt_tax_paid,
                    COALESCE(bs.bonus_selling, 0) AS bonus_selling
                FROM purchases p
                LEFT JOIN allocation_summary alloc ON alloc.purchase_id = p.id
                LEFT JOIN bonus_sums bs ON bs.parent_id = p.id
                LEFT JOIN invoices inv ON inv.id = p.invoice_id
+               LEFT JOIN receipts r_direct ON r_direct.id = p.receipt_id
                              WHERE p.item_id = $1
                                  AND (
                                          p.invoice_id IS NOT NULL
@@ -4774,14 +4832,13 @@ pub async fn get_purchases_by_item(
                    ELSE (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
                         + pr.bonus_selling
                END AS total_commission,
-               (pr.quantity * pr.effective_purchase_cost * (pr.tax_rate / 100.0)) AS tax_paid,
+               pr.receipt_tax_paid AS tax_paid,
                CASE
                    WHEN pr.bonus_for_purchase_id IS NOT NULL THEN 0::numeric
                    WHEN pr.purchase_type = 'bonus'
                        THEN (pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost) * (pr.tax_rate / 100.0))
                    WHEN pr.effective_purchase_cost = 0 THEN NULL
-                   ELSE ((pr.quantity * (COALESCE(pr.invoice_unit_price, pr.effective_purchase_cost) - pr.effective_purchase_cost))
-                        + pr.bonus_selling) * (pr.tax_rate / 100.0)
+                   ELSE ((pr.quantity * pr.invoice_unit_price) + pr.bonus_selling) * (pr.tax_rate / 100.0) - pr.receipt_tax_paid
                END AS tax_owed,
                pr.status AS "status!: DeliveryStatus",
                pr.delivery_date,
@@ -4909,9 +4966,12 @@ pub async fn get_tax_report(
             inv.invoice_date AS "invoice_date!",
             inv.delivery_date AS "delivery_date?",
             inv.tax_rate AS "tax_rate!",
+            inv.tax_amount AS "invoice_tax_amount?",
             i.name AS "item_name!",
             p.quantity AS "quantity!",
             p.invoice_unit_price AS "invoice_unit_price!",
+            p.purchase_type AS "purchase_type!",
+            p.bonus_for_purchase_id AS "bonus_for_purchase_id?",
             vac.receipt_id AS "receipt_id?",
             r.receipt_number AS "receipt_number?",
             r.receipt_date AS "receipt_date?",
@@ -4941,6 +5001,53 @@ pub async fn get_tax_report(
     .await
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct LostItemRow {
+    pub receipt_id: Uuid,
+    pub receipt_number: String,
+    pub receipt_date: NaiveDate,
+    pub vendor_name: String,
+    pub item_name: String,
+    pub quantity: i32,
+    pub unit_cost: Decimal,
+    pub line_total: Decimal,
+    pub tax_amount: Decimal,
+}
+
+pub async fn get_lost_items_for_tax_report(
+    pool: &PgPool,
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+) -> Result<Vec<LostItemRow>, sqlx::Error> {
+    sqlx::query_as!(
+        LostItemRow,
+        r#"SELECT
+            r.id AS "receipt_id!",
+            r.receipt_number AS "receipt_number!",
+            r.receipt_date AS "receipt_date!",
+            v.name AS "vendor_name!",
+            i.name AS "item_name!",
+            rli.quantity AS "quantity!",
+            rli.unit_cost AS "unit_cost!",
+            (rli.quantity * rli.unit_cost) AS "line_total!",
+            (rli.quantity * rli.unit_cost * r.tax_amount / NULLIF(r.subtotal, 0)) AS "tax_amount!"
+        FROM receipt_line_items rli
+        JOIN receipts r ON r.id = rli.receipt_id
+        JOIN vendors v ON v.id = r.vendor_id
+        JOIN items i ON i.id = rli.item_id
+        WHERE rli.state = 'lost'
+          AND rli.line_type = 'item'
+          AND rli.parent_line_item_id IS NULL
+          AND ($1::date IS NULL OR r.receipt_date >= $1)
+          AND ($2::date IS NULL OR r.receipt_date <= $2)
+        ORDER BY r.receipt_date, i.name"#,
+        from,
+        to,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn get_profit_report(
     pool: &PgPool,
     from: Option<NaiveDate>,
@@ -4952,8 +5059,10 @@ pub async fn get_profit_report(
                         SELECT
                             vac.purchase_id,
                             COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
-                            COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost
+                            COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost,
+                            SUM(vac.effective_allocated_cost * r.tax_amount / NULLIF(r.subtotal, 0)) AS allocated_tax_paid
                         FROM v_allocation_costs vac
+                        JOIN receipts r ON r.id = vac.receipt_id
                         GROUP BY vac.purchase_id
                 ),
                 finalized_purchases AS (
@@ -4964,15 +5073,23 @@ pub async fn get_profit_report(
                                 p.invoice_unit_price,
                                 inv.tax_rate,
                                 CASE
-                                    WHEN at.allocated_qty = p.quantity
+                                    WHEN at.allocated_qty = ABS(p.quantity)
                                          AND at.allocated_qty > 0
-                                         AND p.quantity > 0
-                                    THEN at.allocated_total_cost / p.quantity::numeric
+                                         AND p.quantity != 0
+                                    THEN at.allocated_total_cost / ABS(p.quantity)::numeric
                                     ELSE (p.purchase_cost + p.cost_adjustment)
-                                END AS effective_purchase_cost
+                                END AS effective_purchase_cost,
+                                CASE
+                                    WHEN at.allocated_qty = ABS(p.quantity)
+                                         AND at.allocated_qty > 0
+                                         AND p.quantity != 0
+                                    THEN (CASE WHEN p.quantity < 0 THEN -1 ELSE 1 END) * COALESCE(at.allocated_tax_paid, 0)
+                                    ELSE p.quantity * (p.purchase_cost + p.cost_adjustment) * COALESCE(r_direct.tax_amount / NULLIF(r_direct.subtotal, 0), inv.tax_rate / 100.0)
+                                END AS receipt_tax_paid
                         FROM purchases p
                         JOIN invoices inv ON inv.id = p.invoice_id
                         LEFT JOIN allocation_totals at ON at.purchase_id = p.id
+                        LEFT JOIN receipts r_direct ON r_direct.id = p.receipt_id
                         WHERE p.invoice_id IS NOT NULL
                             AND p.invoice_unit_price IS NOT NULL
                             AND p.destination_id IS NOT NULL
@@ -4982,8 +5099,8 @@ pub async fn get_profit_report(
                         SUM(quantity * effective_purchase_cost) as total_cost,
                         SUM(quantity * invoice_unit_price) as total_revenue,
                         SUM(quantity * (invoice_unit_price - effective_purchase_cost)) as total_commission,
-                        SUM(quantity * effective_purchase_cost * (tax_rate / 100.0)) as total_tax_paid,
-                        SUM(quantity * (invoice_unit_price - effective_purchase_cost) * (tax_rate / 100.0)) as total_tax_owed,
+                        SUM(receipt_tax_paid) as total_tax_paid,
+                        SUM(quantity * invoice_unit_price * (tax_rate / 100.0) - receipt_tax_paid) as total_tax_owed,
                         COUNT(*) as purchase_count,
                         COUNT(DISTINCT purchase_id) as item_count
                 FROM finalized_purchases
@@ -4993,6 +5110,47 @@ pub async fn get_profit_report(
         to
     )
     .fetch_one(pool)
+    .await
+}
+
+// ============================================
+// DATA INTEGRITY CHECKS
+// ============================================
+
+#[derive(Debug, serde::Serialize)]
+pub struct AllocationItemMismatch {
+    pub allocation_id: Uuid,
+    pub purchase_id: Uuid,
+    pub purchase_item_name: String,
+    pub receipt_line_item_name: String,
+    pub receipt_number: String,
+    pub allocated_qty: i32,
+}
+
+/// Detect allocations where the purchase item_id does not match
+/// the receipt line item's item_id. These are data integrity violations.
+pub async fn check_allocation_item_integrity(
+    pool: &PgPool,
+) -> Result<Vec<AllocationItemMismatch>, sqlx::Error> {
+    sqlx::query_as!(
+        AllocationItemMismatch,
+        r#"SELECT
+            pa.id AS allocation_id,
+            pa.purchase_id,
+            pi.name AS purchase_item_name,
+            ri.name AS receipt_line_item_name,
+            r.receipt_number,
+            pa.allocated_qty
+        FROM purchase_allocations pa
+        JOIN purchases p ON p.id = pa.purchase_id
+        JOIN items pi ON pi.id = p.item_id
+        JOIN receipt_line_items rli ON rli.id = pa.receipt_line_item_id
+        JOIN items ri ON ri.id = rli.item_id
+        JOIN receipts r ON r.id = pa.receipt_id
+        WHERE pi.id != ri.id
+        ORDER BY r.receipt_number, pi.name"#
+    )
+    .fetch_all(pool)
     .await
 }
 

@@ -41,6 +41,7 @@ pub fn router() -> Router<AppState> {
         .route("/vendors", get(get_by_vendor))
         .route("/unreconciled-items", get(get_unreconciled_items))
         .route("/tax", get(get_tax_report))
+        .route("/integrity", get(get_integrity_check))
 }
 
 async fn get_summary(
@@ -232,23 +233,35 @@ async fn get_tax_report(
             }),
         ))?;
 
-    let summary = build_tax_report_hierarchy(rows);
+    let lost_rows = queries::get_lost_items_for_tax_report(&state.pool, query.from, query.to)
+        .await
+        .map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(TaxValidationError {
+                error: format!("Database error: {}", e),
+                missing_tax_rates: vec![],
+            }),
+        ))?;
+
+    let summary = build_tax_report_hierarchy(rows, lost_rows);
     Ok(Json(summary))
 }
 
-fn build_tax_report_hierarchy(rows: Vec<TaxReportFlatRow>) -> TaxReportSummary {
+fn build_tax_report_hierarchy(rows: Vec<TaxReportFlatRow>, lost_rows: Vec<queries::LostItemRow>) -> TaxReportSummary {
     // Group: invoice_id → purchase_id → allocations
     // Use IndexMap to preserve insertion order (which matches the SQL ORDER BY)
     let mut invoice_map: IndexMap<Uuid, TaxReportInvoice> = IndexMap::new();
 
-    // Track purchases we've already seen to avoid double-counting
     struct PurchaseAccum {
         item_name: String,
         quantity: i32,
         invoice_unit_price: Decimal,
+        purchase_type: String,
+        bonus_for_purchase_id: Option<Uuid>,
         allocations: Vec<TaxReportAllocation>,
     }
-    let mut purchase_map: IndexMap<Uuid, IndexMap<Uuid, PurchaseAccum>> = IndexMap::new();
+    // Flat map: purchase_id → (invoice_id, accum)
+    let mut purchase_map: IndexMap<Uuid, (Uuid, PurchaseAccum)> = IndexMap::new();
 
     for row in &rows {
         // Ensure invoice entry exists
@@ -258,6 +271,7 @@ fn build_tax_report_hierarchy(rows: Vec<TaxReportFlatRow>) -> TaxReportSummary {
             invoice_date: row.invoice_date,
             delivery_date: row.delivery_date,
             tax_rate: row.tax_rate,
+            hst_charged: row.invoice_tax_amount.unwrap_or(Decimal::ZERO),
             total_cost: Decimal::ZERO,
             total_revenue: Decimal::ZERO,
             total_commission: Decimal::ZERO,
@@ -267,13 +281,14 @@ fn build_tax_report_hierarchy(rows: Vec<TaxReportFlatRow>) -> TaxReportSummary {
         });
 
         // Ensure purchase entry exists
-        let inv_purchases = purchase_map.entry(row.invoice_id).or_default();
-        let purchase = inv_purchases.entry(row.purchase_id).or_insert_with(|| PurchaseAccum {
+        let (_, accum) = purchase_map.entry(row.purchase_id).or_insert_with(|| (row.invoice_id, PurchaseAccum {
             item_name: row.item_name.clone(),
             quantity: row.quantity,
             invoice_unit_price: row.invoice_unit_price,
+            purchase_type: row.purchase_type.clone(),
+            bonus_for_purchase_id: row.bonus_for_purchase_id,
             allocations: vec![],
-        });
+        }));
 
         // Add allocation if present
         if let (Some(receipt_id), Some(receipt_number), Some(receipt_date), Some(allocated_qty), Some(unit_cost), Some(allocated_total)) = (
@@ -284,7 +299,7 @@ fn build_tax_report_hierarchy(rows: Vec<TaxReportFlatRow>) -> TaxReportSummary {
             row.allocation_unit_cost,
             row.allocation_total,
         ) {
-            purchase.allocations.push(TaxReportAllocation {
+            accum.allocations.push(TaxReportAllocation {
                 receipt_id,
                 receipt_number: receipt_number.clone(),
                 receipt_date,
@@ -296,75 +311,156 @@ fn build_tax_report_hierarchy(rows: Vec<TaxReportFlatRow>) -> TaxReportSummary {
         }
     }
 
+    // Compute bonus revenue per parent purchase.
+    // bonus_revenue_for[parent_purchase_id] = sum of (bonus_qty * bonus_unit_price)
+    let mut bonus_revenue_for: std::collections::HashMap<Uuid, Decimal> = std::collections::HashMap::new();
+    let bonus_purchase_ids: Vec<Uuid> = purchase_map.iter()
+        .filter(|(_, (_, a))| a.purchase_type == "bonus")
+        .map(|(id, _)| *id)
+        .collect();
+
+    for bonus_id in &bonus_purchase_ids {
+        if let Some((_, accum)) = purchase_map.get(bonus_id) {
+            if let Some(parent_id) = accum.bonus_for_purchase_id {
+                let revenue = Decimal::from(accum.quantity) * accum.invoice_unit_price;
+                *bonus_revenue_for.entry(parent_id).or_insert(Decimal::ZERO) += revenue;
+            }
+        }
+    }
+
+    // Remove bonus purchases from the map — they're merged into parents
+    for bonus_id in &bonus_purchase_ids {
+        purchase_map.shift_remove(bonus_id);
+    }
+
     let hundred = Decimal::from(100);
     let mut total_cost = Decimal::ZERO;
     let mut total_revenue = Decimal::ZERO;
     let mut total_commission = Decimal::ZERO;
     let mut total_hst_on_cost = Decimal::ZERO;
     let mut total_hst_on_commission = Decimal::ZERO;
+    let mut total_hst_charged = Decimal::ZERO;
 
-    // Build final structure with correct per-allocation economics
-    for (invoice_id, purchases) in &purchase_map {
-        let invoice = invoice_map.get_mut(invoice_id).unwrap();
-        let tax_rate = invoice.tax_rate;
+    // Group purchases back by invoice for output
+    let mut invoice_purchases: IndexMap<Uuid, Vec<TaxReportPurchase>> = IndexMap::new();
 
-        for (_purchase_id, accum) in purchases {
-            // Compute cost from actual allocations (the REAL cost, not an average)
-            let alloc_total_cost: Decimal = accum.allocations.iter()
-                .map(|a| a.allocated_total)
-                .sum();
-            let alloc_total_qty: i32 = accum.allocations.iter()
-                .map(|a| a.allocated_qty)
-                .sum();
+    for (purchase_id, (invoice_id, accum)) in &purchase_map {
+        let tax_rate = invoice_map.get(invoice_id).map(|i| i.tax_rate).unwrap_or(Decimal::ZERO);
 
-            // Use allocation-based cost when fully allocated, otherwise fall back
-            // For tax reporting we only show locked invoices which should be fully allocated
-            let qty = Decimal::from(accum.quantity);
-            let purchase_total_cost = if alloc_total_qty == accum.quantity && alloc_total_qty > 0 {
-                alloc_total_cost
-            } else {
-                // Fallback: if not fully allocated, use allocation cost for what we have
-                // plus proportional estimate for the rest (shouldn't happen for locked invoices)
-                alloc_total_cost
-            };
+        let alloc_total_cost: Decimal = accum.allocations.iter()
+            .map(|a| a.allocated_total)
+            .sum();
 
-            let purchase_total_revenue = qty * accum.invoice_unit_price;
-            let commission = purchase_total_revenue - purchase_total_cost;
-            let hst_on_cost = purchase_total_cost * tax_rate / hundred;
-            let hst_on_commission = commission * tax_rate / hundred;
+        let qty = Decimal::from(accum.quantity);
 
-            invoice.purchases.push(TaxReportPurchase {
-                item_name: accum.item_name.clone(),
-                quantity: accum.quantity,
-                invoice_unit_price: accum.invoice_unit_price,
-                total_cost: purchase_total_cost,
-                total_revenue: purchase_total_revenue,
-                commission,
-                hst_on_cost,
-                hst_on_commission,
-                allocations: accum.allocations.clone(),
-            });
+        // Refunds: negate allocation cost so everything reverses
+        let purchase_total_cost = if accum.purchase_type == "refund" {
+            -alloc_total_cost
+        } else {
+            alloc_total_cost
+        };
 
-            invoice.total_cost += purchase_total_cost;
-            invoice.total_revenue += purchase_total_revenue;
-            invoice.total_commission += commission;
-            invoice.total_hst_on_cost += hst_on_cost;
-            invoice.total_hst_on_commission += hst_on_commission;
+        let bonus_rev = bonus_revenue_for.get(purchase_id).copied().unwrap_or(Decimal::ZERO);
+        let purchase_total_revenue = qty * accum.invoice_unit_price;
+        // Commission includes bonus revenue (bonus has zero cost, so it's pure profit)
+        let commission = purchase_total_revenue + bonus_rev - purchase_total_cost;
+        let hst_on_cost = purchase_total_cost * tax_rate / hundred;
+        let hst_on_commission = commission * tax_rate / hundred;
 
-            total_cost += purchase_total_cost;
-            total_revenue += purchase_total_revenue;
-            total_commission += commission;
-            total_hst_on_cost += hst_on_cost;
-            total_hst_on_commission += hst_on_commission;
+        let purchase = TaxReportPurchase {
+            item_name: accum.item_name.clone(),
+            quantity: accum.quantity,
+            invoice_unit_price: accum.invoice_unit_price,
+            purchase_type: accum.purchase_type.clone(),
+            total_cost: purchase_total_cost,
+            total_revenue: purchase_total_revenue,
+            commission,
+            bonus_revenue: bonus_rev,
+            hst_on_cost,
+            hst_on_commission,
+            allocations: accum.allocations.clone(),
+        };
+
+        let inv = invoice_map.get_mut(invoice_id).unwrap();
+        inv.total_cost += purchase_total_cost;
+        inv.total_revenue += purchase_total_revenue + bonus_rev;
+        inv.total_commission += commission;
+        inv.total_hst_on_cost += hst_on_cost;
+        inv.total_hst_on_commission += hst_on_commission;
+
+        total_cost += purchase_total_cost;
+        total_revenue += purchase_total_revenue + bonus_rev;
+        total_commission += commission;
+        total_hst_on_cost += hst_on_cost;
+        total_hst_on_commission += hst_on_commission;
+
+        invoice_purchases.entry(*invoice_id).or_default().push(purchase);
+    }
+
+    // Attach purchases to invoices
+    for (invoice_id, purchases) in invoice_purchases {
+        if let Some(inv) = invoice_map.get_mut(&invoice_id) {
+            inv.purchases = purchases;
         }
     }
+
+    // Sum HST charged across all invoices
+    for inv in invoice_map.values() {
+        total_hst_charged += inv.hst_charged;
+    }
+
+    // Build lost items list and sum costs
+    let mut lost_items_cost = Decimal::ZERO;
+    let mut lost_items_tax = Decimal::ZERO;
+    let lost_items: Vec<TaxReportLostItem> = lost_rows.into_iter().map(|r| {
+        lost_items_cost += r.line_total;
+        lost_items_tax += r.tax_amount;
+        TaxReportLostItem {
+            receipt_id: r.receipt_id,
+            receipt_number: r.receipt_number,
+            receipt_date: r.receipt_date,
+            vendor_name: r.vendor_name,
+            item_name: r.item_name,
+            quantity: r.quantity,
+            unit_cost: r.unit_cost,
+            line_total: r.line_total,
+            tax_amount: r.tax_amount,
+        }
+    }).collect();
+
+    // Lost items add to total cost (write-off) and HST paid
+    total_cost += lost_items_cost;
+    total_hst_on_cost += lost_items_tax;
 
     TaxReportSummary {
         total_commission,
         total_hst_on_cost,
         total_hst_on_commission,
+        total_hst_charged,
         total_cost,
         total_revenue,
+        lost_items_cost,
+        lost_items_tax,
+        lost_items,
         invoices: invoice_map.into_values().collect(),
     }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct IntegrityReport {
+    allocation_item_mismatches: Vec<queries::AllocationItemMismatch>,
+    ok: bool,
+}
+
+async fn get_integrity_check(
+    State(state): State<AppState>,
+) -> Result<Json<IntegrityReport>, (StatusCode, String)> {
+    let mismatches = queries::check_allocation_item_integrity(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let ok = mismatches.is_empty();
+    Ok(Json(IntegrityReport {
+        allocation_item_mismatches: mismatches,
+        ok,
+    }))
 }

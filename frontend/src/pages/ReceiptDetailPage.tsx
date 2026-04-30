@@ -121,6 +121,11 @@ export default function ReceiptDetailPage() {
     isError: purchasesLoadError,
     error: purchasesLoadErrorDetail,
   } = useReceiptPurchases(id || "")
+
+  useEffect(() => {
+    document.title = receipt ? `Receipt ${receipt.receipt_number} — BG Tracker` : "Receipt — BG Tracker"
+  }, [receipt?.receipt_number])
+
   const { data: items = [] } = useItems()
   const { data: destinations = [] } = useDestinations()
   const { data: invoices = [] } = useInvoices()
@@ -994,6 +999,7 @@ export default function ReceiptDetailPage() {
                       <SelectItem value="active">Active</SelectItem>
                       <SelectItem value="returned">Returned</SelectItem>
                       <SelectItem value="damaged">Damaged</SelectItem>
+                      <SelectItem value="lost">Lost</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -1208,6 +1214,7 @@ export default function ReceiptDetailPage() {
                     <SelectItem value="active">Active</SelectItem>
                     <SelectItem value="returned">Returned</SelectItem>
                     <SelectItem value="damaged">Damaged</SelectItem>
+                    <SelectItem value="lost">Lost</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
