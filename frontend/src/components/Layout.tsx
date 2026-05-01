@@ -12,6 +12,7 @@ import {
   LogOut,
   Settings,
   BarChart3,
+  Car,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -31,6 +32,17 @@ const navItems = [
     children: [
       { to: "/reports/unreconciled", label: "Unreconciled" },
       { to: "/reports/tax", label: "Tax Report" },
+    ],
+  },
+  {
+    to: "/services/travel/log",
+    icon: Car,
+    label: "Travel",
+    children: [
+      { to: "/services/travel/log", label: "Mileage Log" },
+      { to: "/services/travel/import/google-timeline", label: "Timeline Import" },
+      { to: "/services/travel/import/receipt", label: "Receipt Import" },
+      { to: "/services/travel/locations", label: "Locations" },
     ],
   },
   { to: "/options", icon: Settings, label: "Options" },
@@ -56,6 +68,10 @@ export function Layout({ children }: { children: React.ReactNode }) {
     else if (path === "/destinations") title = "Destinations — BG Tracker"
     else if (path === "/reports/unreconciled") title = "Unreconciled — BG Tracker"
     else if (path === "/reports/tax") title = "Tax Report — BG Tracker"
+    else if (path === "/services/travel/log") title = "Mileage Log — BG Tracker"
+    else if (path === "/services/travel/import/google-timeline") title = "Timeline Import — BG Tracker"
+    else if (path === "/services/travel/import/receipt") title = "Receipt Import — BG Tracker"
+    else if (path === "/services/travel/locations") title = "Travel Locations — BG Tracker"
     else if (path === "/options") title = "Options — BG Tracker"
     document.title = title
   }, [location.pathname])
@@ -70,7 +86,10 @@ export function Layout({ children }: { children: React.ReactNode }) {
 
         <nav className="flex-1 py-4">
           {navItems.map((item) => {
-            const isReportsActive = item.children && location.pathname.startsWith("/reports")
+            const isSectionActive = item.children && (
+              location.pathname.startsWith("/reports") && item.to.startsWith("/reports") ||
+              location.pathname.startsWith("/services/travel") && item.to.startsWith("/services/travel")
+            )
             return (
               <div key={item.to}>
                 <NavLink
@@ -79,7 +98,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
                   className={({ isActive }) =>
                     cn(
                       "flex items-center gap-3 px-4 py-2 text-sm transition-colors",
-                      isActive || isReportsActive
+                      isActive || isSectionActive
                         ? "bg-slate-800 text-white"
                         : "text-slate-400 hover:bg-slate-800 hover:text-white"
                     )
@@ -88,7 +107,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
                   <item.icon className="h-4 w-4" />
                   {item.label}
                 </NavLink>
-                {item.children && isReportsActive && (
+                {item.children && isSectionActive && (
                   <div className="ml-7 border-l border-slate-700">
                     {item.children.map((child) => (
                       <NavLink

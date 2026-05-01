@@ -6,6 +6,7 @@ pub mod items;
 pub mod purchases;
 pub mod receipts;
 pub mod reports;
+pub mod travel;
 pub mod vendors;
 
 use axum::{http::StatusCode, routing::get, Router};
@@ -35,6 +36,7 @@ pub fn router() -> Router<AppState> {
         .nest("/purchases", purchases::router())
         .nest("/reports", reports::router())
         .nest("/import", import::router())
+        .nest("/travel", travel::router())
 }
 
 async fn health_check() -> StatusCode {

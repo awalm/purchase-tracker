@@ -7,6 +7,9 @@ import {
   useDeleteVendorImportAlias,
   usePurchases,
   useReceipts,
+  useUpdateVendor,
+  useTravelLocations,
+  useApplyVendorDefaultLocation,
 } from "@/hooks/useApi"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -21,22 +24,12 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
-import { ArrowLeft, Plus, Trash2 } from "lucide-react"
+import { LocationSearch } from "@/components/ui/location-search"
+import { ArrowLeft, Plus, Trash2, MapPin, Globe, Save } from "lucide-react"
 import { formatCurrency, formatDate, formatNumber } from "@/lib/utils"
 import { assessPurchaseReconciliation } from "@/lib/purchaseReconciliation"
-
-type PriceHistoryRow = {
-  item_id: string
-  item_name: string
-  purchase_count: number
-  total_qty: number
-  total_spend: number
-  avg_unit: number
-  min_unit: number
-  max_unit: number
-  last_unit: number
-  last_purchase: string
-}
+import { buildPriceHistory } from "@/lib/vendorPriceHistory"
+import type { PriceHistoryRow } from "@/lib/vendorPriceHistory"
 
 function parseMoney(value: string | null | undefined): number {
   const parsed = Number.parseFloat(value ?? "0")
@@ -63,12 +56,31 @@ export default function VendorDetailPage() {
 
   const createAlias = useCreateVendorImportAlias(vendorId)
   const deleteAlias = useDeleteVendorImportAlias(vendorId)
+  const updateVendor = useUpdateVendor()
+  const applyDefaultLocation = useApplyVendorDefaultLocation()
+  const { data: travelLocations = [] } = useTravelLocations()
 
   const [newAlias, setNewAlias] = useState("")
+  const [applyResult, setApplyResult] = useState<number | null>(null)
+
+  const locationOptions = useMemo(
+    () => travelLocations.filter((l) => !l.excluded),
+    [travelLocations]
+  )
+
+  const onlineLocation = useMemo(
+    () => travelLocations.find((l) => l.location_type === "online"),
+    [travelLocations]
+  )
 
   const vendorReceipts = useMemo(
     () => allReceipts.filter((receipt) => receipt.vendor_id === vendorId),
     [allReceipts, vendorId]
+  )
+
+  const unlinkedReceiptCount = useMemo(
+    () => vendorReceipts.filter((r) => !r.store_location_id).length,
+    [vendorReceipts]
   )
 
   const totalQuantity = purchases.reduce((sum, purchase) => sum + purchase.quantity, 0)
@@ -85,55 +97,12 @@ export default function VendorDetailPage() {
   const avgUnit = totalQuantity > 0 ? totalSpent / totalQuantity : 0
 
   const priceHistory = useMemo<PriceHistoryRow[]>(() => {
-    const byItem = new Map<string, PriceHistoryRow>()
-
-    for (const purchase of purchases) {
-      const unit = parseMoney(purchase.purchase_cost)
-      const qty = purchase.quantity
-      const spend = parseMoney(purchase.total_cost) || unit * qty
-      const existing = byItem.get(purchase.item_id)
-
-      if (!existing) {
-        byItem.set(purchase.item_id, {
-          item_id: purchase.item_id,
-          item_name: purchase.item_name,
-          purchase_count: 1,
-          total_qty: qty,
-          total_spend: spend,
-          avg_unit: unit,
-          min_unit: unit,
-          max_unit: unit,
-          last_unit: unit,
-          last_purchase: purchase.purchase_date,
-        })
-        continue
-      }
-
-      existing.purchase_count += 1
-      existing.total_qty += qty
-      existing.total_spend += spend
-      existing.min_unit = Math.min(existing.min_unit, unit)
-      existing.max_unit = Math.max(existing.max_unit, unit)
-
-      if (new Date(purchase.purchase_date).getTime() > new Date(existing.last_purchase).getTime()) {
-        existing.last_purchase = purchase.purchase_date
-        existing.last_unit = unit
-      }
-    }
-
-    const rows = Array.from(byItem.values()).map((row) => ({
-      ...row,
-      avg_unit: row.total_qty > 0 ? row.total_spend / row.total_qty : 0,
-    }))
-
-    rows.sort((a, b) => b.total_spend - a.total_spend)
-    return rows
+    return buildPriceHistory(purchases)
   }, [purchases])
 
-  const recentPurchases = purchases.slice(0, 30)
-  const recentReceipts = [...vendorReceipts]
+  const sortedPurchases = purchases
+  const sortedReceipts = [...vendorReceipts]
     .sort((a, b) => new Date(b.receipt_date).getTime() - new Date(a.receipt_date).getTime())
-    .slice(0, 20)
 
   const handleAddAlias = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -273,6 +242,87 @@ export default function VendorDetailPage() {
         </CardContent>
       </Card>
 
+      {/* Default Store Location */}
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between py-3">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <MapPin className="h-4 w-4" /> Default Store Location
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="pt-0 space-y-3">
+          <p className="text-xs text-muted-foreground">
+            New receipts for this vendor will automatically get this location assigned.
+          </p>
+          <div className="flex items-center gap-2">
+            <LocationSearch
+              locations={locationOptions}
+              value={vendor.default_location_id === onlineLocation?.id ? "__none__" : (vendor.default_location_id || "")}
+              onValueChange={(val) => {
+                if (val === "__none__") {
+                  updateVendor.mutate({
+                    id: vendorId,
+                    default_location_id: onlineLocation?.id || null,
+                  })
+                } else {
+                  updateVendor.mutate({
+                    id: vendorId,
+                    default_location_id: val,
+                  })
+                }
+                setApplyResult(null)
+              }}
+              allowClear
+              initialSearch={vendor.name + " "}
+              placeholder="Search locations..."
+              className="flex-1"
+            />
+          </div>
+          {vendor.default_location_id && vendor.default_location_id !== onlineLocation?.id && (
+            <div className="text-xs text-muted-foreground">
+              {(() => {
+                const loc = travelLocations.find((l) => l.id === vendor.default_location_id)
+                return loc ? `${loc.label} — ${loc.address}` : null
+              })()}
+            </div>
+          )}
+          {vendor.default_location_id === onlineLocation?.id && (
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Globe className="h-3 w-3" />
+              <span>Online-only vendor — no store location needed</span>
+            </div>
+          )}
+          {vendor.default_location_id === onlineLocation?.id && unlinkedReceiptCount > 0 && (
+            <div className="bg-green-50 border border-green-200 rounded p-2 text-xs text-green-800">
+              {unlinkedReceiptCount} receipt{unlinkedReceiptCount !== 1 ? "s" : ""} excluded from mileage import (online-only).
+            </div>
+          )}
+          {vendor.default_location_id && unlinkedReceiptCount > 0 && (
+            <div className="flex items-center gap-2 bg-amber-50 border border-amber-200 rounded p-2">
+              <span className="text-xs text-amber-800">
+                {unlinkedReceiptCount} receipt{unlinkedReceiptCount !== 1 ? "s" : ""} without a store location.
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={applyDefaultLocation.isPending}
+                onClick={() => {
+                  applyDefaultLocation.mutate(vendorId, {
+                    onSuccess: (result) => setApplyResult(result.updated),
+                  })
+                }}
+              >
+                <Save className="h-3 w-3 mr-1" />
+                Apply to Unassigned Receipts
+              </Button>
+              {applyResult !== null && (
+                <span className="text-xs text-green-700">Updated {applyResult} receipt{applyResult !== 1 ? "s" : ""}</span>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       <Card>
         <CardHeader>
           <CardTitle>Price History by Item</CardTitle>
@@ -320,9 +370,10 @@ export default function VendorDetailPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Recent Purchases</CardTitle>
+          <CardTitle>Purchases ({purchases.length})</CardTitle>
         </CardHeader>
         <CardContent>
+          <div className="max-h-[600px] overflow-y-auto">
           <Table>
             <TableHeader>
               <TableRow>
@@ -337,7 +388,7 @@ export default function VendorDetailPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {recentPurchases.map((purchase) => {
+              {sortedPurchases.map((purchase) => {
                 const reconciliation = assessPurchaseReconciliation({
                   quantity: purchase.quantity,
                   purchase_cost: purchase.purchase_cost,
@@ -409,30 +460,33 @@ export default function VendorDetailPage() {
                 </TableRow>
                 )
               })}
-              {recentPurchases.length === 0 && (
+              {sortedPurchases.length === 0 && (
                 <EmptyTableRow colSpan={8} message="No purchases yet for this vendor" />
               )}
             </TableBody>
           </Table>
+          </div>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>Vendor Receipts</CardTitle>
+          <CardTitle>Vendor Receipts ({vendorReceipts.length})</CardTitle>
         </CardHeader>
         <CardContent>
+          <div className="max-h-[600px] overflow-y-auto">
           <Table>
             <TableHeader>
               <TableRow>
                 <TableHead>Receipt #</TableHead>
                 <TableHead>Date</TableHead>
+                <TableHead>Location</TableHead>
                 <TableHead>Total</TableHead>
                 <TableHead>Purchases</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {recentReceipts.map((receipt) => (
+              {sortedReceipts.map((receipt) => (
                 <TableRow key={receipt.id}>
                   <TableCell>
                     <Link className="text-blue-600 hover:underline" to={`/receipts/${receipt.id}`}>
@@ -440,15 +494,17 @@ export default function VendorDetailPage() {
                     </Link>
                   </TableCell>
                   <TableCell>{formatDate(receipt.receipt_date)}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{receipt.store_label || "—"}</TableCell>
                   <TableCell>{formatCurrency(receipt.total)}</TableCell>
                   <TableCell>{formatNumber(receipt.purchase_count || 0)}</TableCell>
                 </TableRow>
               ))}
-              {recentReceipts.length === 0 && (
-                <EmptyTableRow colSpan={4} message="No receipts yet for this vendor" />
+              {sortedReceipts.length === 0 && (
+                <EmptyTableRow colSpan={5} message="No receipts yet for this vendor" />
               )}
             </TableBody>
           </Table>
+          </div>
         </CardContent>
       </Card>
     </div>

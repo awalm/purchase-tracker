@@ -15,6 +15,10 @@ import ReceiptDetailPage from "@/pages/ReceiptDetailPage"
 import PurchasesPage from "@/pages/PurchasesPage"
 import UnreconciledItemsPage from "@/pages/UnreconciledItemsPage"
 import TaxReportPage from "@/pages/TaxReportPage"
+import TravelReportPage from "@/pages/TravelReportPage"
+import TravelLocationsPage from "@/pages/TravelLocationsPage"
+import MileageLogPage from "@/pages/MileageLogPage"
+import ReceiptMileageImportPage from "@/pages/ReceiptMileageImportPage"
 import OptionsPage from "@/pages/OptionsPage"
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -153,6 +157,38 @@ export default function App() {
         element={
           <ProtectedRoute>
             <TaxReportPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/services/travel/import/google-timeline"
+        element={
+          <ProtectedRoute>
+            <TravelReportPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/services/travel/log"
+        element={
+          <ProtectedRoute>
+            <MileageLogPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/services/travel/import/receipt"
+        element={
+          <ProtectedRoute>
+            <ReceiptMileageImportPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/services/travel/locations"
+        element={
+          <ProtectedRoute>
+            <TravelLocationsPage />
           </ProtectedRoute>
         }
       />

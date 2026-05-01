@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { useParams, useNavigate, Link } from "react-router-dom"
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import {
@@ -12,6 +12,8 @@ import {
   useDestinations,
   useInvoices,
   useVendors,
+  useTravelLocations,
+  useCreateTravelLocation,
 } from "@/hooks/useApi"
 import { receipts as receiptsApi, purchases as purchasesApi, type ReceiptLineItem } from "@/api"
 import { Button } from "@/components/ui/button"
@@ -40,6 +42,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { LocationSearch } from "@/components/ui/location-search"
 import { StatusSelect } from "@/components/StatusSelect"
 import { EmptyTableRow } from "@/components/EmptyTableRow"
 import { ConfirmCloseDialog } from "@/components/ConfirmCloseDialog"
@@ -54,6 +57,8 @@ import {
   AlertCircle,
   CheckCircle2,
   Scissors,
+  MapPin,
+  Lock,
 } from "lucide-react"
 import { formatCurrency, formatDate } from "@/lib/utils"
 import { assessPurchaseReconciliation } from "@/lib/purchaseReconciliation"
@@ -130,11 +135,18 @@ export default function ReceiptDetailPage() {
   const { data: destinations = [] } = useDestinations()
   const { data: invoices = [] } = useInvoices()
   const { data: vendors = [] } = useVendors()
+  const { data: travelLocations = [] } = useTravelLocations()
+
+  const onlineLocation = useMemo(
+    () => travelLocations.find((l) => l.location_type === "online"),
+    [travelLocations]
+  )
 
   const createPurchase = useCreatePurchase()
   const updateReceipt = useUpdateReceipt()
   const deleteReceipt = useDeleteReceipt()
   const updatePurchase = useUpdatePurchase()
+  const createTravelLocation = useCreateTravelLocation()
 
   const {
     data: receiptLineItems = [],
@@ -179,6 +191,14 @@ export default function ReceiptDetailPage() {
   const [isEditingMetadata, setIsEditingMetadata] = useState(false)
   const [metadataDraft, setMetadataDraft] = useState("")
   const [metadataError, setMetadataError] = useState("")
+
+  // Store location editing
+  const [isEditingLocation, setIsEditingLocation] = useState(false)
+  const [selectedLocationId, setSelectedLocationId] = useState<string>("")
+  const [isAddingNewLocation, setIsAddingNewLocation] = useState(false)
+  const [newLocLabel, setNewLocLabel] = useState("")
+  const [newLocAddress, setNewLocAddress] = useState("")
+  const [newLocType, setNewLocType] = useState("store")
 
   // Split line dialog state
   const [splitDialogOpen, setSplitDialogOpen] = useState(false)
@@ -557,7 +577,8 @@ export default function ReceiptDetailPage() {
               variant="ghost"
               size="icon"
               aria-label="Edit receipt"
-              title="Edit receipt"
+              title={fullyReconciled ? "Locked — receipt is reconciled" : "Edit receipt"}
+              disabled={fullyReconciled}
               onClick={() => {
                 setReceiptEditError("")
                 setReceiptDialogOpen(true)
@@ -625,6 +646,29 @@ export default function ReceiptDetailPage() {
               </>
             )}
           </div>
+          {fullyReconciled && (
+            <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-md px-3 py-2 text-sm text-blue-800 mt-1">
+              <Lock className="h-4 w-4 flex-shrink-0" />
+              <span>
+                This receipt is fully reconciled. All editing is locked. Unlock{" "}
+                {(() => {
+                  const invoiceLinks = [...new Map(
+                    purchases
+                      .filter((p) => p.invoice_id && p.invoice_reconciliation_state === "locked")
+                      .map((p) => [p.invoice_id, p.invoice_number || p.invoice_id])
+                  ).entries()]
+                  if (invoiceLinks.length === 0) return "the associated invoice"
+                  return invoiceLinks.map(([id, num], i) => (
+                    <span key={id}>
+                      {i > 0 && ", "}
+                      <Link to={`/invoices/${id}`} className="underline font-medium hover:text-blue-900">{num}</Link>
+                    </span>
+                  ))
+                })()}{" "}
+                to make changes.
+              </span>
+            </div>
+          )}
         </div>
         <div className="flex gap-2">
           {receipt.has_pdf ? (
@@ -645,7 +689,7 @@ export default function ReceiptDetailPage() {
                 View Document
             </Button>
           ) : (
-            <Button variant="outline" onClick={handleUploadPdf}>
+            <Button variant="outline" onClick={handleUploadPdf} disabled={fullyReconciled} title={fullyReconciled ? "Locked — receipt is reconciled" : undefined}>
               <Upload className="h-4 w-4 mr-2" />
               Upload Document
             </Button>
@@ -653,6 +697,8 @@ export default function ReceiptDetailPage() {
           <Button
             variant="outline"
             className="text-red-600 hover:text-red-700 hover:bg-red-50"
+            disabled={fullyReconciled}
+            title={fullyReconciled ? "Locked — receipt is reconciled" : undefined}
             onClick={() => { setDeleteError(""); setDeleteConfirmOpen(true) }}
           >
             <Trash2 className="h-4 w-4 mr-2" />
@@ -722,6 +768,160 @@ export default function ReceiptDetailPage() {
         </Card>
       </div>
 
+      {/* Store Location */}
+      <Card>
+        <CardHeader className="flex flex-row items-center justify-between py-3">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <MapPin className="h-4 w-4" /> Store Location
+          </CardTitle>
+          {!isEditingLocation && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs"
+              disabled={fullyReconciled}
+              title={fullyReconciled ? "Locked — receipt is reconciled" : undefined}
+              onClick={() => {
+                setIsEditingLocation(true)
+                setIsAddingNewLocation(false)
+                setSelectedLocationId(
+                  receipt.store_location_id === onlineLocation?.id
+                    ? "__none__"
+                    : (receipt.store_location_id || "")
+                )
+              }}
+            >
+              <Pencil className="h-3 w-3 mr-1" />
+              {receipt.store_location_id ? "Edit" : "Set Location"}
+            </Button>
+          )}
+        </CardHeader>
+        <CardContent className="pt-0">
+          {isEditingLocation ? (
+            <div className="space-y-3">
+              {!isAddingNewLocation ? (
+                <>
+                  <LocationSearch
+                    locations={travelLocations.filter((loc) => !loc.excluded)}
+                    value={selectedLocationId}
+                    onValueChange={(val) => setSelectedLocationId(val)}
+                    onAddNew={() => {
+                      setIsAddingNewLocation(true)
+                      setNewLocLabel("")
+                      setNewLocAddress("")
+                      setNewLocType("store")
+                    }}
+                    allowClear
+                    initialSearch={receipt.vendor_name + " "}
+                    placeholder="Search locations..."
+                  />
+                  {selectedLocationId && selectedLocationId !== "__none__" && (() => {
+                    const loc = travelLocations.find((l) => l.id === selectedLocationId)
+                    return loc ? (
+                      <div className="text-xs text-muted-foreground space-y-0.5">
+                        <p>{loc.address}</p>
+                        {loc.latitude != null && loc.longitude != null && (
+                          <p>{loc.latitude.toFixed(5)}, {loc.longitude.toFixed(5)}</p>
+                        )}
+                      </div>
+                    ) : null
+                  })()}
+                  <div className="flex justify-end gap-2">
+                    <Button variant="outline" size="sm" onClick={() => setIsEditingLocation(false)}>Cancel</Button>
+                    <Button
+                      size="sm"
+                      disabled={!selectedLocationId}
+                      onClick={() => {
+                        updateReceipt.mutate(
+                          {
+                            id: receipt.id,
+                            store_location_id: selectedLocationId === "__none__"
+                              ? (onlineLocation?.id || null)
+                              : selectedLocationId,
+                          },
+                          { onSuccess: () => setIsEditingLocation(false) }
+                        )
+                      }}
+                    >
+                      Save Location
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p className="text-xs font-medium text-muted-foreground">New Location</p>
+                  <div>
+                    <label className="text-xs font-medium block mb-1">Label</label>
+                    <input
+                      className="w-full text-sm border rounded px-2 py-1.5"
+                      value={newLocLabel}
+                      onChange={(e) => setNewLocLabel(e.target.value)}
+                      placeholder="e.g. Costco Barrhaven"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium block mb-1">Address</label>
+                    <input
+                      className="w-full text-sm border rounded px-2 py-1.5"
+                      value={newLocAddress}
+                      onChange={(e) => setNewLocAddress(e.target.value)}
+                      placeholder="e.g. 3535 Strandherd Dr, Nepean, ON"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium block mb-1">Type</label>
+                    <Select value={newLocType} onValueChange={setNewLocType}>
+                      <SelectTrigger className="w-full text-sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="store">Store</SelectItem>
+                        <SelectItem value="home">Home</SelectItem>
+                        <SelectItem value="work">Work</SelectItem>
+                        <SelectItem value="client">Client</SelectItem>
+                        <SelectItem value="other">Other</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <Button variant="outline" size="sm" onClick={() => setIsAddingNewLocation(false)}>Back</Button>
+                    <Button
+                      size="sm"
+                      disabled={!newLocLabel || !newLocAddress || createTravelLocation.isPending}
+                      onClick={() => {
+                        createTravelLocation.mutate(
+                          { label: newLocLabel, address: newLocAddress, location_type: newLocType },
+                          {
+                            onSuccess: (newLoc) => {
+                              setSelectedLocationId(newLoc.id)
+                              setIsAddingNewLocation(false)
+                            },
+                          }
+                        )
+                      }}
+                    >
+                      {createTravelLocation.isPending ? "Creating..." : "Create Location"}
+                    </Button>
+                  </div>
+                </>
+              )}
+            </div>
+          ) : receipt.store_location_id ? (
+            <div className="text-sm space-y-1">
+              {receipt.store_label && <p className="font-medium">{receipt.store_label}</p>}
+              {receipt.store_address && <p className="text-muted-foreground">{receipt.store_address}</p>}
+              {receipt.store_latitude != null && receipt.store_longitude != null && (
+                <p className="text-xs text-muted-foreground">
+                  {receipt.store_latitude.toFixed(5)}, {receipt.store_longitude.toFixed(5)}
+                </p>
+              )}
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground italic">No store location set. Online orders don't need one.</p>
+          )}
+        </CardContent>
+      </Card>
+
       <Card className="order-last">
         <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle>Ingestion Metadata</CardTitle>
@@ -749,6 +949,8 @@ export default function ReceiptDetailPage() {
               type="button"
               size="sm"
               variant="outline"
+              disabled={fullyReconciled}
+              title={fullyReconciled ? "Locked — receipt is reconciled" : undefined}
               onClick={() => {
                 setMetadataDraft(JSON.stringify(receipt.ingestion_metadata || {}, null, 2))
                 setMetadataError("")
@@ -950,7 +1152,7 @@ export default function ReceiptDetailPage() {
             }}
           >
             <DialogTrigger asChild>
-              <Button size="sm" onClick={resetLineItemForm}>
+              <Button size="sm" onClick={resetLineItemForm} disabled={fullyReconciled} title={fullyReconciled ? "Locked — receipt is reconciled" : undefined}>
                 <Plus className="h-4 w-4 mr-2" />
                 Add Receipt Line
               </Button>
@@ -1078,7 +1280,7 @@ export default function ReceiptDetailPage() {
                         <TableCell className="text-muted-foreground">{line.notes || "-"}</TableCell>
                         <TableCell>
                           <div className="flex gap-1">
-                            <Button size="icon" variant="ghost" onClick={() => handleEditLineItem(line)}>
+                            <Button size="icon" variant="ghost" onClick={() => handleEditLineItem(line)} disabled={fullyReconciled}>
                               <Pencil className="h-4 w-4" />
                             </Button>
                             {line.quantity > 1 && (
@@ -1087,6 +1289,7 @@ export default function ReceiptDetailPage() {
                                 variant="ghost"
                                 onClick={() => handleOpenSplitDialog(line)}
                                 title="Split line by quantity"
+                                disabled={fullyReconciled}
                               >
                                 <Scissors className="h-4 w-4" />
                               </Button>
@@ -1096,8 +1299,8 @@ export default function ReceiptDetailPage() {
                               variant="ghost"
                               className="text-red-600"
                               onClick={() => handleDeleteLineItem(line)}
-                              disabled={line.allocated_qty > 0}
-                              title={line.allocated_qty > 0 ? "Cannot delete while allocated" : "Delete"}
+                              disabled={fullyReconciled || line.allocated_qty > 0}
+                              title={fullyReconciled ? "Locked — receipt is reconciled" : line.allocated_qty > 0 ? "Cannot delete while allocated" : "Delete"}
                             >
                               <Trash2 className="h-4 w-4" />
                             </Button>
@@ -1126,7 +1329,7 @@ export default function ReceiptDetailPage() {
                           <TableCell className="text-muted-foreground text-sm">{child.notes || "-"}</TableCell>
                           <TableCell>
                             <div className="flex gap-1">
-                              <Button size="icon" variant="ghost" onClick={() => handleEditLineItem(child)}>
+                              <Button size="icon" variant="ghost" onClick={() => handleEditLineItem(child)} disabled={fullyReconciled}>
                                 <Pencil className="h-4 w-4" />
                               </Button>
                               <Button
@@ -1134,8 +1337,8 @@ export default function ReceiptDetailPage() {
                                 variant="ghost"
                                 className="text-red-600"
                                 onClick={() => handleDeleteLineItem(child)}
-                                disabled={child.allocated_qty > 0}
-                                title={child.allocated_qty > 0 ? "Cannot delete while allocated" : "Delete"}
+                                disabled={fullyReconciled || child.allocated_qty > 0}
+                                title={fullyReconciled ? "Locked — receipt is reconciled" : child.allocated_qty > 0 ? "Cannot delete while allocated" : "Delete"}
                               >
                                 <Trash2 className="h-4 w-4" />
                               </Button>
@@ -1248,7 +1451,8 @@ export default function ReceiptDetailPage() {
             <DialogTrigger asChild>
               <Button
                 size="sm"
-                disabled={loadingReceiptLineItems || creatableReceiptLines.length === 0}
+                disabled={fullyReconciled || loadingReceiptLineItems || creatableReceiptLines.length === 0}
+                title={fullyReconciled ? "Locked — receipt is reconciled" : undefined}
                 onClick={() => {
                   resetForm()
                   if (creatableReceiptLines.length > 0) {
@@ -1542,6 +1746,7 @@ export default function ReceiptDetailPage() {
                       <TableCell>
                         <StatusSelect
                           value={p.status}
+                          disabled={fullyReconciled}
                           onValueChange={(value) =>
                             handleStatusChange(p.purchase_id, value)
                           }
@@ -1553,6 +1758,7 @@ export default function ReceiptDetailPage() {
                             size="icon"
                             variant="ghost"
                             onClick={() => handleEdit(p)}
+                            disabled={fullyReconciled}
                           >
                             <Pencil className="h-4 w-4" />
                           </Button>
@@ -1561,6 +1767,7 @@ export default function ReceiptDetailPage() {
                             variant="ghost"
                             className="text-red-600"
                             onClick={() => handleUnlinkPurchase(p.purchase_id)}
+                            disabled={fullyReconciled}
                           >
                             <Trash2 className="h-4 w-4" />
                           </Button>

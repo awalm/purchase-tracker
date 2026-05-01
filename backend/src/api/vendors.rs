@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -33,6 +33,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/{id}/import-aliases/{alias_id}",
             delete(delete_vendor_import_alias),
+        )
+        .route(
+            "/{id}/apply-default-location",
+            post(apply_default_location),
         )
 }
 
@@ -159,4 +163,36 @@ async fn delete_vendor_import_alias(
     } else {
         Err((StatusCode::NOT_FOUND, "Alias not found".to_string()))
     }
+}
+
+/// Apply vendor's default_location_id to all receipts for this vendor that don't have a store_location_id.
+/// Returns the count of updated receipts.
+async fn apply_default_location(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let vendor = queries::get_vendor_by_id(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Vendor not found".to_string()))?;
+
+    let location_id = vendor.default_location_id.ok_or((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "Vendor has no default location set".to_string(),
+    ))?;
+
+    let result = sqlx::query!(
+        r#"UPDATE receipts SET store_location_id = $1
+           WHERE vendor_id = $2 AND store_location_id IS NULL"#,
+        location_id,
+        id
+    )
+    .execute(&state.pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "updated": result.rows_affected()
+    })))
 }

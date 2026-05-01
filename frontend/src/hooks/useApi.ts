@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
-import { vendors, destinations, items, invoices, receipts, purchases, reports } from "@/api"
+import { vendors, destinations, items, invoices, receipts, purchases, reports, travel } from "@/api"
 import type { ReceiptIngestionMetadata } from "@/api"
 
 // ============================================
@@ -31,8 +31,16 @@ export function useCreateVendor() {
 export function useUpdateVendor() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, ...data }: { id: string; name?: string; short_id?: string }) => vendors.update(id, data),
+    mutationFn: ({ id, ...data }: { id: string; [key: string]: unknown }) => vendors.update(id, data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["vendors"] }),
+  })
+}
+
+export function useApplyVendorDefaultLocation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (vendorId: string) => vendors.applyDefaultLocation(vendorId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["receipts"] }),
   })
 }
 
@@ -412,5 +420,203 @@ export function useTaxReport(destinationId: string | undefined, from?: string, t
     queryKey: ["reports", "tax", destinationId, from, to],
     queryFn: () => reports.taxReport(destinationId!, from, to),
     enabled: !!destinationId,
+  })
+}
+
+// ============================================
+// Travel
+// ============================================
+export function useTravelLocations() {
+  return useQuery({
+    queryKey: ["travel", "locations"],
+    queryFn: travel.locations.list,
+  })
+}
+
+export function useCreateTravelLocation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (data: { label: string; chain?: string; address: string; location_type: string; excluded?: boolean }) =>
+      travel.locations.create(data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["travel", "locations"] }),
+  })
+}
+
+export function useUpdateTravelLocation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...data }: { id: string; label?: string; chain?: string; address?: string; location_type?: string; excluded?: boolean }) =>
+      travel.locations.update(id, data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["travel", "locations"] }),
+  })
+}
+
+export function useDeleteTravelLocation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => travel.locations.delete(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["travel", "locations"] }),
+  })
+}
+
+export function useImportTravelLocations() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (locations: { label: string; chain?: string; address: string; location_type: string; excluded?: boolean }[]) =>
+      travel.locations.import(locations),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["travel", "locations"] }),
+  })
+}
+
+export function useGeocodeTravelLocations() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (locationIds?: string[]) => travel.locations.geocode(locationIds),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["travel", "locations"] }),
+  })
+}
+
+export function useTravelUploads() {
+  return useQuery({
+    queryKey: ["travel", "uploads"],
+    queryFn: travel.uploads.list,
+  })
+}
+
+export function useUploadTimeline() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (file: File) => travel.uploads.upload(file),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["travel", "uploads"] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "segments"] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "summary"] })
+    },
+  })
+}
+
+export function useDeleteTravelUpload() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => travel.uploads.delete(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["travel", "uploads"] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "segments"] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "summary"] })
+    },
+  })
+}
+
+export function useReparseTravelUpload() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => travel.uploads.reparse(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["travel", "uploads"] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "segments"] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "summary"] })
+    },
+  })
+}
+
+export function useTravelSegments(uploadId: string | undefined, from?: string, to?: string) {
+  return useQuery({
+    queryKey: ["travel", "segments", uploadId, from, to],
+    queryFn: () => travel.segments.list(uploadId!, from, to),
+    enabled: !!uploadId,
+  })
+}
+
+export function useTravelSegmentsForDate(date: string | null) {
+  return useQuery({
+    queryKey: ["travel", "segments-by-date", date],
+    queryFn: () => travel.segments.listByDate(date!),
+    enabled: !!date,
+  })
+}
+
+export function useClassifySegment() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...data }: { id: string; classification?: string; notes?: string }) =>
+      travel.segments.classify(id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["travel", "segments"] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "summary"] })
+    },
+  })
+}
+
+export function useLinkReceiptToSegment() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, receiptId }: { id: string; receiptId: string | null }) =>
+      travel.segments.linkReceipt(id, receiptId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["travel", "segments"] }),
+  })
+}
+
+export function useReceiptLocations(from?: string, to?: string) {
+  return useQuery({
+    queryKey: ["receipts", "locations", from, to],
+    queryFn: () => receipts.locations(from, to),
+  })
+}
+
+export function useTravelSummary(uploadId: string | undefined, from?: string, to?: string) {
+  return useQuery({
+    queryKey: ["travel", "summary", uploadId, from, to],
+    queryFn: () => travel.summary(uploadId!, from, to),
+    enabled: !!uploadId,
+  })
+}
+
+export function useTripLogs(uploadId?: string) {
+  return useQuery({
+    queryKey: ["travel", "trip-logs", uploadId || "all"],
+    queryFn: () => travel.tripLogs.list(uploadId),
+  })
+}
+
+export function useCreateTripLog() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (data: { upload_id?: string; trip_date: string; purpose?: string; notes?: string; source?: string }) =>
+      travel.tripLogs.create(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })
+    },
+  })
+}
+
+export function useCreateReceiptTripLog() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (data: { trip_date: string; purpose?: string; notes?: string; segments: { from_location: string; to_location: string; distance_km: number; classification: string }[] }) =>
+      travel.tripLogs.createFromReceipt(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })
+    },
+  })
+}
+
+export function useUpdateTripLog() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...data }: { id: string; purpose?: string; notes?: string; status?: string }) =>
+      travel.tripLogs.update(id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })
+    },
+  })
+}
+
+export function useDeleteTripLog() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => travel.tripLogs.delete(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })
+    },
   })
 }

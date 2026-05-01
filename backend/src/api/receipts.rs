@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::Response,
     routing::get,
@@ -20,6 +20,7 @@ const RECEIPT_MULTIPART_MAX_BYTES: usize = 25 * 1024 * 1024;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_receipts).post(create_receipt))
+        .route("/locations", get(get_receipt_locations))
         .route(
             "/{id}",
             get(get_receipt_detail)
@@ -76,6 +77,22 @@ async fn list_receipts(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ReceiptWithVendor>>, (StatusCode, String)> {
     let receipts = queries::get_receipts_with_vendor(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(receipts))
+}
+
+#[derive(serde::Deserialize)]
+struct ReceiptLocationQuery {
+    from: Option<chrono::NaiveDate>,
+    to: Option<chrono::NaiveDate>,
+}
+
+async fn get_receipt_locations(
+    State(state): State<AppState>,
+    Query(params): Query<ReceiptLocationQuery>,
+) -> Result<Json<Vec<ReceiptWithVendor>>, (StatusCode, String)> {
+    let receipts = queries::get_receipt_locations(&state.pool, params.from, params.to)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(receipts))

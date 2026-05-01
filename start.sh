@@ -2,6 +2,13 @@
 set -e
 cd "$(dirname "$0")"
 
+# Source .env if it exists (won't override vars already set in the environment)
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
+
 # Kill stale processes
 for port in 3000 5173 5174; do
   lsof -ti:"$port" 2>/dev/null | xargs -r kill -9 2>/dev/null || true

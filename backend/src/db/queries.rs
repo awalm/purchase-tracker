@@ -310,7 +310,7 @@ fn no_eligible_receipts_before_invoice_warning(cutoff_date: NaiveDate) -> String
 pub async fn get_all_vendors(pool: &PgPool) -> Result<Vec<Vendor>, sqlx::Error> {
     sqlx::query_as!(
         Vendor,
-        r#"SELECT id, name, short_id, created_at, updated_at FROM vendors ORDER BY name"#
+        r#"SELECT id, name, short_id, default_location_id, created_at, updated_at FROM vendors ORDER BY name"#
     )
     .fetch_all(pool)
     .await
@@ -319,7 +319,7 @@ pub async fn get_all_vendors(pool: &PgPool) -> Result<Vec<Vendor>, sqlx::Error> 
 pub async fn get_vendor_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Vendor>, sqlx::Error> {
     sqlx::query_as!(
         Vendor,
-        r#"SELECT id, name, short_id, created_at, updated_at FROM vendors WHERE id = $1"#,
+        r#"SELECT id, name, short_id, default_location_id, created_at, updated_at FROM vendors WHERE id = $1"#,
         id
     )
     .fetch_optional(pool)
@@ -339,7 +339,7 @@ pub async fn create_vendor(
 
     let vendor = sqlx::query_as!(
         Vendor,
-        r#"INSERT INTO vendors (name, short_id) VALUES ($1, $2) RETURNING id, name, short_id, created_at, updated_at"#,
+        r#"INSERT INTO vendors (name, short_id) VALUES ($1, $2) RETURNING id, name, short_id, default_location_id, created_at, updated_at"#,
         data.name,
         short_id
     )
@@ -376,13 +376,19 @@ pub async fn update_vendor(
             .or_else(|| old_vendor.short_id.clone())
             .or_else(|| derive_vendor_short_id(&next_name));
 
+        let next_default_location_id = match data.default_location_id {
+            Some(val) => val,
+            None => old_vendor.default_location_id,
+        };
+
         let vendor = sqlx::query_as!(
             Vendor,
-            r#"UPDATE vendors SET name = COALESCE($2, name), short_id = $3 WHERE id = $1 
-               RETURNING id, name, short_id, created_at, updated_at"#,
+            r#"UPDATE vendors SET name = COALESCE($2, name), short_id = $3, default_location_id = $4 WHERE id = $1 
+               RETURNING id, name, short_id, default_location_id, created_at, updated_at"#,
             id,
             data.name,
-            next_short_id
+            next_short_id,
+            next_default_location_id
         )
         .fetch_optional(pool)
         .await?;
@@ -3858,7 +3864,12 @@ pub async fn get_purchase_economics(
                    (ARRAY_AGG(DISTINCT vac.receipt_id))[1] AS any_receipt_id,
                    COALESCE(SUM(vac.allocated_qty), 0)::INT AS allocated_qty,
                    COALESCE(SUM(vac.effective_allocated_cost), 0::numeric) AS allocated_total_cost,
-                   SUM(vac.effective_allocated_cost * r.tax_amount / NULLIF(r.subtotal, 0)) AS allocated_tax_paid
+                   SUM(vac.effective_allocated_cost * r.tax_amount / NULLIF(r.subtotal, 0)) AS allocated_tax_paid,
+                   -- vendor-scoped aggregates (active when $3 vendor_id IS NOT NULL)
+                   (ARRAY_AGG(DISTINCT vac.receipt_id) FILTER (WHERE r.vendor_id = $3))[1] AS vendor_receipt_id,
+                   COALESCE(SUM(vac.allocated_qty) FILTER (WHERE r.vendor_id = $3), 0)::INT AS vendor_allocated_qty,
+                   COALESCE(SUM(vac.effective_allocated_cost) FILTER (WHERE r.vendor_id = $3), 0::numeric) AS vendor_allocated_cost,
+                   SUM(vac.effective_allocated_cost * r.tax_amount / NULLIF(r.subtotal, 0)) FILTER (WHERE r.vendor_id = $3) AS vendor_allocated_tax_paid
                FROM v_allocation_costs vac
                JOIN receipts r ON r.id = vac.receipt_id
                GROUP BY vac.purchase_id
@@ -3874,12 +3885,26 @@ pub async fn get_purchase_economics(
                SELECT
                    p.id AS purchase_id,
                    p.item_id,
-                   p.quantity,
+                   -- When vendor filter is active, use vendor-scoped allocated qty
+                   CASE
+                       WHEN $3::uuid IS NOT NULL AND alloc.vendor_allocated_qty > 0
+                       THEN (CASE WHEN p.quantity < 0 THEN -1 ELSE 1 END) * alloc.vendor_allocated_qty
+                       WHEN $3::uuid IS NOT NULL AND r_direct.vendor_id = $3
+                       THEN p.quantity
+                       WHEN $3::uuid IS NOT NULL
+                       THEN 0
+                       ELSE p.quantity
+                   END AS quantity,
                    p.invoice_unit_price,
                    p.status,
                    p.delivery_date,
                    p.invoice_id,
-                   COALESCE(p.receipt_id, alloc.any_receipt_id) AS resolved_receipt_id,
+                   -- When vendor filter is active, resolve to that vendor's receipt
+                   CASE
+                       WHEN $3::uuid IS NOT NULL
+                       THEN COALESCE(alloc.vendor_receipt_id, CASE WHEN r_direct.vendor_id = $3 THEN p.receipt_id END)
+                       ELSE COALESCE(p.receipt_id, alloc.any_receipt_id)
+                   END AS resolved_receipt_id,
                    p.destination_id,
                    inv.destination_id AS invoice_destination_id,
                    p.allow_receipt_date_override,
@@ -3894,6 +3919,9 @@ pub async fn get_purchase_economics(
                    inv.reconciliation_state,
                    inv.tax_rate,
                    CASE
+                       -- Vendor-scoped: use vendor allocation cost
+                       WHEN $3::uuid IS NOT NULL AND alloc.vendor_allocated_qty > 0
+                       THEN alloc.vendor_allocated_cost / alloc.vendor_allocated_qty::numeric
                        WHEN alloc.allocated_qty = ABS(p.quantity)
                             AND alloc.allocated_qty > 0
                             AND p.quantity != 0
@@ -3901,6 +3929,9 @@ pub async fn get_purchase_economics(
                        ELSE (p.purchase_cost + p.cost_adjustment)
                    END AS effective_purchase_cost,
                    CASE
+                       -- Vendor-scoped: use vendor allocation tax
+                       WHEN $3::uuid IS NOT NULL AND alloc.vendor_allocated_qty > 0
+                       THEN (CASE WHEN p.quantity < 0 THEN -1 ELSE 1 END) * COALESCE(alloc.vendor_allocated_tax_paid, 0)
                        WHEN alloc.allocated_qty = ABS(p.quantity)
                             AND alloc.allocated_qty > 0
                             AND p.quantity != 0
@@ -4145,7 +4176,8 @@ pub async fn get_all_receipts(pool: &PgPool) -> Result<Vec<Receipt>, sqlx::Error
         r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total,
                 payment_method,
           ingestion_metadata,
-                  notes, created_at, updated_at
+                  notes, store_location_id,
+                  created_at, updated_at
            FROM receipts ORDER BY receipt_date DESC"#
     )
     .fetch_all(pool)
@@ -4158,7 +4190,8 @@ pub async fn get_receipt_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Receipt
         r#"SELECT id, vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total,
                   payment_method,
                   ingestion_metadata,
-                  notes, created_at, updated_at
+                  notes, store_location_id,
+                  created_at, updated_at
            FROM receipts WHERE id = $1"#,
         id
     )
@@ -4200,14 +4233,20 @@ pub async fn create_receipt(
         generate_unique_receipt_number(pool, data.vendor_id).await?
     };
 
+    // Auto-apply vendor's default location if set
+    let vendor_default_location = get_vendor_by_id(pool, data.vendor_id)
+        .await?
+        .and_then(|v| v.default_location_id);
+
     let receipt = sqlx::query_as!(
         Receipt,
-        r#"INSERT INTO receipts (vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total, payment_method, ingestion_metadata, notes)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        r#"INSERT INTO receipts (vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total, payment_method, ingestion_metadata, notes, store_location_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
            RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total,
                      payment_method,
                      ingestion_metadata,
-                     notes, created_at, updated_at"#,
+                     notes, store_location_id,
+                     created_at, updated_at"#,
         data.vendor_id,
         receipt_number,
         data.receipt_date,
@@ -4216,7 +4255,8 @@ pub async fn create_receipt(
         total,
         data.payment_method,
         ingestion_metadata,
-        data.notes
+        data.notes,
+        vendor_default_location
     )
     .fetch_one(pool)
     .await?;
@@ -4339,6 +4379,11 @@ pub async fn update_receipt(
             .ingestion_metadata
             .or_else(|| old_receipt.ingestion_metadata.clone());
 
+        let store_location_id = match data.store_location_id {
+            Some(val) => val,           // Some(Some(uuid)) or Some(None) — use as-is
+            None => old_receipt.store_location_id, // not provided — keep old
+        };
+
         let (tax_amount, total) = if let Some(tax_amount) = data.tax_amount {
             (tax_amount, subtotal + tax_amount)
         } else if let Some(rate) = data.tax_rate {
@@ -4360,12 +4405,14 @@ pub async fn update_receipt(
                 total = $7,
                 payment_method = $8,
                 ingestion_metadata = $9,
-                notes = $10
+                notes = $10,
+                store_location_id = $11
                WHERE id = $1 
                RETURNING id, vendor_id, receipt_number, receipt_date, subtotal, tax_amount, total,
                          payment_method,
                          ingestion_metadata,
-                         notes, created_at, updated_at"#,
+                         notes, store_location_id,
+                         created_at, updated_at"#,
             id,
             vendor_id,
             receipt_number,
@@ -4375,7 +4422,8 @@ pub async fn update_receipt(
             total,
             payment_method,
             ingestion_metadata,
-            notes
+            notes,
+            store_location_id
         )
         .fetch_optional(pool)
         .await?;
@@ -4505,6 +4553,11 @@ pub async fn get_receipt_with_vendor(
             r.ingestion_metadata,
             (r.original_pdf IS NOT NULL) AS has_pdf,
             r.notes,
+            r.store_location_id,
+            tl.label AS "store_label?",
+            tl.address AS "store_address?",
+            tl.latitude AS "store_latitude?",
+            tl.longitude AS "store_longitude?",
             r.created_at,
             r.updated_at,
             (SELECT COALESCE(SUM(rli.quantity), 0)::BIGINT FROM receipt_line_items rli WHERE rli.receipt_id = r.id) AS "receipt_line_item_count!",
@@ -4519,13 +4572,16 @@ pub async fn get_receipt_with_vendor(
                         COUNT(DISTINCT p.id) FILTER (WHERE inv.reconciliation_state = 'locked') AS locked_purchase_count
         FROM receipts r
         JOIN vendors v ON v.id = r.vendor_id
+        LEFT JOIN travel_locations tl ON tl.id = r.store_location_id
                 LEFT JOIN v_allocation_costs vac ON vac.receipt_id = r.id
                 LEFT JOIN purchases p ON p.id = vac.purchase_id OR (vac.allocation_id IS NULL AND p.receipt_id = r.id)
                     LEFT JOIN invoices inv ON inv.id = p.invoice_id
         WHERE r.id = $1
            GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_amount, r.total,
                              r.payment_method, r.ingestion_metadata,
-                 r.original_pdf, r.notes, r.created_at, r.updated_at"#,
+                 r.original_pdf, r.notes, r.store_location_id,
+                 tl.label, tl.address, tl.latitude, tl.longitude,
+                 r.created_at, r.updated_at"#,
         id
     )
     .fetch_optional(pool)
@@ -4550,6 +4606,11 @@ pub async fn get_receipts_with_vendor(
             r.ingestion_metadata,
             (r.original_pdf IS NOT NULL) AS has_pdf,
             r.notes,
+            r.store_location_id,
+            tl.label AS "store_label?",
+            tl.address AS "store_address?",
+            tl.latitude AS "store_latitude?",
+            tl.longitude AS "store_longitude?",
             r.created_at,
             r.updated_at,
             (SELECT COALESCE(SUM(rli.quantity), 0)::BIGINT FROM receipt_line_items rli WHERE rli.receipt_id = r.id) AS "receipt_line_item_count!",
@@ -4564,13 +4625,65 @@ pub async fn get_receipts_with_vendor(
                         COUNT(DISTINCT p.id) FILTER (WHERE inv.reconciliation_state = 'locked') AS locked_purchase_count
         FROM receipts r
         JOIN vendors v ON v.id = r.vendor_id
+        LEFT JOIN travel_locations tl ON tl.id = r.store_location_id
                 LEFT JOIN v_allocation_costs vac ON vac.receipt_id = r.id
                 LEFT JOIN purchases p ON p.id = vac.purchase_id OR (vac.allocation_id IS NULL AND p.receipt_id = r.id)
                     LEFT JOIN invoices inv ON inv.id = p.invoice_id
         GROUP BY r.id, r.vendor_id, v.name, r.receipt_number, r.receipt_date, r.subtotal, r.tax_amount, r.total,
              r.payment_method, r.ingestion_metadata,
-                 r.original_pdf, r.notes, r.created_at, r.updated_at
+                 r.original_pdf, r.notes, r.store_location_id,
+                 tl.label, tl.address, tl.latitude, tl.longitude,
+                 r.created_at, r.updated_at
         ORDER BY r.receipt_date DESC"#
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Fetch receipts that have a linked store location, optionally filtered by date range.
+/// Used by the travel map to overlay receipt purchase locations.
+pub async fn get_receipt_locations(
+    pool: &PgPool,
+    from_date: Option<NaiveDate>,
+    to_date: Option<NaiveDate>,
+) -> Result<Vec<ReceiptWithVendor>, sqlx::Error> {
+    sqlx::query_as!(
+        ReceiptWithVendor,
+        r#"SELECT 
+            r.id,
+            r.vendor_id,
+            v.name AS vendor_name,
+            r.receipt_number,
+            r.receipt_date,
+            r.subtotal,
+            r.tax_amount,
+            r.total,
+            r.payment_method,
+            r.ingestion_metadata,
+            (r.original_pdf IS NOT NULL) AS has_pdf,
+            r.notes,
+            r.store_location_id,
+            tl.label AS "store_label?",
+            tl.address AS "store_address?",
+            tl.latitude AS "store_latitude?",
+            tl.longitude AS "store_longitude?",
+            r.created_at,
+            r.updated_at,
+            0::BIGINT AS "receipt_line_item_count!",
+            0::BIGINT AS purchase_count,
+            0::DECIMAL AS purchases_total,
+            0::DECIMAL AS total_selling,
+            0::DECIMAL AS total_commission,
+            0::BIGINT AS invoiced_count,
+            0::BIGINT AS locked_purchase_count
+        FROM receipts r
+        JOIN vendors v ON v.id = r.vendor_id
+        JOIN travel_locations tl ON tl.id = r.store_location_id
+        WHERE ($1::DATE IS NULL OR r.receipt_date >= $1)
+          AND ($2::DATE IS NULL OR r.receipt_date <= $2)
+        ORDER BY r.receipt_date DESC"#,
+        from_date,
+        to_date
     )
     .fetch_all(pool)
     .await
@@ -5154,6 +5267,924 @@ pub async fn check_allocation_item_integrity(
     .await
 }
 
+// ============================================
+// Travel Report Queries
+// ============================================
+
+// --- Locations ---
+
+pub async fn get_all_travel_locations(pool: &PgPool) -> Result<Vec<TravelLocation>, sqlx::Error> {
+    sqlx::query_as::<_, TravelLocation>(
+        "SELECT * FROM travel_locations ORDER BY chain NULLS LAST, label"
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn get_travel_location_by_id(pool: &PgPool, id: Uuid) -> Result<Option<TravelLocation>, sqlx::Error> {
+    sqlx::query_as::<_, TravelLocation>("SELECT * FROM travel_locations WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn create_travel_location(pool: &PgPool, input: &CreateTravelLocation) -> Result<TravelLocation, sqlx::Error> {
+    let config_key = slugify_config_key(&input.label, &input.address);
+    sqlx::query_as::<_, TravelLocation>(
+        r#"INSERT INTO travel_locations (config_key, label, chain, address, location_type, excluded)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING *"#
+    )
+    .bind(&config_key)
+    .bind(&input.label)
+    .bind(&input.chain)
+    .bind(&input.address)
+    .bind(&input.location_type)
+    .bind(input.excluded.unwrap_or(false))
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn update_travel_location(pool: &PgPool, id: Uuid, input: &UpdateTravelLocation) -> Result<Option<TravelLocation>, sqlx::Error> {
+    let existing = get_travel_location_by_id(pool, id).await?;
+    let existing = match existing {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+
+    let label = input.label.as_deref().unwrap_or(&existing.label);
+    let address = input.address.as_deref().unwrap_or(&existing.address);
+    let chain = input.chain.as_ref().or(existing.chain.as_ref());
+    let location_type = input.location_type.as_deref().unwrap_or(&existing.location_type);
+    let excluded = input.excluded.unwrap_or(existing.excluded);
+
+    // If address changed, reset geocode
+    let (geocode_status, lat, lng) = if input.address.is_some() && input.address.as_deref() != Some(&existing.address) {
+        ("pending", None, None)
+    } else {
+        (existing.geocode_status.as_str(), existing.latitude, existing.longitude)
+    };
+
+    sqlx::query_as::<_, TravelLocation>(
+        r#"UPDATE travel_locations
+           SET label = $1, chain = $2, address = $3, location_type = $4, excluded = $5,
+               geocode_status = $6, latitude = $7, longitude = $8, geocode_error = NULL,
+               updated_at = NOW()
+           WHERE id = $9
+           RETURNING *"#
+    )
+    .bind(label)
+    .bind(chain)
+    .bind(address)
+    .bind(location_type)
+    .bind(excluded)
+    .bind(geocode_status)
+    .bind(lat)
+    .bind(lng)
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_travel_location(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM travel_locations WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn bulk_import_travel_locations(pool: &PgPool, locations: &[BulkImportLocation]) -> Result<(usize, usize), sqlx::Error> {
+    let mut success = 0;
+    let mut skipped = 0;
+    for loc in locations {
+        let config_key = slugify_config_key(&loc.label, &loc.address);
+        let result = sqlx::query(
+            r#"INSERT INTO travel_locations (config_key, label, chain, address, location_type, excluded)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (config_key) DO NOTHING"#
+        )
+        .bind(&config_key)
+        .bind(&loc.label)
+        .bind(&loc.chain)
+        .bind(&loc.address)
+        .bind(&loc.location_type)
+        .bind(loc.excluded.unwrap_or(false))
+        .execute(pool)
+        .await?;
+        if result.rows_affected() > 0 {
+            success += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+    Ok((success, skipped))
+}
+
+fn slugify_config_key(label: &str, address: &str) -> String {
+    let raw = format!("{}_{}", label, address);
+    raw.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+// --- Uploads ---
+
+pub async fn get_all_travel_uploads(pool: &PgPool) -> Result<Vec<TravelUpload>, sqlx::Error> {
+    sqlx::query_as::<_, TravelUpload>(
+        "SELECT id, filename, uploaded_at, date_range_start, date_range_end, total_segments, total_visits, total_activities, processing_status, processing_error, created_at FROM travel_uploads ORDER BY uploaded_at DESC"
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn create_travel_upload(pool: &PgPool, filename: &str, raw_data: &[u8]) -> Result<TravelUpload, sqlx::Error> {
+    sqlx::query_as::<_, TravelUpload>(
+        r#"INSERT INTO travel_uploads (filename, processing_status, raw_data)
+           VALUES ($1, 'processing', $2)
+           RETURNING *"#
+    )
+    .bind(filename)
+    .bind(raw_data)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn update_travel_upload_status(
+    pool: &PgPool,
+    id: Uuid,
+    status: &str,
+    error: Option<&str>,
+    date_start: Option<NaiveDate>,
+    date_end: Option<NaiveDate>,
+    visits: i32,
+    activities: i32,
+    segments: i32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE travel_uploads
+           SET processing_status = $1, processing_error = $2,
+               date_range_start = $3, date_range_end = $4,
+               total_visits = $5, total_activities = $6, total_segments = $7
+           WHERE id = $8"#
+    )
+    .bind(status)
+    .bind(error)
+    .bind(date_start)
+    .bind(date_end)
+    .bind(visits)
+    .bind(activities)
+    .bind(segments)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_travel_upload(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM travel_uploads WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Get raw timeline data for re-parsing.
+pub async fn get_travel_upload_raw_data(pool: &PgPool, id: Uuid) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
+        "SELECT raw_data FROM travel_uploads WHERE id = $1"
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.0))
+}
+
+/// Delete all visits, activities, and segments for an upload (for re-parsing).
+pub async fn clear_travel_upload_data(pool: &PgPool, upload_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM travel_segments WHERE upload_id = $1")
+        .bind(upload_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM travel_activities WHERE upload_id = $1")
+        .bind(upload_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM travel_visits WHERE upload_id = $1")
+        .bind(upload_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// --- Visits ---
+
+pub async fn insert_travel_visit(pool: &PgPool, upload_id: Uuid, visit: &crate::services::travel::parser::ParsedVisit, matched_location_id: Option<Uuid>, match_distance: Option<f64>) -> Result<TravelVisit, sqlx::Error> {
+    sqlx::query_as::<_, TravelVisit>(
+        r#"INSERT INTO travel_visits (upload_id, place_id, semantic_type, latitude, longitude, start_time, end_time, duration_minutes, matched_location_id, match_distance_meters, hierarchy_level, probability)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           RETURNING *"#
+    )
+    .bind(upload_id)
+    .bind(&visit.place_id)
+    .bind(&visit.semantic_type)
+    .bind(visit.latitude)
+    .bind(visit.longitude)
+    .bind(visit.start_time)
+    .bind(visit.end_time)
+    .bind(visit.duration_minutes)
+    .bind(matched_location_id)
+    .bind(match_distance)
+    .bind(visit.hierarchy_level)
+    .bind(visit.probability)
+    .fetch_one(pool)
+    .await
+}
+
+// --- Activities ---
+
+pub async fn insert_travel_activity(pool: &PgPool, upload_id: Uuid, activity: &crate::services::travel::parser::ParsedActivity) -> Result<TravelActivity, sqlx::Error> {
+    sqlx::query_as::<_, TravelActivity>(
+        r#"INSERT INTO travel_activities (upload_id, activity_type, start_lat, start_lng, end_lat, end_lng, distance_meters, start_time, end_time, probability)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           RETURNING *"#
+    )
+    .bind(upload_id)
+    .bind(&activity.activity_type)
+    .bind(activity.start_lat)
+    .bind(activity.start_lng)
+    .bind(activity.end_lat)
+    .bind(activity.end_lng)
+    .bind(activity.distance_meters)
+    .bind(activity.start_time)
+    .bind(activity.end_time)
+    .bind(activity.probability)
+    .fetch_one(pool)
+    .await
+}
+
+// --- Segments ---
+
+pub async fn insert_travel_segment(pool: &PgPool, upload_id: Uuid, draft: &crate::services::travel::trips::SegmentDraft) -> Result<TravelSegment, sqlx::Error> {
+    sqlx::query_as::<_, TravelSegment>(
+        r#"INSERT INTO travel_segments (upload_id, trip_date, segment_order, segment_type, activity_id, distance_meters, visit_id, start_time, end_time, from_location, to_location, classification, classification_reason, is_detour, detour_extra_km)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+           RETURNING *"#
+    )
+    .bind(upload_id)
+    .bind(draft.trip_date)
+    .bind(draft.segment_order)
+    .bind(&draft.segment_type)
+    .bind(draft.activity_id)
+    .bind(draft.distance_meters)
+    .bind(draft.visit_id)
+    .bind(draft.start_time)
+    .bind(draft.end_time)
+    .bind(&draft.from_location)
+    .bind(&draft.to_location)
+    .bind(&draft.classification)
+    .bind(&draft.classification_reason)
+    .bind(draft.is_detour)
+    .bind(draft.detour_extra_km)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn get_travel_segments(
+    pool: &PgPool,
+    upload_id: Uuid,
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+) -> Result<Vec<TravelSegmentWithDetails>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, TravelSegment>(
+        r#"SELECT ts.* FROM travel_segments ts
+           WHERE ts.upload_id = $1
+             AND ($2::date IS NULL OR ts.trip_date >= $2)
+             AND ($3::date IS NULL OR ts.trip_date <= $3)
+           ORDER BY ts.trip_date, ts.segment_order"#
+    )
+    .bind(upload_id)
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await?;
+
+    // Enrich with visit/location details
+    let mut result = Vec::with_capacity(rows.len());
+    for seg in rows {
+        let (visit_label, visit_chain, visit_duration, visit_lat, visit_lng) = if let Some(vid) = seg.visit_id {
+            let visit = sqlx::query_as::<_, TravelVisit>(
+                "SELECT * FROM travel_visits WHERE id = $1"
+            )
+            .bind(vid)
+            .fetch_optional(pool)
+            .await?;
+
+            if let Some(v) = visit {
+                let (label, chain) = if let Some(lid) = v.matched_location_id {
+                    let loc = sqlx::query_as::<_, TravelLocation>(
+                        "SELECT * FROM travel_locations WHERE id = $1"
+                    )
+                    .bind(lid)
+                    .fetch_optional(pool)
+                    .await?;
+                    loc.map(|l| (Some(l.label), l.chain)).unwrap_or((None, None))
+                } else {
+                    (None, None)
+                };
+                (label, chain, Some(v.duration_minutes), Some(v.latitude), Some(v.longitude))
+            } else {
+                (None, None, None, None, None)
+            }
+        } else {
+            (None, None, None, None, None)
+        };
+
+        // Get drive coordinates from activity, or fall back to travel_locations by label
+        let (drive_start_lat, drive_start_lng, drive_end_lat, drive_end_lng) = if let Some(aid) = seg.activity_id {
+            let act = sqlx::query_as::<_, TravelActivity>(
+                "SELECT * FROM travel_activities WHERE id = $1"
+            )
+            .bind(aid)
+            .fetch_optional(pool)
+            .await?;
+            act.map(|a| (Some(a.start_lat), Some(a.start_lng), Some(a.end_lat), Some(a.end_lng)))
+                .unwrap_or((None, None, None, None))
+        } else if seg.segment_type == "drive" {
+            // Manual segment — resolve coords from travel_locations by label
+            let from_coords = if let Some(ref label) = seg.from_location {
+                sqlx::query_as::<_, (f64, f64)>(
+                    "SELECT latitude, longitude FROM travel_locations WHERE label = $1 AND latitude IS NOT NULL LIMIT 1"
+                )
+                .bind(label)
+                .fetch_optional(pool)
+                .await?
+                .map(|(lat, lng)| (Some(lat), Some(lng)))
+                .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+            let to_coords = if let Some(ref label) = seg.to_location {
+                sqlx::query_as::<_, (f64, f64)>(
+                    "SELECT latitude, longitude FROM travel_locations WHERE label = $1 AND latitude IS NOT NULL LIMIT 1"
+                )
+                .bind(label)
+                .fetch_optional(pool)
+                .await?
+                .map(|(lat, lng)| (Some(lat), Some(lng)))
+                .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+            (from_coords.0, from_coords.1, to_coords.0, to_coords.1)
+        } else {
+            (None, None, None, None)
+        };
+
+        let (start_lat, start_lng, end_lat, end_lng) = if seg.segment_type == "drive" {
+            (drive_start_lat, drive_start_lng, drive_end_lat, drive_end_lng)
+        } else {
+            (visit_lat, visit_lng, visit_lat, visit_lng)
+        };
+
+        result.push(TravelSegmentWithDetails {
+            segment: seg,
+            visit_location_label: visit_label,
+            visit_location_chain: visit_chain,
+            visit_duration_minutes: visit_duration,
+            start_lat,
+            start_lng,
+            end_lat,
+            end_lng,
+        });
+    }
+
+    Ok(result)
+}
+
+pub async fn update_travel_segment(
+    pool: &PgPool,
+    id: Uuid,
+    input: &UpdateTravelSegment,
+) -> Result<Option<TravelSegment>, sqlx::Error> {
+    let existing = sqlx::query_as::<_, TravelSegment>("SELECT * FROM travel_segments WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+
+    let existing = match existing {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+
+    let classification = input.classification.as_deref().unwrap_or(&existing.classification);
+    let notes = input.notes.as_ref().or(existing.notes.as_ref());
+    let reason = if input.classification.is_some() { "manual" } else { existing.classification_reason.as_deref().unwrap_or("auto") };
+
+    sqlx::query_as::<_, TravelSegment>(
+        r#"UPDATE travel_segments
+           SET classification = $1, classification_reason = $2, notes = $3, updated_at = NOW()
+           WHERE id = $4
+           RETURNING *"#
+    )
+    .bind(classification)
+    .bind(reason)
+    .bind(notes)
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn link_receipt_to_segment(pool: &PgPool, segment_id: Uuid, receipt_id: Option<Uuid>) -> Result<Option<TravelSegment>, sqlx::Error> {
+    sqlx::query_as::<_, TravelSegment>(
+        r#"UPDATE travel_segments
+           SET linked_receipt_id = $1, updated_at = NOW()
+           WHERE id = $2
+           RETURNING *"#
+    )
+    .bind(receipt_id)
+    .bind(segment_id)
+    .fetch_optional(pool)
+    .await
+}
+
+// --- Trip Logs ---
+
+pub async fn create_trip_log(
+    pool: &PgPool,
+    input: &CreateTripLog,
+) -> Result<TravelTripLog, sqlx::Error> {
+    // Compute km from segments if we have an upload_id
+    let (total_km, business_km) = if let Some(upload_id) = input.upload_id {
+        let row: (f64, f64) = sqlx::query_as(
+            r#"SELECT
+                COALESCE(SUM(distance_meters), 0) / 1000.0,
+                COALESCE(SUM(CASE WHEN classification = 'business' THEN distance_meters ELSE 0 END), 0) / 1000.0
+               FROM travel_segments
+               WHERE upload_id = $1 AND trip_date = $2"#
+        )
+        .bind(upload_id)
+        .bind(input.trip_date)
+        .fetch_one(pool)
+        .await?;
+        (row.0, row.1)
+    } else {
+        (0.0, 0.0)
+    };
+
+    let source = input.source.as_deref().unwrap_or("timeline");
+
+    // Check if a log already exists for this date (merge scenario)
+    let existing = sqlx::query_as::<_, TravelTripLog>(
+        "SELECT * FROM travel_trip_logs WHERE trip_date = $1"
+    )
+    .bind(input.trip_date)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(existing) = existing {
+        // Merge: keep higher km (timeline GPS > manual), combine purposes, mark as merged
+        let merged_total = if total_km > 0.0 { total_km.max(existing.total_km) } else { existing.total_km };
+        let merged_business = if business_km > 0.0 { business_km.max(existing.business_km) } else { existing.business_km };
+        let merged_purpose = if let Some(ref new_purpose) = input.purpose {
+            if existing.purpose.is_empty() {
+                new_purpose.clone()
+            } else if new_purpose.is_empty() {
+                existing.purpose.clone()
+            } else {
+                format!("{} | {}", existing.purpose, new_purpose)
+            }
+        } else {
+            existing.purpose.clone()
+        };
+        let merged_source = if existing.source != source { "merged".to_string() } else { existing.source.clone() };
+        let merged_upload = input.upload_id.or(existing.upload_id);
+
+        return sqlx::query_as::<_, TravelTripLog>(
+            r#"UPDATE travel_trip_logs
+               SET upload_id = $1, purpose = $2, notes = COALESCE($3, notes),
+                   total_km = $4, business_km = $5, source = $6, updated_at = NOW()
+               WHERE id = $7 RETURNING *"#
+        )
+        .bind(merged_upload)
+        .bind(&merged_purpose)
+        .bind(input.notes.as_deref())
+        .bind(merged_total)
+        .bind(merged_business)
+        .bind(&merged_source)
+        .bind(existing.id)
+        .fetch_one(pool)
+        .await;
+    }
+
+    sqlx::query_as::<_, TravelTripLog>(
+        r#"INSERT INTO travel_trip_logs (upload_id, trip_date, purpose, notes, total_km, business_km, source, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft')
+           RETURNING *"#
+    )
+    .bind(input.upload_id)
+    .bind(input.trip_date)
+    .bind(input.purpose.as_deref().unwrap_or(""))
+    .bind(input.notes.as_deref().unwrap_or(""))
+    .bind(total_km)
+    .bind(business_km)
+    .bind(source)
+    .fetch_one(pool)
+    .await
+}
+
+pub async fn get_trip_log(pool: &PgPool, id: Uuid) -> Result<Option<TravelTripLog>, sqlx::Error> {
+    sqlx::query_as::<_, TravelTripLog>("SELECT * FROM travel_trip_logs WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn get_trip_log_by_date(pool: &PgPool, trip_date: NaiveDate) -> Result<Option<TravelTripLog>, sqlx::Error> {
+    sqlx::query_as::<_, TravelTripLog>(
+        "SELECT * FROM travel_trip_logs WHERE trip_date = $1"
+    )
+    .bind(trip_date)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn list_trip_logs(pool: &PgPool, upload_id: Option<Uuid>) -> Result<Vec<TravelTripLog>, sqlx::Error> {
+    if let Some(uid) = upload_id {
+        sqlx::query_as::<_, TravelTripLog>(
+            "SELECT * FROM travel_trip_logs WHERE upload_id = $1 ORDER BY trip_date"
+        )
+        .bind(uid)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query_as::<_, TravelTripLog>(
+            "SELECT * FROM travel_trip_logs ORDER BY trip_date"
+        )
+        .fetch_all(pool)
+        .await
+    }
+}
+
+/// Get all segments for a specific date, regardless of upload source.
+/// Used by the Mileage Log page to show day detail.
+pub async fn get_segments_for_date(
+    pool: &PgPool,
+    trip_date: NaiveDate,
+) -> Result<Vec<TravelSegmentWithDetails>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, TravelSegment>(
+        r#"SELECT * FROM travel_segments
+           WHERE trip_date = $1
+           ORDER BY segment_order"#
+    )
+    .bind(trip_date)
+    .fetch_all(pool)
+    .await?;
+
+    // Reuse same enrichment logic as get_travel_segments
+    let mut result = Vec::with_capacity(rows.len());
+    for seg in rows {
+        let (visit_label, visit_chain, visit_duration, visit_lat, visit_lng) = if let Some(vid) = seg.visit_id {
+            let visit = sqlx::query_as::<_, TravelVisit>(
+                "SELECT * FROM travel_visits WHERE id = $1"
+            )
+            .bind(vid)
+            .fetch_optional(pool)
+            .await?;
+
+            if let Some(v) = visit {
+                let (label, chain) = if let Some(lid) = v.matched_location_id {
+                    let loc = sqlx::query_as::<_, TravelLocation>(
+                        "SELECT * FROM travel_locations WHERE id = $1"
+                    )
+                    .bind(lid)
+                    .fetch_optional(pool)
+                    .await?;
+                    loc.map(|l| (Some(l.label), l.chain)).unwrap_or((None, None))
+                } else {
+                    (None, None)
+                };
+                (label, chain, Some(v.duration_minutes), Some(v.latitude), Some(v.longitude))
+            } else {
+                (None, None, None, None, None)
+            }
+        } else {
+            (None, None, None, None, None)
+        };
+
+        let (drive_start_lat, drive_start_lng, drive_end_lat, drive_end_lng) = if let Some(aid) = seg.activity_id {
+            let act = sqlx::query_as::<_, TravelActivity>(
+                "SELECT * FROM travel_activities WHERE id = $1"
+            )
+            .bind(aid)
+            .fetch_optional(pool)
+            .await?;
+            act.map(|a| (Some(a.start_lat), Some(a.start_lng), Some(a.end_lat), Some(a.end_lng)))
+                .unwrap_or((None, None, None, None))
+        } else if seg.segment_type == "drive" {
+            // Manual segment — resolve coords from travel_locations by label
+            let from_coords = if let Some(ref label) = seg.from_location {
+                sqlx::query_as::<_, (f64, f64)>(
+                    "SELECT latitude, longitude FROM travel_locations WHERE label = $1 AND latitude IS NOT NULL LIMIT 1"
+                )
+                .bind(label)
+                .fetch_optional(pool)
+                .await?
+                .map(|(lat, lng)| (Some(lat), Some(lng)))
+                .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+            let to_coords = if let Some(ref label) = seg.to_location {
+                sqlx::query_as::<_, (f64, f64)>(
+                    "SELECT latitude, longitude FROM travel_locations WHERE label = $1 AND latitude IS NOT NULL LIMIT 1"
+                )
+                .bind(label)
+                .fetch_optional(pool)
+                .await?
+                .map(|(lat, lng)| (Some(lat), Some(lng)))
+                .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+            (from_coords.0, from_coords.1, to_coords.0, to_coords.1)
+        } else {
+            (None, None, None, None)
+        };
+
+        let (start_lat, start_lng, end_lat, end_lng) = if seg.segment_type == "drive" {
+            (drive_start_lat, drive_start_lng, drive_end_lat, drive_end_lng)
+        } else {
+            (visit_lat, visit_lng, visit_lat, visit_lng)
+        };
+
+        result.push(TravelSegmentWithDetails {
+            segment: seg,
+            visit_location_label: visit_label,
+            visit_location_chain: visit_chain,
+            visit_duration_minutes: visit_duration,
+            start_lat,
+            start_lng,
+            end_lat,
+            end_lng,
+        });
+    }
+
+    Ok(result)
+}
+
+pub async fn update_trip_log(
+    pool: &PgPool,
+    id: Uuid,
+    input: &UpdateTripLog,
+) -> Result<Option<TravelTripLog>, sqlx::Error> {
+    let existing = sqlx::query_as::<_, TravelTripLog>("SELECT * FROM travel_trip_logs WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+
+    let existing = match existing {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+
+    let purpose = input.purpose.as_deref().unwrap_or(&existing.purpose);
+    let notes = input.notes.as_deref().unwrap_or(&existing.notes);
+    let status = input.status.as_deref().unwrap_or(&existing.status);
+
+    sqlx::query_as::<_, TravelTripLog>(
+        r#"UPDATE travel_trip_logs
+           SET purpose = $1, notes = $2, status = $3, updated_at = NOW()
+           WHERE id = $4
+           RETURNING *"#
+    )
+    .bind(purpose)
+    .bind(notes)
+    .bind(status)
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn delete_trip_log(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM travel_trip_logs WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn refresh_trip_log_km(pool: &PgPool, log: &TravelTripLog) -> Result<Option<TravelTripLog>, sqlx::Error> {
+    // Compute km from ALL segments for this date (source-agnostic)
+    let row: (f64, f64) = sqlx::query_as(
+        r#"SELECT
+            COALESCE(SUM(distance_meters), 0) / 1000.0,
+            COALESCE(SUM(CASE WHEN classification = 'business' THEN distance_meters ELSE 0 END), 0) / 1000.0
+           FROM travel_segments
+           WHERE trip_date = $1"#
+    )
+    .bind(log.trip_date)
+    .fetch_one(pool)
+    .await?;
+
+    sqlx::query_as::<_, TravelTripLog>(
+        r#"UPDATE travel_trip_logs SET total_km = $1, business_km = $2, updated_at = NOW()
+           WHERE id = $3 RETURNING *"#
+    )
+    .bind(row.0)
+    .bind(row.1)
+    .bind(log.id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Create a trip log entry from receipt data with manually-entered segments.
+/// If a log already exists for this date (e.g. from timeline), merges into it.
+pub async fn create_receipt_trip_log(
+    pool: &PgPool,
+    input: &CreateReceiptTripLog,
+) -> Result<TravelTripLog, sqlx::Error> {
+    use chrono::Utc;
+
+    // Compute km from the manual segments
+    let total_km: f64 = input.segments.iter().map(|s| s.distance_km).sum();
+    let business_km: f64 = input.segments.iter()
+        .filter(|s| s.classification == "business")
+        .map(|s| s.distance_km)
+        .sum();
+
+    // Check if a log already exists for this date
+    let existing = sqlx::query_as::<_, TravelTripLog>(
+        "SELECT * FROM travel_trip_logs WHERE trip_date = $1"
+    )
+    .bind(input.trip_date)
+    .fetch_optional(pool)
+    .await?;
+
+    let log = if let Some(existing) = existing {
+        // Merge: keep timeline GPS km if higher, combine purposes
+        let merged_total = total_km.max(existing.total_km);
+        let merged_business = business_km.max(existing.business_km);
+        let merged_purpose = if let Some(ref new_purpose) = input.purpose {
+            if existing.purpose.is_empty() {
+                new_purpose.clone()
+            } else if new_purpose.is_empty() {
+                existing.purpose.clone()
+            } else {
+                format!("{} | {}", existing.purpose, new_purpose)
+            }
+        } else {
+            existing.purpose.clone()
+        };
+
+        sqlx::query_as::<_, TravelTripLog>(
+            r#"UPDATE travel_trip_logs
+               SET purpose = $1, notes = COALESCE($2, notes),
+                   total_km = $3, business_km = $4, source = 'merged', updated_at = NOW()
+               WHERE id = $5 RETURNING *"#
+        )
+        .bind(&merged_purpose)
+        .bind(input.notes.as_deref())
+        .bind(merged_total)
+        .bind(merged_business)
+        .bind(existing.id)
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, TravelTripLog>(
+            r#"INSERT INTO travel_trip_logs (trip_date, purpose, notes, total_km, business_km, source, status)
+               VALUES ($1, $2, $3, $4, $5, 'receipt', 'draft')
+               RETURNING *"#
+        )
+        .bind(input.trip_date)
+        .bind(input.purpose.as_deref().unwrap_or(""))
+        .bind(input.notes.as_deref().unwrap_or(""))
+        .bind(total_km)
+        .bind(business_km)
+        .fetch_one(pool)
+        .await?
+    };
+
+    // Insert the manual segments
+    let now = Utc::now();
+    for (i, seg) in input.segments.iter().enumerate() {
+        sqlx::query(
+            r#"INSERT INTO travel_segments
+               (trip_date, segment_order, segment_type, distance_meters,
+                start_time, end_time, from_location, to_location,
+                classification, classification_reason)
+               VALUES ($1, $2, 'drive', $3, $4, $5, $6, $7, $8, 'manual')"#
+        )
+        .bind(input.trip_date)
+        .bind(i as i32)
+        .bind(seg.distance_km * 1000.0) // store as meters
+        .bind(now)
+        .bind(now)
+        .bind(&seg.from_location)
+        .bind(&seg.to_location)
+        .bind(&seg.classification)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(log)
+}
+
+pub async fn get_travel_summary(
+    pool: &PgPool,
+    upload_id: Uuid,
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+) -> Result<TravelSummary, sqlx::Error> {
+    // Get all segments for this upload in the date range
+    let segments = sqlx::query_as::<_, TravelSegment>(
+        r#"SELECT * FROM travel_segments
+           WHERE upload_id = $1
+             AND ($2::date IS NULL OR trip_date >= $2)
+             AND ($3::date IS NULL OR trip_date <= $3)
+           ORDER BY trip_date, segment_order"#
+    )
+    .bind(upload_id)
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await?;
+
+    let mut total_km = 0.0_f64;
+    let mut business_km = 0.0_f64;
+    let mut personal_km = 0.0_f64;
+    let mut unclassified_km = 0.0_f64;
+    let mut store_visit_count = 0_i32;
+
+    // Group by date for trip summaries
+    let mut trips_map: std::collections::BTreeMap<NaiveDate, TravelTripSummary> = std::collections::BTreeMap::new();
+
+    for seg in &segments {
+        let km = seg.distance_meters.unwrap_or(0.0) / 1000.0;
+        total_km += km;
+
+        match seg.classification.as_str() {
+            "business" => business_km += km,
+            "personal" | "commute" => personal_km += km,
+            _ => unclassified_km += km,
+        }
+
+        // Count store visits
+        if seg.segment_type == "visit" && seg.classification == "business" {
+            store_visit_count += 1;
+        }
+
+        let trip = trips_map.entry(seg.trip_date).or_insert_with(|| TravelTripSummary {
+            trip_date: seg.trip_date,
+            total_distance_km: 0.0,
+            business_km: 0.0,
+            personal_km: 0.0,
+            commute_km: 0.0, // unused, kept for compat
+            unclassified_km: 0.0,
+            segment_count: 0,
+            store_visits: Vec::new(),
+        });
+
+        trip.total_distance_km += km;
+        trip.segment_count += 1;
+        match seg.classification.as_str() {
+            "business" => trip.business_km += km,
+            "personal" | "commute" => trip.personal_km += km,
+            _ => trip.unclassified_km += km,
+        }
+
+        // Track store visit names
+        if seg.segment_type == "visit" && seg.classification == "business" {
+            if let Some(ref loc) = seg.from_location {
+                if !trip.store_visits.contains(loc) {
+                    trip.store_visits.push(loc.clone());
+                }
+            }
+        }
+    }
+
+    let business_percentage = if total_km > 0.0 {
+        (business_km / total_km) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(TravelSummary {
+        total_km,
+        business_km,
+        personal_km,
+        commute_km: 0.0, // deprecated, folded into personal
+        unclassified_km,
+        business_percentage,
+        total_trips: trips_map.len() as i32,
+        total_store_visits: store_visit_count,
+        trips: trips_map.into_values().collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5538,6 +6569,7 @@ mod tests {
                 payment_method: None,
                 ingestion_metadata: None,
                 notes: None,
+                store_location_id: None,
             },
             Uuid::new_v4(),
         )
@@ -5599,6 +6631,7 @@ mod tests {
                 payment_method: None,
                 ingestion_metadata: None,
                 notes: Some("edited receipt totals".to_string()),
+                store_location_id: None,
             },
             Uuid::new_v4(),
         )
@@ -6387,6 +7420,13 @@ mod tests {
                 purchase_type: None,
                 bonus_for_purchase_id: None,
                 clear_bonus_for_purchase: false,
+                cost_adjustment: None,
+                adjustment_note: None,
+                clear_adjustment_note: false,
+                display_parent_purchase_id: None,
+                clear_display_parent_purchase: false,
+                display_group: None,
+                clear_display_group: false,
             },
             Uuid::new_v4(),
         )
@@ -6930,6 +7970,13 @@ mod tests {
                 purchase_type: None,
                 bonus_for_purchase_id: None,
                 clear_bonus_for_purchase: false,
+                cost_adjustment: None,
+                adjustment_note: None,
+                clear_adjustment_note: false,
+                display_parent_purchase_id: None,
+                clear_display_parent_purchase: false,
+                display_group: None,
+                clear_display_group: false,
             },
             Uuid::new_v4(),
         )
@@ -7100,6 +8147,13 @@ mod tests {
                 purchase_type: None,
                 bonus_for_purchase_id: None,
                 clear_bonus_for_purchase: false,
+                cost_adjustment: None,
+                adjustment_note: None,
+                clear_adjustment_note: false,
+                display_parent_purchase_id: None,
+                clear_display_parent_purchase: false,
+                display_group: None,
+                clear_display_group: false,
             },
             Uuid::new_v4(),
         )
@@ -7381,6 +8435,7 @@ mod tests {
                 payment_method: None,
                 ingestion_metadata: None,
                 notes: None,
+                store_location_id: None,
             },
             Uuid::new_v4(),
         )
@@ -7407,6 +8462,8 @@ mod tests {
                 unit_cost: Decimal::new(12345, 2),
                 notes: Some("should fail".to_string()),
                 parent_line_item_id: None,
+                state: None,
+                line_type: None,
             },
         )
         .await
@@ -7422,6 +8479,7 @@ mod tests {
                 quantity: None,
                 unit_cost: None,
                 notes: Some("should fail".to_string()),
+                state: None,
             },
         )
         .await

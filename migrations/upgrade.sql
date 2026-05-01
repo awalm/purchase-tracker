@@ -919,3 +919,301 @@ BEGIN
   ALTER TABLE receipt_line_items ADD CONSTRAINT chk_receipt_line_items_state
     CHECK (state IN ('active', 'returned', 'damaged', 'lost'));
 END $$;
+
+-- ============================================
+-- TRAVEL REPORT: Location Management
+-- ============================================
+CREATE TABLE IF NOT EXISTS travel_locations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(255) NOT NULL UNIQUE,
+    label VARCHAR(255) NOT NULL,
+    chain VARCHAR(100),
+    address TEXT NOT NULL,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    geocode_status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    geocode_error TEXT,
+    location_type VARCHAR(20) NOT NULL DEFAULT 'business',
+    excluded BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_travel_locations_type') THEN
+    ALTER TABLE travel_locations ADD CONSTRAINT chk_travel_locations_type
+      CHECK (location_type IN ('business', 'personal'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_travel_locations_geocode') THEN
+    ALTER TABLE travel_locations ADD CONSTRAINT chk_travel_locations_geocode
+      CHECK (geocode_status IN ('pending', 'resolved', 'failed'));
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_travel_locations_type ON travel_locations(location_type);
+CREATE INDEX IF NOT EXISTS idx_travel_locations_chain ON travel_locations(chain);
+
+-- ============================================
+-- TRAVEL REPORT: Upload Tracking
+-- ============================================
+CREATE TABLE IF NOT EXISTS travel_uploads (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    filename VARCHAR(255) NOT NULL,
+    uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    date_range_start DATE,
+    date_range_end DATE,
+    total_segments INT NOT NULL DEFAULT 0,
+    total_visits INT NOT NULL DEFAULT 0,
+    total_activities INT NOT NULL DEFAULT 0,
+    processing_status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    processing_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_travel_uploads_status') THEN
+    ALTER TABLE travel_uploads ADD CONSTRAINT chk_travel_uploads_status
+      CHECK (processing_status IN ('pending', 'processing', 'completed', 'failed'));
+  END IF;
+END $$;
+
+-- ============================================
+-- TRAVEL REPORT: Parsed Visits
+-- ============================================
+CREATE TABLE IF NOT EXISTS travel_visits (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    upload_id UUID NOT NULL REFERENCES travel_uploads(id) ON DELETE CASCADE,
+    place_id VARCHAR(255),
+    semantic_type VARCHAR(50),
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time TIMESTAMPTZ NOT NULL,
+    duration_minutes INT NOT NULL,
+    matched_location_id UUID REFERENCES travel_locations(id),
+    match_distance_meters DOUBLE PRECISION,
+    hierarchy_level INT NOT NULL DEFAULT 0,
+    probability DOUBLE PRECISION,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_travel_visits_upload ON travel_visits(upload_id);
+CREATE INDEX IF NOT EXISTS idx_travel_visits_time ON travel_visits(start_time);
+CREATE INDEX IF NOT EXISTS idx_travel_visits_matched ON travel_visits(matched_location_id);
+
+-- ============================================
+-- TRAVEL REPORT: Parsed Activities
+-- ============================================
+CREATE TABLE IF NOT EXISTS travel_activities (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    upload_id UUID NOT NULL REFERENCES travel_uploads(id) ON DELETE CASCADE,
+    activity_type VARCHAR(50) NOT NULL,
+    start_lat DOUBLE PRECISION NOT NULL,
+    start_lng DOUBLE PRECISION NOT NULL,
+    end_lat DOUBLE PRECISION NOT NULL,
+    end_lng DOUBLE PRECISION NOT NULL,
+    distance_meters DOUBLE PRECISION NOT NULL,
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time TIMESTAMPTZ NOT NULL,
+    probability DOUBLE PRECISION,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_travel_activities_upload ON travel_activities(upload_id);
+CREATE INDEX IF NOT EXISTS idx_travel_activities_time ON travel_activities(start_time);
+
+-- ============================================
+-- TRAVEL REPORT: Trip Segments (classified)
+-- ============================================
+CREATE TABLE IF NOT EXISTS travel_segments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    upload_id UUID NOT NULL REFERENCES travel_uploads(id) ON DELETE CASCADE,
+    trip_date DATE NOT NULL,
+    segment_order INT NOT NULL,
+    segment_type VARCHAR(20) NOT NULL,
+    activity_id UUID REFERENCES travel_activities(id),
+    distance_meters DOUBLE PRECISION,
+    visit_id UUID REFERENCES travel_visits(id),
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time TIMESTAMPTZ NOT NULL,
+    from_location VARCHAR(255),
+    to_location VARCHAR(255),
+    classification VARCHAR(20) NOT NULL DEFAULT 'unclassified',
+    classification_reason VARCHAR(100),
+    is_detour BOOLEAN NOT NULL DEFAULT FALSE,
+    detour_extra_km DOUBLE PRECISION,
+    linked_receipt_id UUID REFERENCES receipts(id),
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_travel_segments_type') THEN
+    ALTER TABLE travel_segments ADD CONSTRAINT chk_travel_segments_type
+      CHECK (segment_type IN ('drive', 'visit'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_travel_segments_class') THEN
+    ALTER TABLE travel_segments ADD CONSTRAINT chk_travel_segments_class
+      CHECK (classification IN ('business', 'personal', 'commute', 'unclassified'));
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_travel_segments_upload ON travel_segments(upload_id);
+CREATE INDEX IF NOT EXISTS idx_travel_segments_date ON travel_segments(trip_date);
+CREATE INDEX IF NOT EXISTS idx_travel_segments_classification ON travel_segments(classification);
+
+-- ============================================
+-- TRAVEL LOCATIONS: Rename 'store' type to 'business'
+-- ============================================
+-- Drop constraint first so we can update the data
+ALTER TABLE travel_locations DROP CONSTRAINT IF EXISTS chk_travel_locations_type;
+
+-- Migrate existing 'store' rows to 'business'
+UPDATE travel_locations SET location_type = 'business' WHERE location_type = 'store';
+
+-- Change default from 'store' to 'business'
+ALTER TABLE travel_locations ALTER COLUMN location_type SET DEFAULT 'business';
+
+-- Recreate the constraint with 'business' instead of 'store'
+ALTER TABLE travel_locations ADD CONSTRAINT chk_travel_locations_type
+  CHECK (location_type IN ('business', 'personal'));
+
+-- ============================================
+-- TRAVEL UPLOADS: Store compressed raw timeline data for re-parsing
+-- ============================================
+ALTER TABLE travel_uploads ADD COLUMN IF NOT EXISTS raw_data BYTEA;
+
+-- ============================================
+-- TRAVEL SEGMENTS: Remove 'commute' classification (fold into 'personal')
+-- ============================================
+ALTER TABLE travel_segments DROP CONSTRAINT IF EXISTS chk_travel_segments_class;
+UPDATE travel_segments SET classification = 'personal', classification_reason = 'auto:personal'
+  WHERE classification = 'commute';
+ALTER TABLE travel_segments ADD CONSTRAINT chk_travel_segments_class
+  CHECK (classification IN ('business', 'personal', 'unclassified'));
+
+-- ============================================
+-- TRAVEL TRIP LOGS: Saved/confirmed business trips for audit
+-- ============================================
+CREATE TABLE IF NOT EXISTS travel_trip_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    upload_id UUID NOT NULL REFERENCES travel_uploads(id) ON DELETE CASCADE,
+    trip_date DATE NOT NULL,
+    purpose TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    total_km DOUBLE PRECISION NOT NULL DEFAULT 0,
+    business_km DOUBLE PRECISION NOT NULL DEFAULT 0,
+    status VARCHAR(20) NOT NULL DEFAULT 'draft',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(upload_id, trip_date)
+);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_trip_log_status') THEN
+    ALTER TABLE travel_trip_logs ADD CONSTRAINT chk_trip_log_status
+      CHECK (status IN ('draft', 'confirmed'));
+  END IF;
+END $$;
+
+-- ============================================
+-- RECEIPT STORE LOCATION: FK to travel_locations
+-- ============================================
+ALTER TABLE receipts ADD COLUMN IF NOT EXISTS store_location_id UUID REFERENCES travel_locations(id) ON DELETE SET NULL;
+
+-- Drop legacy denormalized store columns (no data existed)
+ALTER TABLE receipts DROP COLUMN IF EXISTS store_address;
+ALTER TABLE receipts DROP COLUMN IF EXISTS store_latitude;
+ALTER TABLE receipts DROP COLUMN IF EXISTS store_longitude;
+
+-- ============================================
+-- MILEAGE LOG DECOUPLING: Make trip logs & segments independent of uploads
+-- ============================================
+
+-- 1) travel_trip_logs: make upload_id nullable, add source, change unique to (trip_date)
+ALTER TABLE travel_trip_logs ALTER COLUMN upload_id DROP NOT NULL;
+
+ALTER TABLE travel_trip_logs ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'timeline';
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_trip_log_source') THEN
+    ALTER TABLE travel_trip_logs ADD CONSTRAINT chk_trip_log_source
+      CHECK (source IN ('timeline', 'receipt', 'merged'));
+  END IF;
+END $$;
+
+-- Drop old unique and FK, add new ones
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'travel_trip_logs_upload_id_trip_date_key') THEN
+    ALTER TABLE travel_trip_logs DROP CONSTRAINT travel_trip_logs_upload_id_trip_date_key;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'travel_trip_logs_trip_date_key') THEN
+    ALTER TABLE travel_trip_logs ADD CONSTRAINT travel_trip_logs_trip_date_key UNIQUE (trip_date);
+  END IF;
+END $$;
+
+-- Change FK from CASCADE to SET NULL (don't lose logs when deleting an upload)
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'travel_trip_logs_upload_id_fkey') THEN
+    ALTER TABLE travel_trip_logs DROP CONSTRAINT travel_trip_logs_upload_id_fkey;
+    ALTER TABLE travel_trip_logs ADD CONSTRAINT travel_trip_logs_upload_id_fkey
+      FOREIGN KEY (upload_id) REFERENCES travel_uploads(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+-- 2) travel_segments: make upload_id nullable, change FK to SET NULL
+ALTER TABLE travel_segments ALTER COLUMN upload_id DROP NOT NULL;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'travel_segments_upload_id_fkey') THEN
+    ALTER TABLE travel_segments DROP CONSTRAINT travel_segments_upload_id_fkey;
+    ALTER TABLE travel_segments ADD CONSTRAINT travel_segments_upload_id_fkey
+      FOREIGN KEY (upload_id) REFERENCES travel_uploads(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+-- vendors: add default_location_id
+ALTER TABLE vendors ADD COLUMN IF NOT EXISTS default_location_id UUID REFERENCES travel_locations(id) ON DELETE SET NULL;
+
+-- Remove is_online_only (replaced by stamping online location UUID on receipts)
+ALTER TABLE vendors DROP COLUMN IF EXISTS is_online_only;
+
+-- Expand location_type check constraint to include 'online'
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_enum e
+    JOIN pg_type t ON t.oid = e.enumtypid
+    WHERE t.typname = 'dummy_never_matches'
+  ) THEN
+    -- Drop and recreate the check constraint to allow 'online'
+    ALTER TABLE travel_locations DROP CONSTRAINT IF EXISTS travel_locations_location_type_check;
+    ALTER TABLE travel_locations ADD CONSTRAINT travel_locations_location_type_check
+      CHECK (location_type IN ('business', 'personal', 'online'));
+  END IF;
+END $$;
+
+-- Insert the "Online (No Store)" sentinel location if it doesn't exist
+INSERT INTO travel_locations (id, label, address, location_type, excluded, config_key)
+VALUES (
+  'da93b014-0fd4-42f5-820c-56310f93d840',
+  'Online (No Store)',
+  '',
+  'online',
+  true,
+  '__online__'
+)
+ON CONFLICT (id) DO UPDATE SET
+  latitude = NULL,
+  longitude = NULL,
+  location_type = 'online',
+  excluded = true;

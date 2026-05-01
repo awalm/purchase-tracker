@@ -88,6 +88,11 @@ export interface ReceiptWithVendor {
   total: string;
   has_pdf: boolean | null;
   notes: string | null;
+  store_location_id: string | null;
+  store_label: string | null;
+  store_address: string | null;
+  store_latitude: number | null;
+  store_longitude: number | null;
   created_at: string;
   updated_at: string;
   receipt_line_item_count: number;

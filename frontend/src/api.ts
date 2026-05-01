@@ -1,5 +1,5 @@
 import { compressUploadFile } from './lib/uploadCompression';
-import type { PurchaseEconomics } from './types';
+import type { PurchaseEconomics, ReceiptWithVendor } from './types';
 
 const API_BASE = '/api';
 
@@ -164,20 +164,24 @@ export const auth = {
 
 // Vendors
 export const vendors = {
-  list: () => request<{ id: string; name: string; short_id: string | null }[]>('/vendors'),
-  get: (id: string) => request<{ id: string; name: string; short_id: string | null }>(`/vendors/${id}`),
+  list: () => request<{ id: string; name: string; short_id: string | null; default_location_id: string | null }[]>('/vendors'),
+  get: (id: string) => request<{ id: string; name: string; short_id: string | null; default_location_id: string | null }>(`/vendors/${id}`),
   create: (data: { name: string; short_id?: string }) =>
-    request<{ id: string; name: string; short_id: string | null }>('/vendors', {
+    request<{ id: string; name: string; short_id: string | null; default_location_id: string | null }>('/vendors', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  update: (id: string, data: { name?: string; short_id?: string }) =>
-    request<{ id: string; name: string; short_id: string | null }>(`/vendors/${id}`, {
+  update: (id: string, data: Record<string, unknown>) =>
+    request<{ id: string; name: string; short_id: string | null; default_location_id: string | null }>(`/vendors/${id}`, {
       method: 'PUT',
       body: JSON.stringify(data),
     }),
   delete: (id: string) =>
     request<void>(`/vendors/${id}`, { method: 'DELETE' }),
+  applyDefaultLocation: (vendorId: string) =>
+    request<{ updated: number }>(`/vendors/${vendorId}/apply-default-location`, {
+      method: 'POST',
+    }),
   importAliases: {
     list: (vendorId: string) =>
       request<VendorImportAlias[]>(`/vendors/${vendorId}/import-aliases`),
@@ -503,6 +507,11 @@ export const receipts = {
       ingestion_metadata: ReceiptIngestionMetadata | null;
       has_pdf: boolean | null;
       notes: string | null;
+      store_location_id: string | null;
+      store_label: string | null;
+      store_address: string | null;
+      store_latitude: number | null;
+      store_longitude: number | null;
       created_at: string;
       updated_at: string;
       receipt_line_item_count: number;
@@ -527,6 +536,11 @@ export const receipts = {
       ingestion_metadata: ReceiptIngestionMetadata | null;
       has_pdf: boolean | null;
       notes: string | null;
+      store_location_id: string | null;
+      store_label: string | null;
+      store_address: string | null;
+      store_latitude: number | null;
+      store_longitude: number | null;
       created_at: string;
       updated_at: string;
       receipt_line_item_count: number;
@@ -605,6 +619,12 @@ export const receipts = {
     }
   },
   downloadPdfUrl: (id: string) => `${API_BASE}/receipts/${id}/document`,
+  locations: (from?: string, to?: string) => {
+    const params = new URLSearchParams();
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    return request<ReceiptWithVendor[]>(`/receipts/locations?${params.toString()}`);
+  },
 };
 
 // Purchases
@@ -1223,3 +1243,260 @@ export interface ReceiptLineItem {
   created_at: string;
   updated_at: string;
 }
+
+// ============================================
+// Travel Report
+// ============================================
+
+export interface TravelLocation {
+  id: string;
+  config_key: string;
+  label: string;
+  chain: string | null;
+  address: string;
+  latitude: number | null;
+  longitude: number | null;
+  geocode_status: string;
+  geocode_error: string | null;
+  location_type: string;
+  excluded: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TravelUpload {
+  id: string;
+  filename: string;
+  uploaded_at: string;
+  date_range_start: string | null;
+  date_range_end: string | null;
+  total_segments: number;
+  total_visits: number;
+  total_activities: number;
+  processing_status: string;
+  processing_error: string | null;
+  created_at: string;
+}
+
+export interface TravelSegment {
+  id: string;
+  upload_id: string;
+  trip_date: string;
+  segment_order: number;
+  segment_type: string;
+  activity_id: string | null;
+  distance_meters: number | null;
+  visit_id: string | null;
+  start_time: string;
+  end_time: string;
+  from_location: string | null;
+  to_location: string | null;
+  classification: string;
+  classification_reason: string | null;
+  is_detour: boolean;
+  detour_extra_km: number | null;
+  linked_receipt_id: string | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+  visit_location_label: string | null;
+  visit_location_chain: string | null;
+  visit_duration_minutes: number | null;
+  start_lat: number | null;
+  start_lng: number | null;
+  end_lat: number | null;
+  end_lng: number | null;
+}
+
+export interface TravelTripSummary {
+  trip_date: string;
+  total_distance_km: number;
+  business_km: number;
+  personal_km: number;
+  commute_km: number;
+  unclassified_km: number;
+  segment_count: number;
+  store_visits: string[];
+}
+
+export interface TravelSummary {
+  total_km: number;
+  business_km: number;
+  personal_km: number;
+  commute_km: number;
+  unclassified_km: number;
+  business_percentage: number;
+  total_trips: number;
+  total_store_visits: number;
+  trips: TravelTripSummary[];
+}
+
+export interface GeocodeDetail {
+  address: string;
+  status: string;
+  error: string | null;
+  lat: number | null;
+  lng: number | null;
+}
+
+export interface TravelTripLog {
+  id: string;
+  upload_id: string | null;
+  trip_date: string;
+  purpose: string;
+  notes: string;
+  total_km: number;
+  business_km: number;
+  status: string;
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TripLogWithSegments extends TravelTripLog {
+  segments: TravelSegment[];
+}
+
+export interface CreateManualSegment {
+  from_location: string;
+  to_location: string;
+  distance_km: number;
+  classification: string;
+}
+
+export interface GeocodeResponse {
+  provider: string;
+  total: number;
+  success: number;
+  failed: number;
+  details: GeocodeDetail[];
+}
+
+export const travel = {
+  // Locations
+  locations: {
+    list: () => request<TravelLocation[]>('/travel/locations'),
+    get: (id: string) => request<TravelLocation>(`/travel/locations/${id}`),
+    create: (data: { label: string; chain?: string; address: string; location_type: string; excluded?: boolean }) =>
+      request<TravelLocation>('/travel/locations', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    update: (id: string, data: { label?: string; chain?: string; address?: string; location_type?: string; excluded?: boolean }) =>
+      request<TravelLocation>(`/travel/locations/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    delete: (id: string) =>
+      request<void>(`/travel/locations/${id}`, { method: 'DELETE' }),
+    import: (locations: { label: string; chain?: string; address: string; location_type: string; excluded?: boolean }[]) =>
+      request<{ imported: number; skipped: number }>('/travel/locations/import', {
+        method: 'POST',
+        body: JSON.stringify({ locations }),
+      }),
+    geocode: (locationIds?: string[]) =>
+      request<GeocodeResponse>('/travel/locations/geocode', {
+        method: 'POST',
+        body: JSON.stringify(locationIds ? { location_ids: locationIds } : {}),
+      }),
+  },
+
+  // Uploads
+  uploads: {
+    list: () => request<TravelUpload[]>('/travel/uploads'),
+    upload: async (file: File): Promise<TravelUpload> => {
+      const token = localStorage.getItem('token');
+      const formData = new FormData();
+      formData.append('file', file);
+      const response = await fetch(`${API_BASE}/travel/uploads`, {
+        method: 'POST',
+        headers: {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: formData,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new ApiError(response.status, text || response.statusText);
+      }
+      return response.json();
+    },
+    delete: (id: string) =>
+      request<void>(`/travel/uploads/${id}`, { method: 'DELETE' }),
+    reparse: (id: string) =>
+      request<TravelUpload>(`/travel/uploads/${id}/reparse`, { method: 'POST' }),
+  },
+
+  // Segments
+  segments: {
+    list: (uploadId: string, from?: string, to?: string) => {
+      const params = new URLSearchParams();
+      params.set('upload_id', uploadId);
+      if (from) params.set('from', from);
+      if (to) params.set('to', to);
+      return request<TravelSegment[]>(`/travel/segments?${params.toString()}`);
+    },
+    listByDate: (date: string) => {
+      const params = new URLSearchParams();
+      params.set('from', date);
+      return request<TravelSegment[]>(`/travel/segments?${params.toString()}`);
+    },
+    classify: (id: string, data: { classification?: string; notes?: string }) =>
+      request<TravelSegment>(`/travel/segments/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(data),
+      }),
+    linkReceipt: (id: string, receiptId: string | null) =>
+      request<TravelSegment>(`/travel/segments/${id}/link-receipt`, {
+        method: 'POST',
+        body: JSON.stringify({ receipt_id: receiptId }),
+      }),
+  },
+
+  // Summary
+  summary: (uploadId: string, from?: string, to?: string) => {
+    const params = new URLSearchParams();
+    params.set('upload_id', uploadId);
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    return request<TravelSummary>(`/travel/summary?${params.toString()}`);
+  },
+
+  // Trip Logs
+  tripLogs: {
+    list: (uploadId?: string) => {
+      const params = new URLSearchParams();
+      if (uploadId) params.set('upload_id', uploadId);
+      const qs = params.toString();
+      return request<TravelTripLog[]>(`/travel/trip-logs${qs ? `?${qs}` : ''}`);
+    },
+    create: (data: { upload_id?: string; trip_date: string; purpose?: string; notes?: string; source?: string }) =>
+      request<TripLogWithSegments>(`/travel/trip-logs`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    createFromReceipt: (data: { trip_date: string; purpose?: string; notes?: string; segments: CreateManualSegment[] }) =>
+      request<TripLogWithSegments>(`/travel/trip-logs/receipt`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    get: (id: string) =>
+      request<TripLogWithSegments>(`/travel/trip-logs/${id}`),
+    update: (id: string, data: { purpose?: string; notes?: string; status?: string }) =>
+      request<TravelTripLog>(`/travel/trip-logs/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(data),
+      }),
+    delete: (id: string) =>
+      request<void>(`/travel/trip-logs/${id}`, { method: 'DELETE' }),
+  },
+
+  directions: (fromLat: number, fromLng: number, toLat: number, toLng: number, waypoints?: [number, number][]) => {
+    let url = `/travel/directions?from_lat=${fromLat}&from_lng=${fromLng}&to_lat=${toLat}&to_lng=${toLng}`
+    if (waypoints && waypoints.length > 0) {
+      const wp = waypoints.map(([lat, lng]) => `${lat},${lng}`).join('|')
+      url += `&waypoints=${encodeURIComponent(wp)}`
+    }
+    return request<{ distance_meters: number; coords: [number, number][] }>(url)
+  },
+};

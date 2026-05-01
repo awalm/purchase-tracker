@@ -25,6 +25,7 @@ argon2 = "0.5"
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 rust_decimal = { version = "1", features = ["serde", "macros"] }
 thiserror = "2"
 anyhow = "1"
@@ -37,6 +38,7 @@ dotenvy = "0.15"
 csv = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 zip = "0.6"
+flate2 = "1"
 
 [dev-dependencies]
 testcontainers = "0.23"

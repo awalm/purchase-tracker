@@ -29,6 +29,7 @@ pub struct Vendor {
     pub id: Uuid,
     pub name: String,
     pub short_id: Option<String>,
+    pub default_location_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -95,6 +96,7 @@ pub struct Receipt {
     pub payment_method: Option<String>,
     pub ingestion_metadata: Option<serde_json::Value>,
     pub notes: Option<String>,
+    pub store_location_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     // original_pdf and original_filename are NOT included here
@@ -446,6 +448,11 @@ pub struct ReceiptWithVendor {
     pub ingestion_metadata: Option<serde_json::Value>,
     pub has_pdf: Option<bool>,
     pub notes: Option<String>,
+    pub store_location_id: Option<Uuid>,
+    pub store_label: Option<String>,
+    pub store_address: Option<String>,
+    pub store_latitude: Option<f64>,
+    pub store_longitude: Option<f64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub receipt_line_item_count: i64,
@@ -497,6 +504,8 @@ pub struct CreateVendor {
 pub struct UpdateVendor {
     pub name: Option<String>,
     pub short_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub default_location_id: Option<Option<Uuid>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -645,6 +654,18 @@ pub struct UpdateReceipt {
     pub payment_method: Option<String>,
     pub ingestion_metadata: Option<serde_json::Value>,
     pub notes: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub store_location_id: Option<Option<Uuid>>,
+}
+
+/// Deserializes a field that can be absent (None), explicitly null (Some(None)),
+/// or present with a value (Some(Some(T))).
+fn deserialize_optional_field<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -841,6 +862,238 @@ pub struct AuditQuery {
     pub record_id: Option<Uuid>,
     pub limit: Option<i32>,
     pub offset: Option<i32>,
+}
+
+// ============================================
+// Travel Report
+// ============================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TravelLocation {
+    pub id: Uuid,
+    pub config_key: String,
+    pub label: String,
+    pub chain: Option<String>,
+    pub address: String,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub geocode_status: String,
+    pub geocode_error: Option<String>,
+    pub location_type: String,
+    pub excluded: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TravelUpload {
+    pub id: Uuid,
+    pub filename: String,
+    pub uploaded_at: DateTime<Utc>,
+    pub date_range_start: Option<NaiveDate>,
+    pub date_range_end: Option<NaiveDate>,
+    pub total_segments: i32,
+    pub total_visits: i32,
+    pub total_activities: i32,
+    pub processing_status: String,
+    pub processing_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing)]
+    #[sqlx(default)]
+    pub raw_data: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TravelVisit {
+    pub id: Uuid,
+    pub upload_id: Uuid,
+    pub place_id: Option<String>,
+    pub semantic_type: Option<String>,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    pub duration_minutes: i32,
+    pub matched_location_id: Option<Uuid>,
+    pub match_distance_meters: Option<f64>,
+    pub hierarchy_level: i32,
+    pub probability: Option<f64>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TravelActivity {
+    pub id: Uuid,
+    pub upload_id: Uuid,
+    pub activity_type: String,
+    pub start_lat: f64,
+    pub start_lng: f64,
+    pub end_lat: f64,
+    pub end_lng: f64,
+    pub distance_meters: f64,
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    pub probability: Option<f64>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TravelSegment {
+    pub id: Uuid,
+    pub upload_id: Option<Uuid>,
+    pub trip_date: NaiveDate,
+    pub segment_order: i32,
+    pub segment_type: String,
+    pub activity_id: Option<Uuid>,
+    pub distance_meters: Option<f64>,
+    pub visit_id: Option<Uuid>,
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    pub from_location: Option<String>,
+    pub to_location: Option<String>,
+    pub classification: String,
+    pub classification_reason: Option<String>,
+    pub is_detour: bool,
+    pub detour_extra_km: Option<f64>,
+    pub linked_receipt_id: Option<Uuid>,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TravelSegmentWithDetails {
+    #[serde(flatten)]
+    pub segment: TravelSegment,
+    pub visit_location_label: Option<String>,
+    pub visit_location_chain: Option<String>,
+    pub visit_duration_minutes: Option<i32>,
+    pub start_lat: Option<f64>,
+    pub start_lng: Option<f64>,
+    pub end_lat: Option<f64>,
+    pub end_lng: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TravelTripSummary {
+    pub trip_date: NaiveDate,
+    pub total_distance_km: f64,
+    pub business_km: f64,
+    pub personal_km: f64,
+    pub commute_km: f64,
+    pub unclassified_km: f64,
+    pub segment_count: i32,
+    pub store_visits: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TravelSummary {
+    pub total_km: f64,
+    pub business_km: f64,
+    pub personal_km: f64,
+    pub commute_km: f64,
+    pub unclassified_km: f64,
+    pub business_percentage: f64,
+    pub total_trips: i32,
+    pub total_store_visits: i32,
+    pub trips: Vec<TravelTripSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTravelLocation {
+    pub label: String,
+    pub chain: Option<String>,
+    pub address: String,
+    pub location_type: String,
+    pub excluded: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateTravelLocation {
+    pub label: Option<String>,
+    pub chain: Option<String>,
+    pub address: Option<String>,
+    pub location_type: Option<String>,
+    pub excluded: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateTravelSegment {
+    pub classification: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TravelTripLog {
+    pub id: Uuid,
+    pub upload_id: Option<Uuid>,
+    pub trip_date: NaiveDate,
+    pub purpose: String,
+    pub notes: String,
+    pub total_km: f64,
+    pub business_km: f64,
+    pub status: String,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTripLog {
+    pub upload_id: Option<Uuid>,
+    pub trip_date: NaiveDate,
+    pub purpose: Option<String>,
+    pub notes: Option<String>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateTripLog {
+    pub purpose: Option<String>,
+    pub notes: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TripLogWithSegments {
+    #[serde(flatten)]
+    pub log: TravelTripLog,
+    pub segments: Vec<TravelSegmentWithDetails>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkReceiptToSegment {
+    pub receipt_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateManualSegment {
+    pub from_location: String,
+    pub to_location: String,
+    pub distance_km: f64,
+    pub classification: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateReceiptTripLog {
+    pub trip_date: NaiveDate,
+    pub purpose: Option<String>,
+    pub notes: Option<String>,
+    pub segments: Vec<CreateManualSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkImportLocation {
+    pub label: String,
+    pub chain: Option<String>,
+    pub address: String,
+    pub location_type: String,
+    pub excluded: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkImportLocationsRequest {
+    pub locations: Vec<BulkImportLocation>,
 }
 
 #[cfg(test)]
@@ -1283,6 +1536,8 @@ mod tests {
                     receipt_id: None,
                     quantity: 4,
                     purchase_cost,
+                    cost_adjustment: dec!(0),
+                    adjustment_note: None,
                     invoice_unit_price: Some(dec!(12.00)),
                     destination_id: Some(dest_id),
                     status: DeliveryStatus::Pending,
@@ -1291,6 +1546,8 @@ mod tests {
                     refunds_purchase_id: None,
                     purchase_type: "unit".to_string(),
                     bonus_for_purchase_id: None,
+                    display_parent_purchase_id: None,
+                    display_group: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 },
@@ -1301,6 +1558,8 @@ mod tests {
                     receipt_id: None,
                     quantity: -1,
                     purchase_cost,
+                    cost_adjustment: dec!(0),
+                    adjustment_note: None,
                     invoice_unit_price: Some(dec!(12.00)),
                     destination_id: Some(dest_id),
                     status: DeliveryStatus::Pending,
@@ -1309,6 +1568,8 @@ mod tests {
                     refunds_purchase_id: None,
                     purchase_type: "refund".to_string(),
                     bonus_for_purchase_id: None,
+                    display_parent_purchase_id: None,
+                    display_group: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 },
@@ -1390,6 +1651,8 @@ mod tests {
                 destination_code: Some("BSC".to_string()),
                 quantity: -1,
                 purchase_cost: dec!(8.00),
+                cost_adjustment: None,
+                adjustment_note: None,
                 total_cost: Some(dec!(-8.00)),
                 invoice_unit_price: Some(dec!(12.00)),
                 total_selling: Some(dec!(-12.00)),
@@ -1434,6 +1697,8 @@ mod tests {
                 destination_code: Some("BSC".to_string()),
                 quantity: 4,
                 purchase_cost: dec!(8.00),
+                cost_adjustment: None,
+                adjustment_note: None,
                 total_cost: Some(dec!(32.00)),
                 invoice_unit_price: Some(dec!(12.00)),
                 total_selling: Some(dec!(48.00)),
@@ -1469,6 +1734,8 @@ mod tests {
                 destination_code: Some("BSC".to_string()),
                 quantity: -1,
                 purchase_cost: dec!(8.00),
+                cost_adjustment: None,
+                adjustment_note: None,
                 total_cost: Some(dec!(-8.00)),
                 invoice_unit_price: Some(dec!(12.00)),
                 total_selling: Some(dec!(-12.00)),
@@ -1776,6 +2043,8 @@ mod tests {
                 destination_code: Some("BSC".to_string()),
                 quantity: qty,
                 purchase_cost: dec!(0),
+                cost_adjustment: None,
+                adjustment_note: None,
                 // View logic: total_cost = qty * invoice_unit_price when cost = 0
                 total_cost: Some(Decimal::from(qty) * invoice_unit_price),
                 invoice_unit_price: Some(invoice_unit_price),
@@ -1818,6 +2087,8 @@ mod tests {
                 destination_code: Some("BSC".to_string()),
                 quantity: qty,
                 purchase_cost: cost,
+                cost_adjustment: None,
+                adjustment_note: None,
                 total_cost: Some(Decimal::from(qty) * cost),
                 invoice_unit_price: Some(sell),
                 total_selling: Some(Decimal::from(qty) * sell),
@@ -1972,6 +2243,8 @@ mod tests {
                 destination_code: Some("BSC".to_string()),
                 quantity: qty,
                 purchase_cost: dec!(0),
+                cost_adjustment: None,
+                adjustment_note: None,
                 // Bonus: total_cost = 0 (cost is genuinely zero)
                 total_cost: Some(dec!(0)),
                 invoice_unit_price: Some(invoice_unit_price),
@@ -2116,6 +2389,8 @@ mod tests {
                 destination_code: Some("BSC".to_string()),
                 quantity: 10,
                 purchase_cost: dec!(5.00),
+                cost_adjustment: None,
+                adjustment_note: None,
                 total_cost: Some(dec!(50.00)),
                 invoice_unit_price: Some(dec!(8.00)),
                 // total_selling boosted: 10*8 + 16 = 96
@@ -2183,6 +2458,8 @@ mod tests {
                 destination_code: None,
                 quantity: 5,
                 purchase_cost: dec!(10),
+                cost_adjustment: None,
+                adjustment_note: None,
                 total_cost: Some(dec!(50)),
                 invoice_unit_price: Some(dec!(15)),
                 total_selling: Some(dec!(75)),
