@@ -5,8 +5,14 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import type { TravelLocation } from "@/api"
 
+interface LocationGroup {
+  label: string
+  locations: TravelLocation[]
+}
+
 interface LocationSearchProps {
   locations: TravelLocation[]
+  groups?: LocationGroup[]
   value: string
   onValueChange: (value: string) => void
   onAddNew?: () => void
@@ -19,6 +25,7 @@ interface LocationSearchProps {
 
 export function LocationSearch({
   locations,
+  groups,
   value,
   onValueChange,
   onAddNew,
@@ -35,14 +42,21 @@ export function LocationSearch({
 
   const selectedLocation = locations.find((l) => l.id === value)
 
-  const filteredLocations = React.useMemo(() => {
-    if (!search) return locations
+  const filterLocs = React.useCallback((locs: TravelLocation[]) => {
+    if (!search) return locs
     const words = search.toLowerCase().split(/\s+/).filter(Boolean)
-    return locations.filter((l) => {
+    return locs.filter((l) => {
       const text = `${l.label} ${l.address}`.toLowerCase()
       return words.every((w) => text.includes(w))
     })
-  }, [locations, search])
+  }, [search])
+
+  const filteredLocations = React.useMemo(() => filterLocs(locations), [locations, filterLocs])
+
+  const filteredGroups = React.useMemo(() => {
+    if (!groups) return null
+    return groups.map((g) => ({ ...g, locations: filterLocs(g.locations) })).filter((g) => g.locations.length > 0)
+  }, [groups, filterLocs])
 
   React.useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -115,7 +129,40 @@ export function LocationSearch({
                 <span className="text-muted-foreground italic">No Store (Online)</span>
               </div>
             )}
-            {filteredLocations.length === 0 ? (
+            {filteredGroups && filteredGroups.length > 0 ? (
+              filteredGroups.map((group, gi) => (
+                <div key={group.label}>
+                  {gi > 0 && <div className="border-t my-1" />}
+                  <div className="px-2 py-1 flex items-center justify-between">
+                    <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide">{group.label}</span>
+                    {gi > 0 && onAddNew && (
+                      <button
+                        className="text-[10px] font-medium text-primary hover:underline flex items-center gap-0.5"
+                        onClick={() => { setOpen(false); setSearch(""); onAddNew() }}
+                      >
+                        <Plus className="h-2.5 w-2.5" />New
+                      </button>
+                    )}
+                  </div>
+                  {group.locations.map((loc) => (
+                    <div
+                      key={loc.id}
+                      className={cn(
+                        "relative flex cursor-pointer select-none items-center rounded-sm px-2 py-1.5 text-xs outline-none hover:bg-accent hover:text-accent-foreground",
+                        value === loc.id && "bg-accent"
+                      )}
+                      onClick={() => handleSelect(loc.id)}
+                    >
+                      <Check className={cn("mr-2 h-3 w-3 flex-shrink-0", value === loc.id ? "opacity-100" : "opacity-0")} />
+                      <div className="flex-1 min-w-0">
+                        <span className="font-medium">{loc.label}</span>
+                        {loc.address && <span className="text-muted-foreground ml-1 truncate">— {loc.address}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ))
+            ) : filteredLocations.length === 0 ? (
               <div className="py-4 text-center text-xs text-muted-foreground">
                 No locations found
               </div>
@@ -144,7 +191,7 @@ export function LocationSearch({
                 </div>
               ))
             )}
-            {onAddNew && (
+            {onAddNew && !filteredGroups && (
               <div
                 className="flex cursor-pointer items-center rounded-sm px-2 py-1.5 text-xs font-medium text-primary hover:bg-accent border-t mt-1"
                 onClick={() => {

@@ -957,6 +957,7 @@ pub struct TravelSegment {
     pub detour_extra_km: Option<f64>,
     pub linked_receipt_id: Option<Uuid>,
     pub notes: Option<String>,
+    pub route_coords: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1052,6 +1053,7 @@ pub struct UpdateTripLog {
     pub purpose: Option<String>,
     pub notes: Option<String>,
     pub status: Option<String>,
+    pub segments: Option<Vec<CreateManualSegment>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1072,6 +1074,7 @@ pub struct CreateManualSegment {
     pub to_location: String,
     pub distance_km: f64,
     pub classification: String,
+    pub route_coords: Option<Vec<[f64; 2]>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

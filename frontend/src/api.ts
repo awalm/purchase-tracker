@@ -1306,6 +1306,7 @@ export interface TravelSegment {
   start_lng: number | null;
   end_lat: number | null;
   end_lng: number | null;
+  route_coords: [number, number][] | null;
 }
 
 export interface TravelTripSummary {
@@ -1362,6 +1363,7 @@ export interface CreateManualSegment {
   to_location: string;
   distance_km: number;
   classification: string;
+  route_coords?: [number, number][];
 }
 
 export interface GeocodeResponse {
@@ -1482,7 +1484,7 @@ export const travel = {
       }),
     get: (id: string) =>
       request<TripLogWithSegments>(`/travel/trip-logs/${id}`),
-    update: (id: string, data: { purpose?: string; notes?: string; status?: string }) =>
+    update: (id: string, data: { purpose?: string; notes?: string; status?: string; segments?: CreateManualSegment[] }) =>
       request<TravelTripLog>(`/travel/trip-logs/${id}`, {
         method: 'PATCH',
         body: JSON.stringify(data),
@@ -1490,6 +1492,12 @@ export const travel = {
     delete: (id: string) =>
       request<void>(`/travel/trip-logs/${id}`, { method: 'DELETE' }),
   },
+
+  rematchVisits: (date: string, radiusMeters: number) =>
+    request<{ total_visits: number; matched: number; updated: number; radius_meters: number }>(`/travel/segments/rematch`, {
+      method: 'POST',
+      body: JSON.stringify({ date, radius_meters: radiusMeters }),
+    }),
 
   directions: (fromLat: number, fromLng: number, toLat: number, toLng: number, waypoints?: [number, number][]) => {
     let url = `/travel/directions?from_lat=${fromLat}&from_lng=${fromLng}&to_lat=${toLat}&to_lng=${toLng}`

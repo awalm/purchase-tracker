@@ -9,6 +9,7 @@ import {
   useUpdateReceipt,
   useTravelSegmentsForDate,
   useCreateTravelLocation,
+  useUpdateTripLog,
 } from "@/hooks/useApi"
 import { useQueryClient } from "@tanstack/react-query"
 import { travel } from "@/api"
@@ -147,10 +148,22 @@ interface SegmentDraft {
   computing: boolean
   routeError: string | null
   source: string
+  // Detour fields
+  isDetour: boolean
+  detourStopIds: string[]
+  directKm: string
+  withStopsKm: string
+  directCoords: [number, number][]
+  withStopsCoords: [number, number][]
 }
 
-function emptySegment(): SegmentDraft {
-  return { from_id: "", to_id: "", distance_km: "", computed_km: "", classification: "business", routeCoords: [], computing: false, routeError: null, source: "manual" }
+function emptySegment(fromId?: string): SegmentDraft {
+  return {
+    from_id: fromId || "", to_id: "", distance_km: "", computed_km: "",
+    classification: "business", routeCoords: [], computing: false, routeError: null, source: "manual",
+    isDetour: false, detourStopIds: [], directKm: "", withStopsKm: "",
+    directCoords: [], withStopsCoords: [],
+  }
 }
 
 // ----- Route fetching -----
@@ -193,9 +206,10 @@ function RouteMap({
   const [snapping, setSnapping] = useState(false)
   const [snappedCount, setSnappedCount] = useState(0)
 
-  const { allPoints, manualDrives, timelineDrives, timelineVisits, receiptMarkers } = useMemo(() => {
+  const { allPoints, manualDrives, detourDrives, timelineDrives, timelineVisits, receiptMarkers } = useMemo(() => {
     const pts: [number, number][] = []
     const manual: { positions: [number, number][]; color: string; label: string }[] = []
+    const detours: { directPositions: [number, number][]; withStopsPositions: [number, number][]; label: string }[] = []
 
     for (const seg of segments) {
       const fromLoc = locations.find((l) => l.id === seg.from_id)
@@ -204,11 +218,19 @@ function RouteMap({
       const start: [number, number] = [fromLoc.latitude, fromLoc.longitude]
       const end: [number, number] = [toLoc.latitude, toLoc.longitude]
       pts.push(start, end)
-      manual.push({
-        positions: seg.routeCoords.length > 0 ? seg.routeCoords : [start, end],
-        color: CLASSIFICATION_COLORS[seg.classification] || "#6b7280",
-        label: `${fromLoc.label} \u2192 ${toLoc.label} (${seg.distance_km || seg.computed_km || "?"} km)`,
-      })
+      if (seg.isDetour) {
+        detours.push({
+          directPositions: seg.directCoords.length > 0 ? seg.directCoords : [start, end],
+          withStopsPositions: seg.withStopsCoords.length > 0 ? seg.withStopsCoords : [start, end],
+          label: `${fromLoc.label} \u2192 ${toLoc.label} (detour: ${seg.distance_km || "?"} km)`,
+        })
+      } else {
+        manual.push({
+          positions: seg.routeCoords.length > 0 ? seg.routeCoords : [start, end],
+          color: CLASSIFICATION_COLORS[seg.classification] || "#6b7280",
+          label: `${fromLoc.label} \u2192 ${toLoc.label} (${seg.distance_km || seg.computed_km || "?"} km)`,
+        })
+      }
     }
 
     const tlLabels = timelineSegments ? labelTimelineSegments(timelineSegments) : new Map<string, string>()
@@ -250,7 +272,7 @@ function RouteMap({
       .map((r) => ({ pos: [r.store_latitude!, r.store_longitude!] as [number, number], label: `${r.vendor_name} ($${parseFloat(r.total).toFixed(2)})`, address: r.store_label || r.store_address }))
     for (const rm of rcpt) pts.push(rm.pos)
 
-    return { allPoints: pts, manualDrives: manual, timelineDrives: tlDrives, timelineVisits: tlVisits, receiptMarkers: rcpt }
+    return { allPoints: pts, manualDrives: manual, detourDrives: detours, timelineDrives: tlDrives, timelineVisits: tlVisits, receiptMarkers: rcpt }
   }, [segments, locations, receiptLocations, timelineSegments])
 
   // Road-snap timeline drives via Directions API
@@ -336,7 +358,19 @@ function RouteMap({
 
           {/* Manual segments */}
           {manualDrives.map((d, i) => (
-            <Polyline key={`seg-${i}`} positions={d.positions} color={d.color} weight={4} opacity={0.9}>
+            <Polyline key={`seg-${i}-${d.color}`} positions={d.positions} color={d.color} weight={4} opacity={0.9}>
+              <Tooltip>{d.label}</Tooltip>
+            </Polyline>
+          ))}
+
+          {/* Detour segments: dashed direct + solid with-stops */}
+          {detourDrives.map((d, i) => (
+            <Polyline key={`det-direct-${i}`} positions={d.directPositions} color="#94a3b8" weight={3} opacity={0.5} dashArray="8 6">
+              <Tooltip>Direct route (personal)</Tooltip>
+            </Polyline>
+          ))}
+          {detourDrives.map((d, i) => (
+            <Polyline key={`det-stops-${i}`} positions={d.withStopsPositions} color="#d97706" weight={4} opacity={0.9}>
               <Tooltip>{d.label}</Tooltip>
             </Polyline>
           ))}
@@ -378,6 +412,8 @@ export default function ReceiptMileageImportPage() {
   const [purpose, setPurpose] = useState("")
   const [notes, setNotes] = useState("")
   const [hoveredSegmentId, setHoveredSegmentId] = useState<string | null>(null)
+  const [matchRadius, setMatchRadius] = useState(250)
+  const [rematching, setRematching] = useState(false)
 
   const { data: receipts, isLoading: receiptsLoading } = useReceipts()
   const { data: allLogs } = useTripLogs()
@@ -462,14 +498,104 @@ export default function ReceiptMileageImportPage() {
     }, [locationOptions]
   )
 
+  // Store locations from the selected date's receipts (for detour stop picker)
+  const receiptStoreLocations = useMemo(() => {
+    if (!selectedDateData) return []
+    const ids = new Set(selectedDateData.receipts.map((r) => r.store_location_id).filter(Boolean) as string[])
+    return locationOptions.filter((l) => ids.has(l.id))
+  }, [selectedDateData, locationOptions])
+
+  // Grouped location list for segment pickers: Receipt Locations (unused) first, then All Locations
+  const segmentLocationGroups = useMemo(() => {
+    const usedIds = new Set(segments.flatMap((s) => [s.from_id, s.to_id]).filter(Boolean))
+    const receiptIds = new Set(receiptStoreLocations.map((l) => l.id))
+    const unusedReceipt = receiptStoreLocations.filter((l) => !usedIds.has(l.id) && l.id !== homeLocation?.id)
+    const topLocs = [
+      ...(homeLocation ? [homeLocation] : []),
+      ...unusedReceipt,
+    ]
+    const restLocs = locationOptions.filter((l) => !receiptIds.has(l.id) && l.id !== homeLocation?.id)
+    return [
+      { label: "Receipt Locations", locations: topLocs },
+      { label: "All Locations", locations: restLocs },
+    ]
+  }, [receiptStoreLocations, locationOptions, homeLocation, segments])
+
   const handleSelectDate = useCallback((date: string) => {
     setSelectedDate(date)
     const data = receiptsByDate.find((d) => d.date === date)
     if (!data) return
-    setPurpose(`Business: ${data.vendors.join(", ")}`)
-    setNotes("")
+    if (!data.hasLog) {
+      setPurpose(`Business: ${data.vendors.join(", ")}`)
+      setNotes("")
+    }
     setSegments([emptySegment()])
+    setAutoSaveStatus("idle")
+    lastSavedKey.current = ""
+    setDraftLogId(null)
+    loadedLogDateRef.current = null
   }, [receiptsByDate])
+
+  // When selecting a date that has an existing log, load its data
+  const loadedLogDateRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!selectedDate || !selectedDateData) return
+    // Only run once per date selection
+    if (loadedLogDateRef.current === selectedDate) return
+
+    if (selectedDateData.hasLog && selectedDateData.log) {
+      const log = selectedDateData.log
+      setPurpose(log.purpose || "")
+      setNotes(log.notes || "")
+      setDraftLogId(log.id)
+      // Set lastSavedKey so auto-save doesn't immediately re-fire
+      lastSavedKey.current = "loaded"
+    }
+
+    // Load existing manual segments from timeline data
+    if (timelineSegments && timelineSegments.length > 0) {
+      const manualSegs = timelineSegments.filter(
+        (s) => s.classification_reason === "manual" && s.segment_type === "drive"
+      )
+      if (manualSegs.length > 0) {
+        const drafts: SegmentDraft[] = manualSegs.map((s) => {
+          const fromLoc = locationOptions.find((l) => l.label === s.from_location)
+          const toLoc = locationOptions.find((l) => l.label === s.to_location)
+          return {
+            from_id: fromLoc?.id || "",
+            to_id: toLoc?.id || "",
+            distance_km: s.distance_meters != null ? (s.distance_meters / 1000).toFixed(1) : "",
+            computed_km: s.distance_meters != null ? (s.distance_meters / 1000).toFixed(1) : "",
+            classification: s.classification || "business",
+            routeCoords: s.route_coords || [],
+            computing: false,
+            routeError: null,
+            source: "loaded",
+            isDetour: false,
+            detourStopIds: [],
+            directKm: "",
+            withStopsKm: "",
+            directCoords: [],
+            withStopsCoords: [],
+          }
+        })
+        setSegments(drafts)
+        loadedLogDateRef.current = selectedDate
+        // Update lastSavedKey to match loaded state so auto-save doesn't re-fire
+        const validSegs = drafts.filter((s) => s.from_id && s.to_id && parseFloat(s.distance_km) > 0).map((s) => ({
+          from_location: locationOptions.find((l) => l.id === s.from_id)?.label || "",
+          to_location: locationOptions.find((l) => l.id === s.to_id)?.label || "",
+          distance_km: parseFloat(s.distance_km),
+          classification: s.classification,
+        }))
+        const purpose_ = selectedDateData.log?.purpose || ""
+        const notes_ = selectedDateData.log?.notes || ""
+        lastSavedKey.current = JSON.stringify({ date: selectedDate, purpose: purpose_ || undefined, notes: notes_ || undefined, segs: validSegs })
+      } else {
+        loadedLogDateRef.current = selectedDate
+      }
+    }
+  }, [selectedDate, selectedDateData, timelineSegments, locationOptions])
 
   // Auto-compute route distance when from/to set
   const computeSegmentDistance = useCallback(async (index: number) => {
@@ -482,13 +608,42 @@ export default function ReceiptMileageImportPage() {
       return
     }
     try {
-      const result = await fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude)
-      setSegments((prev) => prev.map((s, i) => i === index ? {
-        ...s, computing: false, routeError: null,
-        computed_km: (result.distance / 1000).toFixed(1),
-        distance_km: s.distance_km || (result.distance / 1000).toFixed(1),
-        routeCoords: result.coords,
-      } : s))
+      if (seg.isDetour && seg.detourStopIds.length > 0) {
+        // Detour mode: compute direct route AND route with stops
+        const waypoints: [number, number][] = seg.detourStopIds
+          .map((id) => locationOptions.find((l) => l.id === id))
+          .filter((l): l is TravelLocation => l != null && l.latitude != null && l.longitude != null)
+          .map((l) => [l.latitude!, l.longitude!])
+        const [direct, withStops] = await Promise.all([
+          fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude),
+          waypoints.length > 0
+            ? fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude, waypoints)
+            : fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude),
+        ])
+        const directKm = direct.distance / 1000
+        const withStopsKm = withStops.distance / 1000
+        const detourKm = Math.max(0, withStopsKm - directKm)
+        setSegments((prev) => prev.map((s, i) => i === index ? {
+          ...s, computing: false, routeError: null,
+          directKm: directKm.toFixed(1),
+          withStopsKm: withStopsKm.toFixed(1),
+          directCoords: direct.coords,
+          withStopsCoords: withStops.coords,
+          computed_km: detourKm.toFixed(1),
+          distance_km: detourKm.toFixed(1),
+          routeCoords: withStops.coords,
+        } : s))
+      } else {
+        // Normal mode
+        const result = await fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude)
+        setSegments((prev) => prev.map((s, i) => i === index ? {
+          ...s, computing: false, routeError: null,
+          computed_km: (result.distance / 1000).toFixed(1),
+          distance_km: s.distance_km || (result.distance / 1000).toFixed(1),
+          routeCoords: result.coords,
+          directKm: "", withStopsKm: "", directCoords: [], withStopsCoords: [],
+        } : s))
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Directions API failed"
       setSegments((prev) => prev.map((s, i) => i === index ? { ...s, computing: false, routeError: msg } : s))
@@ -498,15 +653,56 @@ export default function ReceiptMileageImportPage() {
   useEffect(() => {
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i]
-      if (seg.from_id && seg.to_id && !seg.computed_km && !seg.computing) {
+      if (seg.from_id && seg.to_id && (!seg.computed_km || seg.routeCoords.length === 0) && !seg.computing) {
         computeSegmentDistance(i)
         break
       }
     }
   }, [segments, computeSegmentDistance])
 
-  const addSegment = () => setSegments((prev) => [...prev, emptySegment()])
+  const addSegment = () => setSegments((prev) => {
+    const lastTo = prev[prev.length - 1]?.to_id || ""
+    return [...prev, emptySegment(lastTo)]
+  })
   const removeSegment = (index: number) => setSegments((prev) => prev.length > 1 ? prev.filter((_, i) => i !== index) : prev)
+
+  const toggleDetour = (index: number) => {
+    setSegments((prev) => prev.map((s, i) => {
+      if (i !== index) return s
+      const toggled = !s.isDetour
+      return {
+        ...s, isDetour: toggled,
+        classification: toggled ? "business" : s.classification,
+        computed_km: "", distance_km: "", routeCoords: [],
+        directKm: "", withStopsKm: "", directCoords: [], withStopsCoords: [],
+      }
+    }))
+  }
+
+  const addDetourStop = (segIndex: number, locationId: string) => {
+    setSegments((prev) => prev.map((s, i) => {
+      if (i !== segIndex || s.detourStopIds.includes(locationId)) return s
+      return { ...s, detourStopIds: [...s.detourStopIds, locationId], computed_km: "", distance_km: "", routeCoords: [] }
+    }))
+  }
+
+  const removeDetourStop = (segIndex: number, locationId: string) => {
+    setSegments((prev) => prev.map((s, i) => {
+      if (i !== segIndex) return s
+      return { ...s, detourStopIds: s.detourStopIds.filter((id) => id !== locationId), computed_km: "", distance_km: "", routeCoords: [] }
+    }))
+  }
+
+  const handleRematch = async () => {
+    if (!selectedDate || rematching) return
+    setRematching(true)
+    try {
+      await travel.rematchVisits(selectedDate, matchRadius)
+      queryClient.invalidateQueries({ queryKey: ["travel", "segments-by-date", selectedDate] })
+    } finally {
+      setRematching(false)
+    }
+  }
 
   const updateSegment = (index: number, field: keyof SegmentDraft, value: string) => {
     setSegments((prev) => prev.map((s, i) => {
@@ -524,9 +720,9 @@ export default function ReceiptMileageImportPage() {
 
   const canSave = segments.some((s) => s.from_id && s.to_id && parseFloat(s.distance_km) > 0)
 
-  const handleSave = () => {
-    if (!selectedDate || !canSave) return
-    const validSegments = segments
+  // Build valid segment payloads for saving
+  const buildSavePayload = useCallback(() => {
+    return segments
       .filter((s) => s.from_id && s.to_id && parseFloat(s.distance_km) > 0)
       .map((s) => {
         const fromLoc = locationOptions.find((l) => l.id === s.from_id)
@@ -536,12 +732,71 @@ export default function ReceiptMileageImportPage() {
           to_location: toLoc?.label || "",
           distance_km: parseFloat(s.distance_km),
           classification: s.classification,
+          route_coords: s.routeCoords.length > 0 ? s.routeCoords : undefined,
         }
       })
-    createReceiptTripLog.mutate(
-      { trip_date: selectedDate, purpose: purpose || undefined, notes: notes || undefined, segments: validSegments },
-      { onSuccess: () => { setSelectedDate(null); setSegments([emptySegment()]); setPurpose(""); setNotes("") } }
-    )
+  }, [segments, locationOptions])
+
+  // Auto-save as draft: create draft once when segments become valid,
+  // then PATCH purpose/notes on subsequent changes.
+  const [autoSaveStatus, setAutoSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle")
+  const [draftLogId, setDraftLogId] = useState<string | null>(null)
+  const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastSavedKey = useRef("")
+  const updateTripLog = useUpdateTripLog()
+
+  useEffect(() => {
+    if (!selectedDate || !canSave) return
+    const validSegs = buildSavePayload()
+    if (validSegs.length === 0) return
+    const saveKey = JSON.stringify({ date: selectedDate, purpose, notes, segs: validSegs })
+    if (saveKey === lastSavedKey.current) return
+
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
+    autoSaveTimer.current = setTimeout(() => {
+      setAutoSaveStatus("saving")
+
+      if (draftLogId) {
+        // Already have a draft — update purpose/notes AND segments
+        updateTripLog.mutateAsync({ id: draftLogId, purpose: purpose || undefined, notes: notes || undefined, segments: validSegs })
+          .then(() => { lastSavedKey.current = saveKey; setAutoSaveStatus("saved") })
+          .catch(() => setAutoSaveStatus("error"))
+      } else {
+        // First save — create the draft
+        createReceiptTripLog.mutateAsync(
+          { trip_date: selectedDate, purpose: purpose || undefined, notes: notes || undefined, segments: validSegs },
+        ).then((result) => {
+          setDraftLogId(result.id)
+          lastSavedKey.current = saveKey
+          setAutoSaveStatus("saved")
+        }).catch(() => setAutoSaveStatus("error"))
+      }
+    }, 1500)
+
+    return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
+  }, [selectedDate, canSave, buildSavePayload, purpose, notes, draftLogId])
+
+  // "Save to Log" promotes draft → confirmed and closes
+  const handleSave = () => {
+    if (!selectedDate || !canSave) return
+    const logId = draftLogId || selectedDateData?.log?.id
+
+    if (logId) {
+      // Promote existing draft/log to confirmed, with latest segments
+      const validSegments = buildSavePayload()
+      updateTripLog.mutate(
+        { id: logId, purpose: purpose || undefined, notes: notes || undefined, status: "confirmed", segments: validSegments.length > 0 ? validSegments : undefined },
+        { onSuccess: () => { setSelectedDate(null); setSegments([emptySegment()]); setPurpose(""); setNotes(""); setDraftLogId(null); setAutoSaveStatus("idle"); lastSavedKey.current = "" } },
+      )
+    } else {
+      // No draft yet — create and confirm in one shot
+      const validSegments = buildSavePayload()
+      if (validSegments.length === 0) return
+      createReceiptTripLog.mutate(
+        { trip_date: selectedDate, purpose: purpose || undefined, notes: notes || undefined, segments: validSegments },
+        { onSuccess: () => { setSelectedDate(null); setSegments([emptySegment()]); setPurpose(""); setNotes(""); setDraftLogId(null); setAutoSaveStatus("idle"); lastSavedKey.current = "" } },
+      )
+    }
   }
 
   if (receiptsLoading) return <div className="p-8 text-muted-foreground">Loading...</div>
@@ -680,9 +935,30 @@ export default function ReceiptMileageImportPage() {
                   const tlLabelsLocal = labelTimelineSegments(timelineSegments)
                   return (
                     <div>
-                      <div className="text-xs font-medium mb-1">
-                        Timeline Activity ({timelineSegments.length} segments)
-                        <span className="font-normal text-muted-foreground ml-1">— Google data, may have gaps</span>
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="text-xs font-medium">
+                          Timeline Activity ({timelineSegments.length} segments)
+                          <span className="font-normal text-muted-foreground ml-1">— Google data, may have gaps</span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[10px] text-muted-foreground">Match:</span>
+                          <select className="text-[11px] border rounded px-1 py-0.5 h-5 bg-white"
+                            value={matchRadius} onChange={(e) => setMatchRadius(Number(e.target.value))}
+                          >
+                            <option value={150}>150m</option>
+                            <option value={200}>200m</option>
+                            <option value={250}>250m</option>
+                            <option value={300}>300m</option>
+                            <option value={400}>400m</option>
+                            <option value={500}>500m</option>
+                          </select>
+                          <Button variant="outline" size="sm" className="h-5 text-[10px] px-1.5" disabled={rematching}
+                            onClick={handleRematch}
+                          >
+                            {rematching ? <RotateCw className="h-2.5 w-2.5 animate-spin" /> : <RotateCw className="h-2.5 w-2.5" />}
+                            <span className="ml-0.5">Rematch</span>
+                          </Button>
+                        </div>
                       </div>
                       <div className="space-y-0.5 max-h-[200px] overflow-y-auto border rounded p-1.5 bg-white">
                         {timelineSegments.map((seg: TravelSegment) => {
@@ -732,14 +1008,14 @@ export default function ReceiptMileageImportPage() {
                   </div>
                   <div className="space-y-2">
                     {segments.map((seg, i) => (
-                      <div key={i} className="border rounded p-2 bg-slate-50 space-y-2">
+                      <div key={i} className={`border rounded p-2 space-y-2 ${seg.isDetour ? "bg-amber-50 border-amber-200" : "bg-slate-50"}`}>
                         <div className="flex gap-2 items-center">
-                          <LocationSearch locations={locationOptions} value={seg.from_id}
+                          <LocationSearch locations={locationOptions} groups={segmentLocationGroups} value={seg.from_id}
                             onValueChange={(v) => updateSegment(i, "from_id", v)} placeholder="From..." className="flex-1" triggerClassName="h-7"
                             onAddNew={() => { setNewLocTarget({ segIndex: i, field: "from_id" }); setNewLocLabel(""); setNewLocAddress(""); setNewLocType("personal") }}
                           />
                           <span className="text-xs text-muted-foreground">{"\u2192"}</span>
-                          <LocationSearch locations={locationOptions} value={seg.to_id}
+                          <LocationSearch locations={locationOptions} groups={segmentLocationGroups} value={seg.to_id}
                             onValueChange={(v) => updateSegment(i, "to_id", v)} placeholder="To..." className="flex-1" triggerClassName="h-7"
                             onAddNew={() => { setNewLocTarget({ segIndex: i, field: "to_id" }); setNewLocLabel(""); setNewLocAddress(""); setNewLocType("personal") }}
                           />
@@ -747,7 +1023,9 @@ export default function ReceiptMileageImportPage() {
                         <div className="flex gap-2 items-center flex-wrap">
                           <div className="flex items-center gap-1">
                             <input type="number" step="0.1" min="0" className="w-20 text-xs border rounded px-2 py-1 h-7" placeholder="km"
-                              value={seg.distance_km} onChange={(e) => updateSegment(i, "distance_km", e.target.value)} />
+                              value={seg.distance_km} onChange={(e) => updateSegment(i, "distance_km", e.target.value)}
+                              title={seg.isDetour ? `Detour: ${seg.withStopsKm || "?"} − ${seg.directKm || "?"} = ${seg.distance_km || "?"} km` : undefined}
+                            />
                             <span className="text-xs text-muted-foreground">km</span>
                             {seg.computing && <RotateCw className="h-3 w-3 text-muted-foreground animate-spin" />}
                             {seg.routeError && <span className="text-xs text-red-600 flex items-center gap-1" title={seg.routeError}><AlertTriangle className="h-3 w-3" />Failed</span>}
@@ -757,17 +1035,64 @@ export default function ReceiptMileageImportPage() {
                               ><RotateCw className="h-3 w-3" /></Button>
                             )}
                           </div>
-                          <Select value={seg.classification} onValueChange={(v) => updateSegment(i, "classification", v)}>
-                            <SelectTrigger className="h-6 w-[85px] text-[11px] px-2"><SelectValue /></SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="business" className="text-xs">Business</SelectItem>
-                              <SelectItem value="personal" className="text-xs">Personal</SelectItem>
-                            </SelectContent>
-                          </Select>
+                          {!seg.isDetour && (
+                            <Select value={seg.classification} onValueChange={(v) => updateSegment(i, "classification", v)}>
+                              <SelectTrigger className="h-6 w-[85px] text-[11px] px-2"><SelectValue /></SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="business" className="text-xs">Business</SelectItem>
+                                <SelectItem value="personal" className="text-xs">Personal</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          )}
+                          <Button variant={seg.isDetour ? "default" : "outline"} size="sm"
+                            className={`h-6 text-[11px] px-2 ${seg.isDetour ? "bg-amber-600 hover:bg-amber-700" : ""}`}
+                            onClick={() => toggleDetour(i)} title="Detour: business km = route with stops − direct route"
+                          >Detour</Button>
                           {segments.length > 1 && (
                             <Button variant="ghost" size="sm" className="h-6 px-1 text-red-500" onClick={() => removeSegment(i)}><Trash2 className="h-3 w-3" /></Button>
                           )}
                         </div>
+
+                        {/* Detour stop picker + breakdown */}
+                        {seg.isDetour && (
+                          <div className="space-y-1.5 pl-1">
+                            <div className="text-[11px] text-muted-foreground">
+                              Stops made on this personal route (business km = with stops − direct):
+                            </div>
+                            <div className="flex flex-wrap gap-1">
+                              {seg.detourStopIds.map((stopId) => {
+                                const loc = locationOptions.find((l) => l.id === stopId)
+                                return (
+                                  <span key={stopId} className="inline-flex items-center gap-0.5 bg-amber-100 border border-amber-300 rounded px-1.5 py-0.5 text-[11px]">
+                                    <MapPin className="h-2.5 w-2.5" />{loc?.label || "?"}
+                                    <button className="ml-0.5 text-amber-700 hover:text-red-600" onClick={() => removeDetourStop(i, stopId)}>&times;</button>
+                                  </span>
+                                )
+                              })}
+                              <Select value="" onValueChange={(v) => addDetourStop(i, v)}>
+                                <SelectTrigger className="h-6 w-[140px] text-[11px] px-1.5"><span className="text-muted-foreground">+ Add stop</span></SelectTrigger>
+                                <SelectContent>
+                                  {receiptStoreLocations.filter((l) => !seg.detourStopIds.includes(l.id) && l.id !== seg.from_id && l.id !== seg.to_id && l.id !== homeLocation?.id).map((l) => (
+                                    <SelectItem key={l.id} value={l.id} className="text-xs">{l.label}</SelectItem>
+                                  ))}
+                                  {locationOptions.filter((l) => !seg.detourStopIds.includes(l.id) && l.id !== seg.from_id && l.id !== seg.to_id && !receiptStoreLocations.some((r) => r.id === l.id)).length > 0 && (
+                                    <>
+                                      <SelectItem value="__divider" disabled className="text-[10px] text-muted-foreground">— All locations —</SelectItem>
+                                      {locationOptions.filter((l) => !seg.detourStopIds.includes(l.id) && l.id !== seg.from_id && l.id !== seg.to_id && !receiptStoreLocations.some((r) => r.id === l.id)).map((l) => (
+                                        <SelectItem key={l.id} value={l.id} className="text-xs">{l.label}</SelectItem>
+                                      ))}
+                                    </>
+                                  )}
+                                </SelectContent>
+                              </Select>
+                            </div>
+                            {seg.directKm && seg.withStopsKm && (
+                              <div className="text-[11px] text-muted-foreground font-mono">
+                                Direct: {seg.directKm} km · With stops: {seg.withStopsKm} km · <span className="text-green-700 font-semibold">Business detour: {seg.distance_km} km</span>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -832,10 +1157,15 @@ export default function ReceiptMileageImportPage() {
                 </div>
 
                 {/* Save */}
-                <div className="flex justify-end">
-                  <Button disabled={!canSave || createReceiptTripLog.isPending} onClick={handleSave}>
+                <div className="flex items-center justify-between">
+                  <div className="text-xs text-muted-foreground flex items-center gap-1.5">
+                    {autoSaveStatus === "saving" && <><RotateCw className="h-3 w-3 animate-spin" /><span>Saving draft…</span></>}
+                    {autoSaveStatus === "saved" && <><CheckCircle className="h-3 w-3 text-green-600" /><span>Draft saved</span></>}
+                    {autoSaveStatus === "error" && <><AlertTriangle className="h-3 w-3 text-red-500" /><span>Save failed</span></>}
+                  </div>
+                  <Button disabled={!canSave || createReceiptTripLog.isPending || updateTripLog.isPending} onClick={handleSave}>
                     <Save className="h-4 w-4 mr-1" />
-                    {createReceiptTripLog.isPending ? "Saving..." : selectedDateData.hasLog ? "Merge into Log" : "Save to Log"}
+                    {createReceiptTripLog.isPending || updateTripLog.isPending ? "Saving…" : "Save to Log"}
                   </Button>
                 </div>
               </div>

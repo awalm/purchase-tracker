@@ -5955,6 +5955,58 @@ pub async fn update_trip_log(
     let notes = input.notes.as_deref().unwrap_or(&existing.notes);
     let status = input.status.as_deref().unwrap_or(&existing.status);
 
+    // If segments provided, replace manual segments for this date
+    if let Some(ref segments) = input.segments {
+        use chrono::Utc;
+        // Delete old manual segments for this date
+        sqlx::query("DELETE FROM travel_segments WHERE trip_date = $1 AND classification_reason = 'manual'")
+            .bind(existing.trip_date)
+            .execute(pool)
+            .await?;
+
+        // Re-insert
+        let now = Utc::now();
+        let total_km: f64 = segments.iter().map(|s| s.distance_km).sum();
+        let business_km: f64 = segments.iter()
+            .filter(|s| s.classification == "business")
+            .map(|s| s.distance_km)
+            .sum();
+
+        for (i, seg) in segments.iter().enumerate() {
+            let route_json = seg.route_coords.as_ref().map(|coords| {
+                serde_json::to_value(coords).unwrap_or(serde_json::Value::Null)
+            });
+            sqlx::query(
+                r#"INSERT INTO travel_segments
+                   (trip_date, segment_order, segment_type, distance_meters,
+                    start_time, end_time, from_location, to_location,
+                    classification, classification_reason, route_coords)
+                   VALUES ($1, $2, 'drive', $3, $4, $5, $6, $7, $8, 'manual', $9)"#
+            )
+            .bind(existing.trip_date)
+            .bind(i as i32)
+            .bind(seg.distance_km * 1000.0)
+            .bind(now)
+            .bind(now)
+            .bind(&seg.from_location)
+            .bind(&seg.to_location)
+            .bind(&seg.classification)
+            .bind(&route_json)
+            .execute(pool)
+            .await?;
+        }
+
+        // Update km totals on the log
+        sqlx::query(
+            "UPDATE travel_trip_logs SET total_km = $1, business_km = $2, updated_at = NOW() WHERE id = $3"
+        )
+        .bind(total_km)
+        .bind(business_km)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    }
+
     sqlx::query_as::<_, TravelTripLog>(
         r#"UPDATE travel_trip_logs
            SET purpose = $1, notes = $2, status = $3, updated_at = NOW()
@@ -6025,7 +6077,7 @@ pub async fn create_receipt_trip_log(
     .await?;
 
     let log = if let Some(existing) = existing {
-        // Merge: keep timeline GPS km if higher, combine purposes
+        // Merge: keep higher km, combine purposes
         let merged_total = total_km.max(existing.total_km);
         let merged_business = business_km.max(existing.business_km);
         let merged_purpose = if let Some(ref new_purpose) = input.purpose {
@@ -6071,12 +6123,15 @@ pub async fn create_receipt_trip_log(
     // Insert the manual segments
     let now = Utc::now();
     for (i, seg) in input.segments.iter().enumerate() {
+        let route_json = seg.route_coords.as_ref().map(|coords| {
+            serde_json::to_value(coords).unwrap_or(serde_json::Value::Null)
+        });
         sqlx::query(
             r#"INSERT INTO travel_segments
                (trip_date, segment_order, segment_type, distance_meters,
                 start_time, end_time, from_location, to_location,
-                classification, classification_reason)
-               VALUES ($1, $2, 'drive', $3, $4, $5, $6, $7, $8, 'manual')"#
+                classification, classification_reason, route_coords)
+               VALUES ($1, $2, 'drive', $3, $4, $5, $6, $7, $8, 'manual', $9)"#
         )
         .bind(input.trip_date)
         .bind(i as i32)
@@ -6086,6 +6141,7 @@ pub async fn create_receipt_trip_log(
         .bind(&seg.from_location)
         .bind(&seg.to_location)
         .bind(&seg.classification)
+        .bind(&route_json)
         .execute(pool)
         .await?;
     }

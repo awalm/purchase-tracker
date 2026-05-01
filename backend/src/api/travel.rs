@@ -35,6 +35,7 @@ pub fn router() -> Router<AppState> {
         .route("/segments", get(get_segments))
         .route("/segments/{id}", patch(classify_segment))
         .route("/segments/{id}/link-receipt", post(link_receipt))
+        .route("/segments/rematch", post(rematch_visits))
         // Trip Logs
         .route("/trip-logs", get(list_trip_logs).post(create_trip_log))
         .route("/trip-logs/receipt", post(create_receipt_trip_log))
@@ -351,7 +352,7 @@ async fn process_timeline(
     // 3. Insert visits with matching
     let mut db_visits = Vec::new();
     for visit in &parsed.visits {
-        let matched = matcher::match_location(visit.latitude, visit.longitude, &locations, 150.0);
+        let matched = matcher::match_location(visit.latitude, visit.longitude, &locations, 250.0);
         let (loc_id, dist) = matched
             .map(|m| (Some(m.location_id), Some(m.distance_meters)))
             .unwrap_or((None, None));
@@ -464,6 +465,83 @@ async fn link_receipt(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map(Json)
         .ok_or((StatusCode::NOT_FOUND, "Segment not found".to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+struct RematchRequest {
+    date: NaiveDate,
+    radius_meters: f64,
+}
+
+/// Re-match all visits for a given date against locations with a new radius.
+async fn rematch_visits(
+    State(state): State<AppState>,
+    Json(input): Json<RematchRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pool = &state.pool;
+
+    // Load all non-excluded locations
+    let locations = queries::get_all_travel_locations(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .filter(|l| !l.excluded && l.latitude.is_some() && l.longitude.is_some())
+        .collect::<Vec<_>>();
+
+    // Find all visits for this date via segments
+    let visit_ids: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT DISTINCT tv.id FROM travel_visits tv
+           JOIN travel_segments ts ON ts.visit_id = tv.id
+           WHERE ts.trip_date = $1 AND ts.segment_type = 'visit'"#
+    )
+    .bind(input.date)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut matched_count = 0u32;
+    let mut updated_count = 0u32;
+
+    for vid in &visit_ids {
+        let visit = sqlx::query_as::<_, TravelVisit>("SELECT * FROM travel_visits WHERE id = $1")
+            .bind(vid)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let visit = match visit {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let matched = matcher::match_location(visit.latitude, visit.longitude, &locations, input.radius_meters);
+        let (new_loc_id, new_dist) = matched
+            .map(|m| (Some(m.location_id), Some(m.distance_meters)))
+            .unwrap_or((None, None));
+
+        if new_loc_id != visit.matched_location_id {
+            sqlx::query(
+                "UPDATE travel_visits SET matched_location_id = $1, match_distance_meters = $2 WHERE id = $3"
+            )
+            .bind(new_loc_id)
+            .bind(new_dist)
+            .bind(vid)
+            .execute(pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            updated_count += 1;
+        }
+        if new_loc_id.is_some() {
+            matched_count += 1;
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "total_visits": visit_ids.len(),
+        "matched": matched_count,
+        "updated": updated_count,
+        "radius_meters": input.radius_meters,
+    })))
 }
 
 // ============================================

@@ -1217,3 +1217,6 @@ ON CONFLICT (id) DO UPDATE SET
   longitude = NULL,
   location_type = 'online',
   excluded = true;
+
+-- Store road-snapped route coordinates with manual segments
+ALTER TABLE travel_segments ADD COLUMN IF NOT EXISTS route_coords JSONB;

@@ -592,7 +592,7 @@ export function useCreateTripLog() {
 export function useCreateReceiptTripLog() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (data: { trip_date: string; purpose?: string; notes?: string; segments: { from_location: string; to_location: string; distance_km: number; classification: string }[] }) =>
+    mutationFn: (data: { trip_date: string; purpose?: string; notes?: string; segments: { from_location: string; to_location: string; distance_km: number; classification: string; route_coords?: [number, number][] }[] }) =>
       travel.tripLogs.createFromReceipt(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })
@@ -603,7 +603,7 @@ export function useCreateReceiptTripLog() {
 export function useUpdateTripLog() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, ...data }: { id: string; purpose?: string; notes?: string; status?: string }) =>
+    mutationFn: ({ id, ...data }: { id: string; purpose?: string; notes?: string; status?: string; segments?: { from_location: string; to_location: string; distance_km: number; classification: string; route_coords?: [number, number][] }[] }) =>
       travel.tripLogs.update(id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })
