@@ -45,6 +45,7 @@ import {
   Car,
   FileText,
   GripVertical,
+  Undo2,
 } from "lucide-react"
 import { MapContainer, Polyline, CircleMarker, Tooltip, useMap } from "react-leaflet"
 import L from "leaflet"
@@ -138,9 +139,16 @@ function labelTimelineSegments(segs: TravelSegment[]): Map<string, string> {
 }
 
 /**
- * Auto-suggest detour segments from timeline data.
- * Pattern: Personal visit → Business visit(s) → Personal visit
- * Only uses high-confidence matches (visit_location_label set).
+ * Auto-suggest segments from timeline data.
+ * Finds Personal → [business visits...] → Personal brackets and creates
+ * individual segments for each leg:
+ *   Personal → Business₁  (business)
+ *   Business₁ → Business₂ (business)
+ *   ...
+ *   BusinessN → Personal   (personal)
+ *
+ * If there are no business stops between two personal visits, creates
+ * a single Personal → Personal (personal) segment.
  */
 function suggestDetourSegments(
   segs: TravelSegment[],
@@ -150,16 +158,16 @@ function suggestDetourSegments(
   const visits = segs.filter(
     (s) => s.segment_type === "visit" && s.visit_location_label && !s.visit_location_label.startsWith("Unknown")
   )
-  if (visits.length < 3) return []
+  if (visits.length < 2) return []
 
   const findLocId = (label: string) => locations.find((l) => l.label === label)?.id || ""
 
   const drafts: SegmentDraft[] = []
   let i = 0
   while (i < visits.length) {
-    // Look for a personal visit
+    // Look for a personal visit to start a bracket
     if (visits[i].classification !== "personal") { i++; continue }
-    const fromVisit = visits[i]
+    const startVisit = visits[i]
 
     // Collect consecutive business visits after it
     const businessStops: TravelSegment[] = []
@@ -169,40 +177,42 @@ function suggestDetourSegments(
       j++
     }
 
-    // Need at least one business stop AND a personal visit to close the bracket
-    if (businessStops.length > 0 && j < visits.length && visits[j].classification === "personal") {
-      const toVisit = visits[j]
-      const fromId = findLocId(fromVisit.visit_location_label!)
-      const toId = findLocId(toVisit.visit_location_label!)
-      const stopIds = businessStops
-        .map((s) => findLocId(s.visit_location_label!))
-        .filter((id) => id && id !== fromId && id !== toId)
-      // Deduplicate stops
-      const uniqueStopIds = [...new Set(stopIds)]
+    // Need a personal visit to close the bracket
+    if (j >= visits.length || visits[j].classification !== "personal") { i++; continue }
+    const endVisit = visits[j]
 
-      if (fromId && toId && uniqueStopIds.length > 0) {
+    if (businessStops.length === 0) {
+      // Personal → Personal (no business stops)
+      const fromId = findLocId(startVisit.visit_location_label!)
+      const toId = findLocId(endVisit.visit_location_label!)
+      if (fromId && toId) {
         drafts.push({
-          from_id: fromId,
+          ...emptySegment(fromId),
           to_id: toId,
-          distance_km: "",
-          computed_km: "",
-          classification: "business",
-          routeCoords: [],
-          computing: false,
-          routeError: null,
+          classification: "personal",
           source: "suggested",
-          isDetour: true,
-          detourStopIds: uniqueStopIds,
-          directKm: "",
-          withStopsKm: "",
-          directCoords: [],
-          withStopsCoords: [],
         })
       }
-      i = j // continue from the closing personal visit (it can start a new bracket)
     } else {
-      i++
+      // Build chain: Personal, Business₁, ..., BusinessN, Personal
+      const chain = [startVisit, ...businessStops, endVisit]
+      for (let k = 0; k < chain.length - 1; k++) {
+        const from = chain[k]
+        const to = chain[k + 1]
+        const fromId = findLocId(from.visit_location_label!)
+        const toId = findLocId(to.visit_location_label!)
+        if (!fromId || !toId) continue
+        // Last leg (BusinessN → Personal) is personal, rest are business
+        const classification = k === chain.length - 2 ? "personal" : "business"
+        drafts.push({
+          ...emptySegment(fromId),
+          to_id: toId,
+          classification,
+          source: "suggested",
+        })
+      }
     }
+    i = j // continue from closing personal visit (can start new bracket)
   }
   return drafts
 }
@@ -620,6 +630,9 @@ export default function ReceiptMileageImportPage() {
   const [yearFilter, setYearFilter] = useState<string>("all")
   const [editingYearlyKm, setEditingYearlyKm] = useState<string>("")
 
+  // Snapshot of the last confirmed/saved state (for revert)
+  const savedSnapshot = useRef<{ segments: SegmentDraft[]; purpose: string; notes: string } | null>(null)
+
   const { data: receipts, isLoading: receiptsLoading } = useReceipts()
   const { data: allLogs } = useTripLogs()
   const { data: yearlyMileageData } = useQuery({ queryKey: ["travel", "yearly-mileage"], queryFn: () => travel.yearlyMileage.list() })
@@ -723,7 +736,7 @@ export default function ReceiptMileageImportPage() {
     return locationOptions.filter((l) => ids.has(l.id))
   }, [selectedDateData, locationOptions])
 
-  // Grouped location list for segment pickers: Receipt Locations (unused) first, then All Locations
+  // Grouped location list for segment pickers: Receipt Locations, Timeline Locations, All Locations
   const segmentLocationGroups = useMemo(() => {
     const usedIds = new Set(segments.flatMap((s) => [s.from_id, s.to_id]).filter(Boolean))
     const receiptIds = new Set(receiptStoreLocations.map((l) => l.id))
@@ -732,12 +745,24 @@ export default function ReceiptMileageImportPage() {
       ...(homeLocation ? [homeLocation] : []),
       ...unusedReceipt,
     ]
-    const restLocs = locationOptions.filter((l) => !receiptIds.has(l.id) && l.id !== homeLocation?.id)
+    // Timeline locations: matched visit labels from timeline segments
+    const topIds = new Set(topLocs.map((l) => l.id))
+    const timelineVisitLabels = new Set(
+      (timelineSegments || [])
+        .filter((s) => s.segment_type === "visit" && s.visit_location_label && !s.visit_location_label.startsWith("Unknown"))
+        .map((s) => s.visit_location_label!)
+    )
+    const timelineLocs = locationOptions.filter(
+      (l) => timelineVisitLabels.has(l.label) && !topIds.has(l.id) && l.id !== homeLocation?.id
+    )
+    const usedInGroupIds = new Set([...topIds, ...timelineLocs.map((l) => l.id)])
+    const restLocs = locationOptions.filter((l) => !usedInGroupIds.has(l.id) && l.id !== homeLocation?.id)
     return [
       { label: "Receipt Locations", locations: topLocs },
+      ...(timelineLocs.length > 0 ? [{ label: "Timeline Locations", locations: timelineLocs }] : []),
       { label: "All Locations", locations: restLocs },
     ]
-  }, [receiptStoreLocations, locationOptions, homeLocation, segments])
+  }, [receiptStoreLocations, locationOptions, homeLocation, segments, timelineSegments])
 
   const handleSelectDate = useCallback((date: string) => {
     setSelectedDate(date)
@@ -751,6 +776,7 @@ export default function ReceiptMileageImportPage() {
     setAutoSaveStatus("idle")
     lastSavedKey.current = ""
     setDraftLogId(null)
+    savedSnapshot.current = null
     loadedLogDateRef.current = null
   }, [receiptsByDate])
 
@@ -766,7 +792,7 @@ export default function ReceiptMileageImportPage() {
       setPurpose(log.purpose || "")
       setNotes(log.notes || "")
       setDraftLogId(log.id)
-      // Set lastSavedKey so auto-save doesn't immediately re-fire
+      setAutoSaveStatus(log.status === "confirmed" ? "saved" : "idle")
       lastSavedKey.current = "loaded"
     }
 
@@ -799,6 +825,10 @@ export default function ReceiptMileageImportPage() {
         })
         setSegments(drafts)
         loadedLogDateRef.current = selectedDate
+        // Snapshot for revert if this is a confirmed log
+        if (selectedDateData.log?.status === "confirmed") {
+          savedSnapshot.current = { segments: drafts, purpose: selectedDateData.log?.purpose || "", notes: selectedDateData.log?.notes || "" }
+        }
         // Update lastSavedKey to match loaded state so auto-save doesn't re-fire
         const validSegs = drafts.filter((s) => s.from_id && s.to_id && parseFloat(s.distance_km) > 0).map((s) => ({
           from_location: locationOptions.find((l) => l.id === s.from_id)?.label || "",
@@ -971,6 +1001,47 @@ export default function ReceiptMileageImportPage() {
     }))
   }
 
+  // Auto-fill detour stops from timeline visits between from and to
+  const autoFillDetourStops = (segIndex: number) => {
+    if (!timelineSegments) return
+    const seg = segments[segIndex]
+    if (!seg.from_id || !seg.to_id) return
+
+    const fromLoc = locationOptions.find((l) => l.id === seg.from_id)
+    const toLoc = locationOptions.find((l) => l.id === seg.to_id)
+    if (!fromLoc || !toLoc) return
+
+    // Find high-confidence timeline visits in order
+    const visits = timelineSegments.filter(
+      (s) => s.segment_type === "visit" && s.visit_location_label && !s.visit_location_label.startsWith("Unknown")
+    )
+
+    // Find the LATEST matching pair: last "to" match, then last "from" match before it
+    let toIdx = -1
+    for (let i = visits.length - 1; i >= 0; i--) {
+      if (visits[i].visit_location_label === toLoc.label) { toIdx = i; break }
+    }
+    if (toIdx < 0) return
+    let fromIdx = -1
+    for (let i = toIdx - 1; i >= 0; i--) {
+      if (visits[i].visit_location_label === fromLoc.label) { fromIdx = i; break }
+    }
+    if (fromIdx < 0 || toIdx <= fromIdx + 1) return
+
+    // Get visits between from and to
+    const between = visits.slice(fromIdx + 1, toIdx)
+    const stopIds = between
+      .map((v) => locationOptions.find((l) => l.label === v.visit_location_label!)?.id)
+      .filter((id): id is string => !!id && id !== seg.from_id && id !== seg.to_id)
+    const uniqueIds = [...new Set(stopIds)]
+    if (uniqueIds.length === 0) return
+
+    setSegments((prev) => prev.map((s, i) => {
+      if (i !== segIndex) return s
+      return { ...s, detourStopIds: uniqueIds, computed_km: "", distance_km: "", routeCoords: [] }
+    }))
+  }
+
   const handleRematch = async () => {
     if (!selectedDate || rematching) return
     setRematching(true)
@@ -1051,8 +1122,8 @@ export default function ReceiptMileageImportPage() {
       setAutoSaveStatus("saving")
 
       if (draftLogId) {
-        // Already have a draft — update purpose/notes AND segments
-        updateTripLog.mutateAsync({ id: draftLogId, purpose: purpose || undefined, notes: notes || undefined, segments: validSegs })
+        // Already have a log — update as draft
+        updateTripLog.mutateAsync({ id: draftLogId, purpose: purpose || undefined, notes: notes || undefined, status: "draft", segments: validSegs })
           .then(() => { lastSavedKey.current = saveKey; setAutoSaveStatus("saved") })
           .catch(() => setAutoSaveStatus("error"))
       } else {
@@ -1084,6 +1155,8 @@ export default function ReceiptMileageImportPage() {
       if (newId) setDraftLogId(newId)
       setAutoSaveStatus("saved")
       lastSavedKey.current = saveKey
+      // Snapshot the confirmed state for future reverts
+      savedSnapshot.current = { segments: [...segments], purpose, notes }
       // Reset so re-selecting this date will reload fresh data
       loadedLogDateRef.current = null
     }
@@ -1100,6 +1173,35 @@ export default function ReceiptMileageImportPage() {
         { onSuccess: (result) => onDone(result.id) },
       )
     }
+  }
+
+  const handleRevert = () => {
+    if (!savedSnapshot.current || !draftLogId) return
+    // Cancel any pending auto-save
+    if (autoSaveTimer.current) { clearTimeout(autoSaveTimer.current); autoSaveTimer.current = null }
+    const snap = savedSnapshot.current
+    setSegments(snap.segments)
+    setPurpose(snap.purpose)
+    setNotes(snap.notes)
+    // Build payload from the snapshot (can't use buildSavePayload — React batching)
+    const validSegs = snap.segments
+      .filter((s) => s.from_id && s.to_id && parseFloat(s.distance_km) > 0)
+      .map((s) => ({
+        from_location: locationOptions.find((l) => l.id === s.from_id)?.label || "",
+        to_location: locationOptions.find((l) => l.id === s.to_id)?.label || "",
+        distance_km: parseFloat(s.distance_km),
+        classification: s.classification,
+        route_coords: s.routeCoords.length > 0 ? s.routeCoords : undefined,
+        is_detour: s.isDetour || undefined,
+        detour_stop_ids: s.detourStopIds.length > 0 ? s.detourStopIds : undefined,
+        direct_km: s.directKm ? parseFloat(s.directKm) : undefined,
+        with_stops_km: s.withStopsKm ? parseFloat(s.withStopsKm) : undefined,
+      }))
+    const saveKey = JSON.stringify({ date: selectedDate, purpose: snap.purpose, notes: snap.notes, segs: validSegs })
+    updateTripLog.mutate(
+      { id: draftLogId, purpose: snap.purpose || undefined, notes: snap.notes || undefined, status: "confirmed", segments: validSegs },
+      { onSuccess: () => { lastSavedKey.current = saveKey; setAutoSaveStatus("saved") } },
+    )
   }
 
   if (receiptsLoading) return <div className="p-8 text-muted-foreground">Loading...</div>
@@ -1286,19 +1388,27 @@ export default function ReceiptMileageImportPage() {
               <div className="flex items-center gap-2">
                 <CardTitle className="text-sm">{selectedDate ? `Mileage Entry: ${fmtDateWithDay(selectedDate)}` : "Select a date"}</CardTitle>
                 {selectedDate && selectedDateData && (() => {
-                  const logStatus = selectedDateData.log?.status
-                  if (logStatus === "confirmed") return <span className="text-[11px] font-medium bg-green-100 text-green-800 px-1.5 py-0.5 rounded">Saved</span>
-                  if (logStatus === "draft" || autoSaveStatus === "saved") return <span className="text-[11px] font-medium bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded">Draft</span>
                   if (autoSaveStatus === "saving") return <span className="text-[11px] font-medium bg-blue-100 text-blue-800 px-1.5 py-0.5 rounded flex items-center gap-1"><RotateCw className="h-2.5 w-2.5 animate-spin" />Saving…</span>
                   if (autoSaveStatus === "error") return <span className="text-[11px] font-medium bg-red-100 text-red-800 px-1.5 py-0.5 rounded">Error</span>
-                  return <span className="text-[11px] font-medium bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded">Unsaved</span>
+                  if (autoSaveStatus === "saved") return <span className="text-[11px] font-medium bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded">Draft</span>
+                  const logStatus = selectedDateData.log?.status
+                  if (logStatus === "confirmed") return <span className="text-[11px] font-medium bg-green-100 text-green-800 px-1.5 py-0.5 rounded">Saved</span>
+                  if (logStatus === "draft") return <span className="text-[11px] font-medium bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded">Draft</span>
+                  return null
                 })()}
               </div>
               {selectedDate && selectedDateData && (
-                <Button size="sm" disabled={!canSave || createReceiptTripLog.isPending || updateTripLog.isPending} onClick={handleSave}>
-                  <Save className="h-3.5 w-3.5 mr-1" />
-                  {createReceiptTripLog.isPending || updateTripLog.isPending ? "Saving…" : "Save to Log"}
-                </Button>
+                <div className="flex items-center gap-2">
+                  {savedSnapshot.current && autoSaveStatus === "saved" && (
+                    <Button size="sm" variant="outline" disabled={updateTripLog.isPending} onClick={handleRevert}>
+                      <Undo2 className="h-3.5 w-3.5 mr-1" />Revert
+                    </Button>
+                  )}
+                  <Button size="sm" disabled={!canSave || createReceiptTripLog.isPending || updateTripLog.isPending} onClick={handleSave}>
+                    <Save className="h-3.5 w-3.5 mr-1" />
+                    {createReceiptTripLog.isPending || updateTripLog.isPending ? "Saving…" : "Save to Log"}
+                  </Button>
+                </div>
               )}
             </div>
           </CardHeader>
@@ -1483,6 +1593,21 @@ export default function ReceiptMileageImportPage() {
                                 setSegments((prev) => prev.map((s, j) => j === segIdx ? { ...s, detourStopIds: newIds, computed_km: "", distance_km: "", routeCoords: [] } : s))
                               }}
                             />
+                            {(() => {
+                              const noTimeline = !timelineSegments || timelineSegments.length === 0
+                              const missingEndpoints = !seg.from_id || !seg.to_id
+                              const hasStops = seg.detourStopIds.length > 0
+                              const disabled = noTimeline || missingEndpoints || hasStops
+                              const title = noTimeline ? "No timeline data for this date"
+                                : missingEndpoints ? "Set both From and To locations first"
+                                : hasStops ? "Clear existing stops first"
+                                : "Fill detour stops from timeline visits"
+                              return (
+                                <Button variant="outline" size="sm" className="h-5 text-[10px] px-2 ml-5" disabled={disabled} title={title} onClick={() => autoFillDetourStops(i)}>
+                                  Auto-fill from timeline
+                                </Button>
+                              )
+                            })()}
                             {seg.directKm && seg.withStopsKm && (
                               <div className="text-[11px] text-muted-foreground font-mono">
                                 Direct: {seg.directKm} km · With stops: {seg.withStopsKm} km · <span className="text-green-700 font-semibold">Business detour: {seg.distance_km} km</span>
