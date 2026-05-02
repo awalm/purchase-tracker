@@ -11,7 +11,7 @@ import {
   useCreateTravelLocation,
   useUpdateTripLog,
 } from "@/hooks/useApi"
-import { useQueryClient } from "@tanstack/react-query"
+import { useQueryClient, useQuery } from "@tanstack/react-query"
 import { travel } from "@/api"
 import type { TravelTripLog, TravelLocation, TravelSegment } from "@/api"
 import type { ReceiptWithVendor } from "@/types"
@@ -44,6 +44,7 @@ import {
   RotateCw,
   Car,
   FileText,
+  GripVertical,
 } from "lucide-react"
 import { MapContainer, Polyline, CircleMarker, Tooltip, useMap } from "react-leaflet"
 import L from "leaflet"
@@ -136,7 +137,113 @@ function labelTimelineSegments(segs: TravelSegment[]): Map<string, string> {
   return labels
 }
 
+/**
+ * Auto-suggest detour segments from timeline data.
+ * Pattern: Personal visit → Business visit(s) → Personal visit
+ * Only uses high-confidence matches (visit_location_label set).
+ */
+function suggestDetourSegments(
+  segs: TravelSegment[],
+  locations: TravelLocation[],
+): SegmentDraft[] {
+  // Extract matched visits in chronological order
+  const visits = segs.filter(
+    (s) => s.segment_type === "visit" && s.visit_location_label && !s.visit_location_label.startsWith("Unknown")
+  )
+  if (visits.length < 3) return []
+
+  const findLocId = (label: string) => locations.find((l) => l.label === label)?.id || ""
+
+  const drafts: SegmentDraft[] = []
+  let i = 0
+  while (i < visits.length) {
+    // Look for a personal visit
+    if (visits[i].classification !== "personal") { i++; continue }
+    const fromVisit = visits[i]
+
+    // Collect consecutive business visits after it
+    const businessStops: TravelSegment[] = []
+    let j = i + 1
+    while (j < visits.length && visits[j].classification === "business") {
+      businessStops.push(visits[j])
+      j++
+    }
+
+    // Need at least one business stop AND a personal visit to close the bracket
+    if (businessStops.length > 0 && j < visits.length && visits[j].classification === "personal") {
+      const toVisit = visits[j]
+      const fromId = findLocId(fromVisit.visit_location_label!)
+      const toId = findLocId(toVisit.visit_location_label!)
+      const stopIds = businessStops
+        .map((s) => findLocId(s.visit_location_label!))
+        .filter((id) => id && id !== fromId && id !== toId)
+      // Deduplicate stops
+      const uniqueStopIds = [...new Set(stopIds)]
+
+      if (fromId && toId && uniqueStopIds.length > 0) {
+        drafts.push({
+          from_id: fromId,
+          to_id: toId,
+          distance_km: "",
+          computed_km: "",
+          classification: "business",
+          routeCoords: [],
+          computing: false,
+          routeError: null,
+          source: "suggested",
+          isDetour: true,
+          detourStopIds: uniqueStopIds,
+          directKm: "",
+          withStopsKm: "",
+          directCoords: [],
+          withStopsCoords: [],
+        })
+      }
+      i = j // continue from the closing personal visit (it can start a new bracket)
+    } else {
+      i++
+    }
+  }
+  return drafts
+}
+
 // ----- Segment Types (simple) -----
+
+/** Haversine distance in km between two lat/lng points */
+function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371
+  const p = Math.PI / 180
+  const a = Math.sin((lat2 - lat1) * p / 2) ** 2 + Math.cos(lat1 * p) * Math.cos(lat2 * p) * Math.sin((lng2 - lng1) * p / 2) ** 2
+  return R * 2 * Math.asin(Math.sqrt(a))
+}
+
+/** Find the optimal insertion index for a new stop that minimizes total route distance */
+function optimalStopIndex(
+  fromLoc: { latitude: number; longitude: number },
+  toLoc: { latitude: number; longitude: number },
+  existingStops: { latitude: number; longitude: number }[],
+  newStop: { latitude: number; longitude: number },
+): number {
+  // Build the full waypoint chain: [from, ...stops, to]
+  const chain = [fromLoc, ...existingStops, toLoc]
+  let bestIdx = 0
+  let bestCost = Infinity
+  // Try inserting at each position among stops (index 0..existingStops.length)
+  for (let pos = 0; pos <= existingStops.length; pos++) {
+    // Insert after chain[pos] (which is from or a stop) and before chain[pos+1]
+    const prev = chain[pos]
+    const next = chain[pos + 1]
+    // Cost of inserting here = dist(prev→new) + dist(new→next) - dist(prev→next)
+    const added = haversineKm(prev.latitude, prev.longitude, newStop.latitude, newStop.longitude)
+      + haversineKm(newStop.latitude, newStop.longitude, next.latitude, next.longitude)
+      - haversineKm(prev.latitude, prev.longitude, next.latitude, next.longitude)
+    if (added < bestCost) {
+      bestCost = added
+      bestIdx = pos
+    }
+  }
+  return bestIdx
+}
 
 interface SegmentDraft {
   from_id: string
@@ -166,7 +273,7 @@ function emptySegment(fromId?: string): SegmentDraft {
   }
 }
 
-// ----- Route fetching -----
+// ----- Route fetching (cached — same coords always give same Google route) -----
 
 const routeCache = new Map<string, { distance: number; coords: [number, number][] }>()
 
@@ -185,7 +292,7 @@ async function fetchRoute(
 
 // ----- Route Map (uses same road-snap approach as TravelReportPage) -----
 
-const timelineRouteCache = new Map<string, [number, number][]>()
+
 
 function RouteMap({
   segments,
@@ -209,7 +316,7 @@ function RouteMap({
   const { allPoints, manualDrives, detourDrives, timelineDrives, timelineVisits, receiptMarkers } = useMemo(() => {
     const pts: [number, number][] = []
     const manual: { positions: [number, number][]; color: string; label: string }[] = []
-    const detours: { directPositions: [number, number][]; withStopsPositions: [number, number][]; label: string }[] = []
+    const detours: { positions: [number, number][]; color: string; label: string }[] = []
 
     for (const seg of segments) {
       const fromLoc = locations.find((l) => l.id === seg.from_id)
@@ -219,17 +326,22 @@ function RouteMap({
       const end: [number, number] = [toLoc.latitude, toLoc.longitude]
       pts.push(start, end)
       if (seg.isDetour) {
-        detours.push({
-          directPositions: seg.directCoords.length > 0 ? seg.directCoords : [start, end],
-          withStopsPositions: seg.withStopsCoords.length > 0 ? seg.withStopsCoords : [start, end],
-          label: `${fromLoc.label} \u2192 ${toLoc.label} (detour: ${seg.distance_km || "?"} km)`,
-        })
+        const coords = seg.withStopsCoords.length > 0 ? seg.withStopsCoords : (seg.routeCoords.length > 0 ? seg.routeCoords : null)
+        if (coords) {
+          detours.push({
+            positions: coords,
+            color: CLASSIFICATION_COLORS[seg.classification] || "#6b7280",
+            label: `${fromLoc.label} \u2192 ${toLoc.label} (detour: ${seg.distance_km || "?"} km)`,
+          })
+        }
       } else {
-        manual.push({
-          positions: seg.routeCoords.length > 0 ? seg.routeCoords : [start, end],
-          color: CLASSIFICATION_COLORS[seg.classification] || "#6b7280",
-          label: `${fromLoc.label} \u2192 ${toLoc.label} (${seg.distance_km || seg.computed_km || "?"} km)`,
-        })
+        if (seg.routeCoords.length > 0) {
+          manual.push({
+            positions: seg.routeCoords,
+            color: CLASSIFICATION_COLORS[seg.classification] || "#6b7280",
+            label: `${fromLoc.label} \u2192 ${toLoc.label} (${seg.distance_km || seg.computed_km || "?"} km)`,
+          })
+        }
       }
     }
 
@@ -287,13 +399,10 @@ function RouteMap({
       let done = 0
       for (const d of timelineDrives) {
         if (cancelled) break
-        if (timelineRouteCache.has(d.key)) { routes.set(d.key, timelineRouteCache.get(d.key)!); done++; if (!cancelled) setSnappedCount(done); continue }
         try {
-          const data = await travel.directions(d.start[0], d.start[1], d.end[0], d.end[1])
-          const coords: [number, number][] = data.coords.map(([lat, lng]) => [lat, lng] as [number, number])
+          const { coords } = await fetchRoute(d.start[0], d.start[1], d.end[0], d.end[1])
           routes.set(d.key, coords)
-          timelineRouteCache.set(d.key, coords)
-        } catch { /* straight line fallback */ }
+        } catch { /* skip if directions fail */ }
         done++
         if (!cancelled) setSnappedCount(done)
       }
@@ -363,14 +472,9 @@ function RouteMap({
             </Polyline>
           ))}
 
-          {/* Detour segments: dashed direct + solid with-stops */}
+          {/* Detour segments */}
           {detourDrives.map((d, i) => (
-            <Polyline key={`det-direct-${i}`} positions={d.directPositions} color="#94a3b8" weight={3} opacity={0.5} dashArray="8 6">
-              <Tooltip>Direct route (personal)</Tooltip>
-            </Polyline>
-          ))}
-          {detourDrives.map((d, i) => (
-            <Polyline key={`det-stops-${i}`} positions={d.withStopsPositions} color="#d97706" weight={4} opacity={0.9}>
+            <Polyline key={`det-${i}`} positions={d.positions} color={d.color} weight={4} opacity={0.9}>
               <Tooltip>{d.label}</Tooltip>
             </Polyline>
           ))}
@@ -402,6 +506,105 @@ function RouteMap({
   )
 }
 
+// ----- Detour Stop List with Drag & Drop -----
+
+function DetourStopList({
+  seg, segIndex, locationOptions, receiptStoreLocations, homeLocationId,
+  onAdd, onRemove, onReorder,
+}: {
+  seg: SegmentDraft
+  segIndex: number
+  locationOptions: TravelLocation[]
+  receiptStoreLocations: TravelLocation[]
+  homeLocationId?: string
+  onAdd: (segIndex: number, locationId: string) => void
+  onRemove: (segIndex: number, locationId: string) => void
+  onReorder: (segIndex: number, newIds: string[]) => void
+}) {
+  const [dragIdx, setDragIdx] = useState<number | null>(null)
+  const [overIdx, setOverIdx] = useState<number | null>(null)
+
+  const handleDragStart = (e: React.DragEvent, idx: number) => {
+    setDragIdx(idx)
+    e.dataTransfer.effectAllowed = "move"
+    e.dataTransfer.setData("text/plain", String(idx))
+  }
+
+  const handleDragOver = (e: React.DragEvent, idx: number) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = "move"
+    setOverIdx(idx)
+  }
+
+  const handleDrop = (e: React.DragEvent, dropIdx: number) => {
+    e.preventDefault()
+    if (dragIdx == null || dragIdx === dropIdx) { setDragIdx(null); setOverIdx(null); return }
+    const ids = [...seg.detourStopIds]
+    const [moved] = ids.splice(dragIdx, 1)
+    ids.splice(dropIdx, 0, moved)
+    onReorder(segIndex, ids)
+    setDragIdx(null)
+    setOverIdx(null)
+  }
+
+  const handleDragEnd = () => { setDragIdx(null); setOverIdx(null) }
+
+  const used = new Set([...seg.detourStopIds, seg.from_id, seg.to_id])
+  const receiptIds = new Set(receiptStoreLocations.map((l) => l.id))
+  const groups = [
+    { label: "Receipt Locations", locations: receiptStoreLocations.filter((l) => !used.has(l.id) && l.id !== homeLocationId) },
+    { label: "All Locations", locations: locationOptions.filter((l) => !used.has(l.id) && !receiptIds.has(l.id) && l.id !== homeLocationId) },
+  ]
+
+  return (
+    <div className="space-y-1.5 pl-1">
+      <div className="text-[11px] text-muted-foreground">
+        Stops on this personal route (drag to reorder):
+      </div>
+      <div className="space-y-0.5">
+        {seg.detourStopIds.map((stopId, si) => {
+          const loc = locationOptions.find((l) => l.id === stopId)
+          const isDragging = dragIdx === si
+          const isOver = overIdx === si && dragIdx !== si
+          return (
+            <div
+              key={stopId}
+              draggable
+              onDragStart={(e) => handleDragStart(e, si)}
+              onDragOver={(e) => handleDragOver(e, si)}
+              onDrop={(e) => handleDrop(e, si)}
+              onDragEnd={handleDragEnd}
+              className={`flex items-center gap-1.5 rounded px-1 py-0.5 cursor-grab active:cursor-grabbing transition-all ${
+                isDragging ? "opacity-30 scale-95" : ""
+              } ${isOver ? "border-t-2 border-amber-500" : ""}`}
+            >
+              <span className="text-[10px] text-muted-foreground w-3 text-right flex-shrink-0">{si + 1}.</span>
+              <div className="flex items-center gap-0.5 bg-amber-100 border border-amber-300 rounded px-1.5 py-0.5 text-[11px] flex-1 min-w-0">
+                <span className="text-muted-foreground cursor-grab" title="Drag to reorder">⠿</span>
+                <MapPin className="h-2.5 w-2.5 flex-shrink-0" />
+                <span className="truncate">{loc?.label || "?"}</span>
+                <button className="ml-auto pl-1 text-amber-700 hover:text-red-600 flex-shrink-0" onClick={() => onRemove(segIndex, stopId)} title="Remove">&times;</button>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+      <div className="flex items-center gap-1.5 pl-1">
+        <span className="text-[10px] text-muted-foreground w-3 text-right flex-shrink-0">{seg.detourStopIds.length + 1}.</span>
+        <LocationSearch
+          locations={locationOptions}
+          groups={groups}
+          value=""
+          onValueChange={(v) => onAdd(segIndex, v)}
+          placeholder="Add location..."
+          className="w-[180px]"
+          triggerClassName="h-6 text-[11px]"
+        />
+      </div>
+    </div>
+  )
+}
+
 // ----- Main Page -----
 
 export default function ReceiptMileageImportPage() {
@@ -414,9 +617,12 @@ export default function ReceiptMileageImportPage() {
   const [hoveredSegmentId, setHoveredSegmentId] = useState<string | null>(null)
   const [matchRadius, setMatchRadius] = useState(250)
   const [rematching, setRematching] = useState(false)
+  const [yearFilter, setYearFilter] = useState<string>("all")
+  const [editingYearlyKm, setEditingYearlyKm] = useState<string>("")
 
   const { data: receipts, isLoading: receiptsLoading } = useReceipts()
   const { data: allLogs } = useTripLogs()
+  const { data: yearlyMileageData } = useQuery({ queryKey: ["travel", "yearly-mileage"], queryFn: () => travel.yearlyMileage.list() })
   const { data: travelLocations = [] } = useTravelLocations()
   const createReceiptTripLog = useCreateReceiptTripLog()
   const createTravelLocation = useCreateTravelLocation()
@@ -451,12 +657,24 @@ export default function ReceiptMileageImportPage() {
     })
   }, [travelLocations, homeLocation])
 
+  // Compute available years from all logs
+  const availableYears = useMemo(() => {
+    const years = new Set<number>()
+    if (allLogs) for (const log of allLogs) years.add(parseInt(log.trip_date.slice(0, 4)))
+    if (receipts) for (const r of receipts) years.add(parseInt(r.receipt_date.slice(0, 4)))
+    return Array.from(years).sort((a, b) => b - a)
+  }, [allLogs, receipts])
+
+  // Effective date range (year filter overrides from/to)
+  const effectiveFromDate = yearFilter !== "all" ? `${yearFilter}-01-01` : fromDate
+  const effectiveToDate = yearFilter !== "all" ? `${yearFilter}-12-31` : toDate
+
   const receiptsByDate = useMemo(() => {
     if (!receipts) return []
     const map = new Map<string, ReceiptWithVendor[]>()
     for (const r of receipts) {
-      if (fromDate && r.receipt_date < fromDate) continue
-      if (toDate && r.receipt_date > toDate) continue
+      if (effectiveFromDate && r.receipt_date < effectiveFromDate) continue
+      if (effectiveToDate && r.receipt_date > effectiveToDate) continue
       if (!r.store_location_id) continue
       if (r.store_location_id === onlineLocation?.id) continue
       const existing = map.get(r.receipt_date) || []
@@ -473,7 +691,7 @@ export default function ReceiptMileageImportPage() {
         hasLog: logsByDate.has(date),
         log: logsByDate.get(date),
       }))
-  }, [receipts, fromDate, toDate, logsByDate, onlineLocation])
+  }, [receipts, effectiveFromDate, effectiveToDate, logsByDate, onlineLocation])
 
   const selectedDateData = useMemo(() => receiptsByDate.find((d) => d.date === selectedDate), [receiptsByDate, selectedDate])
 
@@ -481,15 +699,15 @@ export default function ReceiptMileageImportPage() {
     if (!receipts) return []
     const map = new Map<string, ReceiptWithVendor[]>()
     for (const r of receipts) {
-      if (fromDate && r.receipt_date < fromDate) continue
-      if (toDate && r.receipt_date > toDate) continue
+      if (effectiveFromDate && r.receipt_date < effectiveFromDate) continue
+      if (effectiveToDate && r.receipt_date > effectiveToDate) continue
       if (r.store_location_id) continue
       const existing = map.get(r.receipt_date) || []
       existing.push(r)
       map.set(r.receipt_date, existing)
     }
     return Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b)).map(([date, recs]) => ({ date, receipts: recs }))
-  }, [receipts, fromDate, toDate])
+  }, [receipts, effectiveFromDate, effectiveToDate])
 
   const findMatchingLocation = useCallback(
     (receipt: ReceiptWithVendor): TravelLocation | undefined => {
@@ -571,10 +789,10 @@ export default function ReceiptMileageImportPage() {
             computing: false,
             routeError: null,
             source: "loaded",
-            isDetour: false,
-            detourStopIds: [],
-            directKm: "",
-            withStopsKm: "",
+            isDetour: s.is_detour || false,
+            detourStopIds: s.detour_stop_ids || [],
+            directKm: s.direct_km != null ? String(s.direct_km) : "",
+            withStopsKm: s.with_stops_km != null ? String(s.with_stops_km) : "",
             directCoords: [],
             withStopsCoords: [],
           }
@@ -587,20 +805,32 @@ export default function ReceiptMileageImportPage() {
           to_location: locationOptions.find((l) => l.id === s.to_id)?.label || "",
           distance_km: parseFloat(s.distance_km),
           classification: s.classification,
+          route_coords: s.routeCoords.length > 0 ? s.routeCoords : undefined,
+          is_detour: s.isDetour || undefined,
+          detour_stop_ids: s.detourStopIds.length > 0 ? s.detourStopIds : undefined,
+          direct_km: s.directKm ? parseFloat(s.directKm) : undefined,
+          with_stops_km: s.withStopsKm ? parseFloat(s.withStopsKm) : undefined,
         }))
         const purpose_ = selectedDateData.log?.purpose || ""
         const notes_ = selectedDateData.log?.notes || ""
         lastSavedKey.current = JSON.stringify({ date: selectedDate, purpose: purpose_ || undefined, notes: notes_ || undefined, segs: validSegs })
       } else {
+        // No existing manual segments — try auto-suggesting detour segments from timeline
+        if (timelineSegments && timelineSegments.length > 0) {
+          const suggested = suggestDetourSegments(timelineSegments, locationOptions)
+          if (suggested.length > 0) {
+            setSegments([...suggested, emptySegment()])
+          }
+        }
         loadedLogDateRef.current = selectedDate
       }
     }
   }, [selectedDate, selectedDateData, timelineSegments, locationOptions])
 
   // Auto-compute route distance when from/to set
-  const computeSegmentDistance = useCallback(async (index: number) => {
+  const computeSegmentDistance = useCallback(async (index: number, segSnapshot: SegmentDraft) => {
     setSegments((prev) => prev.map((s, i) => i === index ? { ...s, computing: true, routeError: null } : s))
-    const seg = segments[index]
+    const seg = segSnapshot
     const fromLoc = locationOptions.find((l) => l.id === seg.from_id)
     const toLoc = locationOptions.find((l) => l.id === seg.to_id)
     if (!fromLoc?.latitude || !fromLoc?.longitude || !toLoc?.latitude || !toLoc?.longitude) {
@@ -648,13 +878,17 @@ export default function ReceiptMileageImportPage() {
       const msg = err instanceof Error ? err.message : "Directions API failed"
       setSegments((prev) => prev.map((s, i) => i === index ? { ...s, computing: false, routeError: msg } : s))
     }
-  }, [segments, locationOptions])
+  }, [locationOptions])
 
   useEffect(() => {
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i]
+      // Skip loaded segments that already have computed km and route coords
+      if (seg.source === "loaded" && seg.computed_km && seg.routeCoords.length > 0) continue
+      // Skip segments that have errored (user must manually retry)
+      if (seg.routeError) continue
       if (seg.from_id && seg.to_id && (!seg.computed_km || seg.routeCoords.length === 0) && !seg.computing) {
-        computeSegmentDistance(i)
+        computeSegmentDistance(i, seg)
         break
       }
     }
@@ -665,6 +899,34 @@ export default function ReceiptMileageImportPage() {
     return [...prev, emptySegment(lastTo)]
   })
   const removeSegment = (index: number) => setSegments((prev) => prev.length > 1 ? prev.filter((_, i) => i !== index) : prev)
+
+  // Drag-and-drop segment reordering
+  const [dragSegIdx, setDragSegIdx] = useState<number | null>(null)
+  const [overSegIdx, setOverSegIdx] = useState<number | null>(null)
+
+  const handleSegDragStart = (e: React.DragEvent, idx: number) => {
+    setDragSegIdx(idx)
+    e.dataTransfer.effectAllowed = "move"
+    e.dataTransfer.setData("text/plain", String(idx))
+  }
+  const handleSegDragOver = (e: React.DragEvent, idx: number) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = "move"
+    setOverSegIdx(idx)
+  }
+  const handleSegDrop = (e: React.DragEvent, dropIdx: number) => {
+    e.preventDefault()
+    if (dragSegIdx == null || dragSegIdx === dropIdx) { setDragSegIdx(null); setOverSegIdx(null); return }
+    setSegments((prev) => {
+      const next = [...prev]
+      const [moved] = next.splice(dragSegIdx, 1)
+      next.splice(dropIdx, 0, moved)
+      return next
+    })
+    setDragSegIdx(null)
+    setOverSegIdx(null)
+  }
+  const handleSegDragEnd = () => { setDragSegIdx(null); setOverSegIdx(null) }
 
   const toggleDetour = (index: number) => {
     setSegments((prev) => prev.map((s, i) => {
@@ -682,7 +944,23 @@ export default function ReceiptMileageImportPage() {
   const addDetourStop = (segIndex: number, locationId: string) => {
     setSegments((prev) => prev.map((s, i) => {
       if (i !== segIndex || s.detourStopIds.includes(locationId)) return s
-      return { ...s, detourStopIds: [...s.detourStopIds, locationId], computed_km: "", distance_km: "", routeCoords: [] }
+      // Find optimal insertion position
+      const fromLoc = locationOptions.find((l) => l.id === s.from_id)
+      const toLoc = locationOptions.find((l) => l.id === s.to_id)
+      const newLoc = locationOptions.find((l) => l.id === locationId)
+      const existingStops = s.detourStopIds.map((id) => locationOptions.find((l) => l.id === id)).filter((l): l is TravelLocation => l != null && l.latitude != null)
+      let insertIdx = s.detourStopIds.length // default: append
+      if (fromLoc?.latitude != null && toLoc?.latitude != null && newLoc?.latitude != null) {
+        insertIdx = optimalStopIndex(
+          { latitude: fromLoc.latitude!, longitude: fromLoc.longitude! },
+          { latitude: toLoc.latitude!, longitude: toLoc.longitude! },
+          existingStops.map((l) => ({ latitude: l.latitude!, longitude: l.longitude! })),
+          { latitude: newLoc.latitude!, longitude: newLoc.longitude! },
+        )
+      }
+      const ids = [...s.detourStopIds]
+      ids.splice(insertIdx, 0, locationId)
+      return { ...s, detourStopIds: ids, computed_km: "", distance_km: "", routeCoords: [] }
     }))
   }
 
@@ -713,6 +991,18 @@ export default function ReceiptMileageImportPage() {
         updated.distance_km = ""
         updated.routeCoords = []
         updated.routeError = null
+        // Auto-set classification based on location types
+        const fromId = field === "from_id" ? value : s.from_id
+        const toId = field === "to_id" ? value : s.to_id
+        if (fromId && toId) {
+          const fromLoc = locationOptions.find((l) => l.id === fromId)
+          const toLoc = locationOptions.find((l) => l.id === toId)
+          if (fromLoc?.location_type === "personal" && toLoc?.location_type === "personal") {
+            updated.classification = "personal"
+          } else {
+            updated.classification = "business"
+          }
+        }
       }
       return updated
     }))
@@ -733,6 +1023,10 @@ export default function ReceiptMileageImportPage() {
           distance_km: parseFloat(s.distance_km),
           classification: s.classification,
           route_coords: s.routeCoords.length > 0 ? s.routeCoords : undefined,
+          is_detour: s.isDetour || undefined,
+          detour_stop_ids: s.detourStopIds.length > 0 ? s.detourStopIds : undefined,
+          direct_km: s.directKm ? parseFloat(s.directKm) : undefined,
+          with_stops_km: s.withStopsKm ? parseFloat(s.withStopsKm) : undefined,
         }
       })
   }, [segments, locationOptions])
@@ -776,25 +1070,34 @@ export default function ReceiptMileageImportPage() {
     return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
   }, [selectedDate, canSave, buildSavePayload, purpose, notes, draftLogId])
 
-  // "Save to Log" promotes draft → confirmed and closes
+  // "Save to Log" promotes draft → confirmed
   const handleSave = () => {
     if (!selectedDate || !canSave) return
+    // Cancel any pending auto-save to prevent race conditions
+    if (autoSaveTimer.current) { clearTimeout(autoSaveTimer.current); autoSaveTimer.current = null }
+
     const logId = draftLogId || selectedDateData?.log?.id
+    const validSegments = buildSavePayload()
+    const saveKey = JSON.stringify({ date: selectedDate, purpose, notes, segs: validSegments })
+
+    const onDone = (newId?: string) => {
+      if (newId) setDraftLogId(newId)
+      setAutoSaveStatus("saved")
+      lastSavedKey.current = saveKey
+      // Reset so re-selecting this date will reload fresh data
+      loadedLogDateRef.current = null
+    }
 
     if (logId) {
-      // Promote existing draft/log to confirmed, with latest segments
-      const validSegments = buildSavePayload()
       updateTripLog.mutate(
-        { id: logId, purpose: purpose || undefined, notes: notes || undefined, status: "confirmed", segments: validSegments.length > 0 ? validSegments : undefined },
-        { onSuccess: () => { setSelectedDate(null); setSegments([emptySegment()]); setPurpose(""); setNotes(""); setDraftLogId(null); setAutoSaveStatus("idle"); lastSavedKey.current = "" } },
+        { id: logId, purpose: purpose || undefined, notes: notes || undefined, status: "confirmed", segments: validSegments },
+        { onSuccess: () => onDone() },
       )
     } else {
-      // No draft yet — create and confirm in one shot
-      const validSegments = buildSavePayload()
       if (validSegments.length === 0) return
       createReceiptTripLog.mutate(
         { trip_date: selectedDate, purpose: purpose || undefined, notes: notes || undefined, segments: validSegments },
-        { onSuccess: () => { setSelectedDate(null); setSegments([emptySegment()]); setPurpose(""); setNotes(""); setDraftLogId(null); setAutoSaveStatus("idle"); lastSavedKey.current = "" } },
+        { onSuccess: (result) => onDone(result.id) },
       )
     }
   }
@@ -807,21 +1110,100 @@ export default function ReceiptMileageImportPage() {
         <h1 className="text-2xl font-bold">Receipt Mileage Import</h1>
       </div>
 
-      {/* Date Filters */}
-      <div className="flex items-center gap-4">
+      {/* Year Filter + Date Filters */}
+      <div className="flex items-center gap-4 flex-wrap">
         <div className="flex items-center gap-2">
-          <label className="text-sm font-medium">From:</label>
-          <DateInput value={fromDate} onChange={setFromDate} className="w-36" />
+          <label className="text-sm font-medium">Year:</label>
+          <Select value={yearFilter} onValueChange={(v) => { setYearFilter(v); if (v !== "all") { setFromDate(""); setToDate("") } }}>
+            <SelectTrigger className="w-24 h-8 text-sm"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All</SelectItem>
+              {availableYears.map((y) => <SelectItem key={y} value={String(y)}>{y}</SelectItem>)}
+            </SelectContent>
+          </Select>
         </div>
-        <div className="flex items-center gap-2">
-          <label className="text-sm font-medium">To:</label>
-          <DateInput value={toDate} onChange={setToDate} className="w-36" />
-        </div>
-        {(fromDate || toDate) && (
-          <Button variant="ghost" size="sm" onClick={() => { setFromDate(""); setToDate("") }}>Clear</Button>
+        {yearFilter === "all" && (
+          <>
+            <div className="flex items-center gap-2">
+              <label className="text-sm font-medium">From:</label>
+              <DateInput value={fromDate} onChange={setFromDate} className="w-36" />
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-sm font-medium">To:</label>
+              <DateInput value={toDate} onChange={setToDate} className="w-36" />
+            </div>
+            {(fromDate || toDate) && (
+              <Button variant="ghost" size="sm" onClick={() => { setFromDate(""); setToDate("") }}>Clear</Button>
+            )}
+          </>
         )}
         <span className="text-xs text-muted-foreground ml-auto">In-store receipts only. Online excluded.</span>
       </div>
+
+      {/* Year Summary */}
+      {yearFilter !== "all" && (() => {
+        const yearNum = parseInt(yearFilter)
+        const yearLogs = allLogs?.filter((l) => l.trip_date.startsWith(yearFilter)) || []
+        const loggedBusinessKm = yearLogs.reduce((s, l) => s + l.business_km, 0)
+        const loggedTotalKm = yearLogs.reduce((s, l) => s + l.total_km, 0)
+        const loggedPersonalKm = loggedTotalKm - loggedBusinessKm
+        const yearlyEntry = yearlyMileageData?.find((y) => y.year === yearNum)
+        const odometerKm = yearlyEntry?.total_km
+        const businessPct = odometerKm && odometerKm > 0 ? (loggedBusinessKm / odometerKm) * 100 : null
+        return (
+          <Card>
+            <CardContent className="py-3 px-4">
+              <div className="flex items-center gap-6 flex-wrap">
+                <div className="text-sm space-y-0.5">
+                  <div className="text-muted-foreground text-xs">Logged Trips</div>
+                  <div className="font-semibold">{yearLogs.length} trips · {loggedTotalKm.toFixed(1)} km</div>
+                </div>
+                <div className="text-sm space-y-0.5">
+                  <div className="text-muted-foreground text-xs">Business</div>
+                  <div className="font-semibold text-green-700">{loggedBusinessKm.toFixed(1)} km</div>
+                </div>
+                <div className="text-sm space-y-0.5">
+                  <div className="text-muted-foreground text-xs">Personal</div>
+                  <div className="font-semibold text-blue-600">{loggedPersonalKm.toFixed(1)} km</div>
+                </div>
+                <div className="border-l pl-4 flex items-center gap-2">
+                  <div className="text-sm space-y-0.5">
+                    <div className="text-muted-foreground text-xs">Total Year km (odometer)</div>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="number"
+                        className="w-28 h-7 text-sm border rounded px-2"
+                        placeholder="e.g. 20000"
+                        value={editingYearlyKm || (odometerKm != null ? String(odometerKm) : "")}
+                        onChange={(e) => setEditingYearlyKm(e.target.value)}
+                        onBlur={() => {
+                          const val = parseFloat(editingYearlyKm)
+                          if (!isNaN(val) && val > 0) {
+                            travel.yearlyMileage.upsert(yearNum, val).then(() => {
+                              queryClient.invalidateQueries({ queryKey: ["travel", "yearly-mileage"] })
+                              setEditingYearlyKm("")
+                            })
+                          } else {
+                            setEditingYearlyKm("")
+                          }
+                        }}
+                        onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur() }}
+                      />
+                      <span className="text-xs text-muted-foreground">km</span>
+                    </div>
+                  </div>
+                </div>
+                {businessPct != null && (
+                  <div className="text-sm space-y-0.5">
+                    <div className="text-muted-foreground text-xs">Business %</div>
+                    <div className="font-bold text-lg text-green-700">{businessPct.toFixed(1)}%</div>
+                  </div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+        )
+      })()}
 
       {/* Unlinked Receipts */}
       {unlinkedByDate.length > 0 && (
@@ -899,7 +1281,27 @@ export default function ReceiptMileageImportPage() {
 
         {/* Right: Segment entry + map */}
         <Card className="col-span-3">
-          <CardHeader><CardTitle className="text-sm">{selectedDate ? `Mileage Entry: ${fmtDateWithDay(selectedDate)}` : "Select a date"}</CardTitle></CardHeader>
+          <CardHeader>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <CardTitle className="text-sm">{selectedDate ? `Mileage Entry: ${fmtDateWithDay(selectedDate)}` : "Select a date"}</CardTitle>
+                {selectedDate && selectedDateData && (() => {
+                  const logStatus = selectedDateData.log?.status
+                  if (logStatus === "confirmed") return <span className="text-[11px] font-medium bg-green-100 text-green-800 px-1.5 py-0.5 rounded">Saved</span>
+                  if (logStatus === "draft" || autoSaveStatus === "saved") return <span className="text-[11px] font-medium bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded">Draft</span>
+                  if (autoSaveStatus === "saving") return <span className="text-[11px] font-medium bg-blue-100 text-blue-800 px-1.5 py-0.5 rounded flex items-center gap-1"><RotateCw className="h-2.5 w-2.5 animate-spin" />Saving…</span>
+                  if (autoSaveStatus === "error") return <span className="text-[11px] font-medium bg-red-100 text-red-800 px-1.5 py-0.5 rounded">Error</span>
+                  return <span className="text-[11px] font-medium bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded">Unsaved</span>
+                })()}
+              </div>
+              {selectedDate && selectedDateData && (
+                <Button size="sm" disabled={!canSave || createReceiptTripLog.isPending || updateTripLog.isPending} onClick={handleSave}>
+                  <Save className="h-3.5 w-3.5 mr-1" />
+                  {createReceiptTripLog.isPending || updateTripLog.isPending ? "Saving…" : "Save to Log"}
+                </Button>
+              )}
+            </div>
+          </CardHeader>
           <CardContent>
             {selectedDate && selectedDateData ? (
               <div className="space-y-4">
@@ -1008,8 +1410,20 @@ export default function ReceiptMileageImportPage() {
                   </div>
                   <div className="space-y-2">
                     {segments.map((seg, i) => (
-                      <div key={i} className={`border rounded p-2 space-y-2 ${seg.isDetour ? "bg-amber-50 border-amber-200" : "bg-slate-50"}`}>
+                      <div key={i}
+                        draggable
+                        onDragStart={(e) => handleSegDragStart(e, i)}
+                        onDragOver={(e) => handleSegDragOver(e, i)}
+                        onDrop={(e) => handleSegDrop(e, i)}
+                        onDragEnd={handleSegDragEnd}
+                        className={`border rounded p-2 space-y-2 bg-slate-50 transition-all ${
+                          dragSegIdx === i ? "opacity-30 scale-[0.98]" : ""
+                        } ${overSegIdx === i && dragSegIdx !== i ? "border-t-2 border-blue-500" : ""}`}
+                      >
                         <div className="flex gap-2 items-center">
+                          <span className="cursor-grab active:cursor-grabbing text-muted-foreground" title="Drag to reorder">
+                            <GripVertical className="h-4 w-4" />
+                          </span>
                           <LocationSearch locations={locationOptions} groups={segmentLocationGroups} value={seg.from_id}
                             onValueChange={(v) => updateSegment(i, "from_id", v)} placeholder="From..." className="flex-1" triggerClassName="h-7"
                             onAddNew={() => { setNewLocTarget({ segIndex: i, field: "from_id" }); setNewLocLabel(""); setNewLocAddress(""); setNewLocType("personal") }}
@@ -1024,14 +1438,15 @@ export default function ReceiptMileageImportPage() {
                           <div className="flex items-center gap-1">
                             <input type="number" step="0.1" min="0" className="w-20 text-xs border rounded px-2 py-1 h-7" placeholder="km"
                               value={seg.distance_km} onChange={(e) => updateSegment(i, "distance_km", e.target.value)}
+                              readOnly={seg.isDetour}
                               title={seg.isDetour ? `Detour: ${seg.withStopsKm || "?"} − ${seg.directKm || "?"} = ${seg.distance_km || "?"} km` : undefined}
                             />
-                            <span className="text-xs text-muted-foreground">km</span>
+                            <span className="text-xs text-muted-foreground">{seg.isDetour ? "detour km" : "km"}</span>
                             {seg.computing && <RotateCw className="h-3 w-3 text-muted-foreground animate-spin" />}
                             {seg.routeError && <span className="text-xs text-red-600 flex items-center gap-1" title={seg.routeError}><AlertTriangle className="h-3 w-3" />Failed</span>}
                             {seg.from_id && seg.to_id && !seg.computing && (
-                              <Button variant="ghost" size="sm" className="h-6 px-1" title="Recompute"
-                                onClick={() => setSegments((prev) => prev.map((s, j) => j === i ? { ...s, computed_km: "", distance_km: "", routeCoords: [] } : s))}
+                              <Button variant="ghost" size="sm" className="h-6 px-1" title={seg.routeError ? "Retry" : "Recompute"}
+                                onClick={() => setSegments((prev) => prev.map((s, j) => j === i ? { ...s, computed_km: "", distance_km: "", routeCoords: [], routeError: null } : s))}
                               ><RotateCw className="h-3 w-3" /></Button>
                             )}
                           </div>
@@ -1045,7 +1460,7 @@ export default function ReceiptMileageImportPage() {
                             </Select>
                           )}
                           <Button variant={seg.isDetour ? "default" : "outline"} size="sm"
-                            className={`h-6 text-[11px] px-2 ${seg.isDetour ? "bg-amber-600 hover:bg-amber-700" : ""}`}
+                            className={`h-6 text-[11px] px-2`}
                             onClick={() => toggleDetour(i)} title="Detour: business km = route with stops − direct route"
                           >Detour</Button>
                           {segments.length > 1 && (
@@ -1055,37 +1470,19 @@ export default function ReceiptMileageImportPage() {
 
                         {/* Detour stop picker + breakdown */}
                         {seg.isDetour && (
-                          <div className="space-y-1.5 pl-1">
-                            <div className="text-[11px] text-muted-foreground">
-                              Stops made on this personal route (business km = with stops − direct):
-                            </div>
-                            <div className="flex flex-wrap gap-1">
-                              {seg.detourStopIds.map((stopId) => {
-                                const loc = locationOptions.find((l) => l.id === stopId)
-                                return (
-                                  <span key={stopId} className="inline-flex items-center gap-0.5 bg-amber-100 border border-amber-300 rounded px-1.5 py-0.5 text-[11px]">
-                                    <MapPin className="h-2.5 w-2.5" />{loc?.label || "?"}
-                                    <button className="ml-0.5 text-amber-700 hover:text-red-600" onClick={() => removeDetourStop(i, stopId)}>&times;</button>
-                                  </span>
-                                )
-                              })}
-                              <Select value="" onValueChange={(v) => addDetourStop(i, v)}>
-                                <SelectTrigger className="h-6 w-[140px] text-[11px] px-1.5"><span className="text-muted-foreground">+ Add stop</span></SelectTrigger>
-                                <SelectContent>
-                                  {receiptStoreLocations.filter((l) => !seg.detourStopIds.includes(l.id) && l.id !== seg.from_id && l.id !== seg.to_id && l.id !== homeLocation?.id).map((l) => (
-                                    <SelectItem key={l.id} value={l.id} className="text-xs">{l.label}</SelectItem>
-                                  ))}
-                                  {locationOptions.filter((l) => !seg.detourStopIds.includes(l.id) && l.id !== seg.from_id && l.id !== seg.to_id && !receiptStoreLocations.some((r) => r.id === l.id)).length > 0 && (
-                                    <>
-                                      <SelectItem value="__divider" disabled className="text-[10px] text-muted-foreground">— All locations —</SelectItem>
-                                      {locationOptions.filter((l) => !seg.detourStopIds.includes(l.id) && l.id !== seg.from_id && l.id !== seg.to_id && !receiptStoreLocations.some((r) => r.id === l.id)).map((l) => (
-                                        <SelectItem key={l.id} value={l.id} className="text-xs">{l.label}</SelectItem>
-                                      ))}
-                                    </>
-                                  )}
-                                </SelectContent>
-                              </Select>
-                            </div>
+                          <div className="space-y-1.5">
+                            <DetourStopList
+                              seg={seg}
+                              segIndex={i}
+                              locationOptions={locationOptions}
+                              receiptStoreLocations={receiptStoreLocations}
+                              homeLocationId={homeLocation?.id}
+                              onAdd={addDetourStop}
+                              onRemove={removeDetourStop}
+                              onReorder={(segIdx, newIds) => {
+                                setSegments((prev) => prev.map((s, j) => j === segIdx ? { ...s, detourStopIds: newIds, computed_km: "", distance_km: "", routeCoords: [] } : s))
+                              }}
+                            />
                             {seg.directKm && seg.withStopsKm && (
                               <div className="text-[11px] text-muted-foreground font-mono">
                                 Direct: {seg.directKm} km · With stops: {seg.withStopsKm} km · <span className="text-green-700 font-semibold">Business detour: {seg.distance_km} km</span>
@@ -1156,18 +1553,20 @@ export default function ReceiptMileageImportPage() {
                   <textarea className="w-full text-sm border rounded px-2 py-1 mt-1" rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Additional notes..." />
                 </div>
 
-                {/* Save */}
-                <div className="flex items-center justify-between">
-                  <div className="text-xs text-muted-foreground flex items-center gap-1.5">
-                    {autoSaveStatus === "saving" && <><RotateCw className="h-3 w-3 animate-spin" /><span>Saving draft…</span></>}
-                    {autoSaveStatus === "saved" && <><CheckCircle className="h-3 w-3 text-green-600" /><span>Draft saved</span></>}
-                    {autoSaveStatus === "error" && <><AlertTriangle className="h-3 w-3 text-red-500" /><span>Save failed</span></>}
-                  </div>
-                  <Button disabled={!canSave || createReceiptTripLog.isPending || updateTripLog.isPending} onClick={handleSave}>
-                    <Save className="h-4 w-4 mr-1" />
-                    {createReceiptTripLog.isPending || updateTripLog.isPending ? "Saving…" : "Save to Log"}
-                  </Button>
-                </div>
+                {/* Km Summary */}
+                {segments.some((s) => s.from_id && s.to_id && parseFloat(s.distance_km) > 0) && (() => {
+                  const valid = segments.filter((s) => s.from_id && s.to_id && parseFloat(s.distance_km) > 0)
+                  const totalKm = valid.reduce((sum, s) => sum + parseFloat(s.distance_km || "0"), 0)
+                  const businessKm = valid.filter((s) => s.classification === "business").reduce((sum, s) => sum + parseFloat(s.distance_km || "0"), 0)
+                  const personalKm = valid.filter((s) => s.classification === "personal").reduce((sum, s) => sum + parseFloat(s.distance_km || "0"), 0)
+                  return (
+                    <div className="flex items-center gap-3 text-xs font-mono bg-muted/50 rounded px-3 py-1.5">
+                      <span className="font-semibold">Total: {totalKm.toFixed(1)} km</span>
+                      {businessKm > 0 && <span className="text-green-700">Business: {businessKm.toFixed(1)} km</span>}
+                      {personalKm > 0 && <span className="text-blue-600">Personal: {personalKm.toFixed(1)} km</span>}
+                    </div>
+                  )
+                })()}
               </div>
             ) : (
               <div className="text-center py-8 text-muted-foreground text-sm">Click a date on the left to create a mileage log entry.</div>

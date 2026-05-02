@@ -958,6 +958,9 @@ pub struct TravelSegment {
     pub linked_receipt_id: Option<Uuid>,
     pub notes: Option<String>,
     pub route_coords: Option<serde_json::Value>,
+    pub detour_stop_ids: Option<serde_json::Value>,
+    pub direct_km: Option<f64>,
+    pub with_stops_km: Option<f64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1039,6 +1042,14 @@ pub struct TravelTripLog {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TravelYearlyMileage {
+    pub year: i32,
+    pub total_km: f64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTripLog {
     pub upload_id: Option<Uuid>,
@@ -1075,6 +1086,10 @@ pub struct CreateManualSegment {
     pub distance_km: f64,
     pub classification: String,
     pub route_coords: Option<Vec<[f64; 2]>>,
+    pub is_detour: Option<bool>,
+    pub detour_stop_ids: Option<Vec<String>>,
+    pub direct_km: Option<f64>,
+    pub with_stops_km: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

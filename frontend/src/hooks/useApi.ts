@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { vendors, destinations, items, invoices, receipts, purchases, reports, travel } from "@/api"
-import type { ReceiptIngestionMetadata } from "@/api"
+import type { ReceiptIngestionMetadata, CreateManualSegment } from "@/api"
 
 // ============================================
 // Vendors
@@ -592,10 +592,11 @@ export function useCreateTripLog() {
 export function useCreateReceiptTripLog() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (data: { trip_date: string; purpose?: string; notes?: string; segments: { from_location: string; to_location: string; distance_km: number; classification: string; route_coords?: [number, number][] }[] }) =>
+    mutationFn: (data: { trip_date: string; purpose?: string; notes?: string; segments: CreateManualSegment[] }) =>
       travel.tripLogs.createFromReceipt(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "segments-by-date"] })
     },
   })
 }
@@ -603,10 +604,11 @@ export function useCreateReceiptTripLog() {
 export function useUpdateTripLog() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, ...data }: { id: string; purpose?: string; notes?: string; status?: string; segments?: { from_location: string; to_location: string; distance_km: number; classification: string; route_coords?: [number, number][] }[] }) =>
+    mutationFn: ({ id, ...data }: { id: string; purpose?: string; notes?: string; status?: string; segments?: CreateManualSegment[] }) =>
       travel.tripLogs.update(id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "segments-by-date"] })
     },
   })
 }

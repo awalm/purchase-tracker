@@ -5829,6 +5829,27 @@ pub async fn list_trip_logs(pool: &PgPool, upload_id: Option<Uuid>) -> Result<Ve
     }
 }
 
+pub async fn list_yearly_mileage(pool: &PgPool) -> Result<Vec<TravelYearlyMileage>, sqlx::Error> {
+    sqlx::query_as::<_, TravelYearlyMileage>(
+        "SELECT * FROM travel_yearly_mileage ORDER BY year"
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn upsert_yearly_mileage(pool: &PgPool, year: i32, total_km: f64) -> Result<TravelYearlyMileage, sqlx::Error> {
+    sqlx::query_as::<_, TravelYearlyMileage>(
+        r#"INSERT INTO travel_yearly_mileage (year, total_km)
+           VALUES ($1, $2)
+           ON CONFLICT (year) DO UPDATE SET total_km = $2, updated_at = NOW()
+           RETURNING *"#
+    )
+    .bind(year)
+    .bind(total_km)
+    .fetch_one(pool)
+    .await
+}
+
 /// Get all segments for a specific date, regardless of upload source.
 /// Used by the Mileage Log page to show day detail.
 pub async fn get_segments_for_date(
@@ -5976,12 +5997,17 @@ pub async fn update_trip_log(
             let route_json = seg.route_coords.as_ref().map(|coords| {
                 serde_json::to_value(coords).unwrap_or(serde_json::Value::Null)
             });
+            let stop_ids_json = seg.detour_stop_ids.as_ref().map(|ids| {
+                serde_json::to_value(ids).unwrap_or(serde_json::Value::Null)
+            });
             sqlx::query(
                 r#"INSERT INTO travel_segments
                    (trip_date, segment_order, segment_type, distance_meters,
                     start_time, end_time, from_location, to_location,
-                    classification, classification_reason, route_coords)
-                   VALUES ($1, $2, 'drive', $3, $4, $5, $6, $7, $8, 'manual', $9)"#
+                    classification, classification_reason, route_coords,
+                    is_detour, detour_stop_ids, direct_km, with_stops_km, detour_extra_km)
+                   VALUES ($1, $2, 'drive', $3, $4, $5, $6, $7, $8, 'manual', $9,
+                           $10, $11, $12, $13, $14)"#
             )
             .bind(existing.trip_date)
             .bind(i as i32)
@@ -5992,6 +6018,11 @@ pub async fn update_trip_log(
             .bind(&seg.to_location)
             .bind(&seg.classification)
             .bind(&route_json)
+            .bind(seg.is_detour.unwrap_or(false))
+            .bind(&stop_ids_json)
+            .bind(seg.direct_km)
+            .bind(seg.with_stops_km)
+            .bind(seg.with_stops_km.and_then(|ws| seg.direct_km.map(|d| ws - d)))
             .execute(pool)
             .await?;
         }
@@ -6126,12 +6157,17 @@ pub async fn create_receipt_trip_log(
         let route_json = seg.route_coords.as_ref().map(|coords| {
             serde_json::to_value(coords).unwrap_or(serde_json::Value::Null)
         });
+        let stop_ids_json = seg.detour_stop_ids.as_ref().map(|ids| {
+            serde_json::to_value(ids).unwrap_or(serde_json::Value::Null)
+        });
         sqlx::query(
             r#"INSERT INTO travel_segments
                (trip_date, segment_order, segment_type, distance_meters,
                 start_time, end_time, from_location, to_location,
-                classification, classification_reason, route_coords)
-               VALUES ($1, $2, 'drive', $3, $4, $5, $6, $7, $8, 'manual', $9)"#
+                classification, classification_reason, route_coords,
+                is_detour, detour_stop_ids, direct_km, with_stops_km, detour_extra_km)
+               VALUES ($1, $2, 'drive', $3, $4, $5, $6, $7, $8, 'manual', $9,
+                       $10, $11, $12, $13, $14)"#
         )
         .bind(input.trip_date)
         .bind(i as i32)
@@ -6142,6 +6178,11 @@ pub async fn create_receipt_trip_log(
         .bind(&seg.to_location)
         .bind(&seg.classification)
         .bind(&route_json)
+        .bind(seg.is_detour.unwrap_or(false))
+        .bind(&stop_ids_json)
+        .bind(seg.direct_km)
+        .bind(seg.with_stops_km)
+        .bind(seg.with_stops_km.and_then(|ws| seg.direct_km.map(|d| ws - d)))
         .execute(pool)
         .await?;
     }

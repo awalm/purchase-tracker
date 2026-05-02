@@ -1220,3 +1220,16 @@ ON CONFLICT (id) DO UPDATE SET
 
 -- Store road-snapped route coordinates with manual segments
 ALTER TABLE travel_segments ADD COLUMN IF NOT EXISTS route_coords JSONB;
+
+-- Store detour stop location IDs for reconstructing detour UI
+ALTER TABLE travel_segments ADD COLUMN IF NOT EXISTS detour_stop_ids JSONB;
+ALTER TABLE travel_segments ADD COLUMN IF NOT EXISTS direct_km DOUBLE PRECISION;
+ALTER TABLE travel_segments ADD COLUMN IF NOT EXISTS with_stops_km DOUBLE PRECISION;
+
+-- Yearly odometer mileage for tax reporting
+CREATE TABLE IF NOT EXISTS travel_yearly_mileage (
+    year INT PRIMARY KEY,
+    total_km DOUBLE PRECISION NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

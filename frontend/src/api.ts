@@ -136,6 +136,11 @@ async function request<T>(
 
   if (!response.ok) {
     const text = await response.text();
+    // On 401, clear stale token and redirect to login
+    if (response.status === 401 && !endpoint.includes('/auth/')) {
+      localStorage.removeItem('token');
+      window.location.reload();
+    }
     throw new ApiError(response.status, text || response.statusText);
   }
 
@@ -1307,6 +1312,9 @@ export interface TravelSegment {
   end_lat: number | null;
   end_lng: number | null;
   route_coords: [number, number][] | null;
+  detour_stop_ids: string[] | null;
+  direct_km: number | null;
+  with_stops_km: number | null;
 }
 
 export interface TravelTripSummary {
@@ -1354,6 +1362,13 @@ export interface TravelTripLog {
   updated_at: string;
 }
 
+export interface TravelYearlyMileage {
+  year: number;
+  total_km: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface TripLogWithSegments extends TravelTripLog {
   segments: TravelSegment[];
 }
@@ -1364,6 +1379,10 @@ export interface CreateManualSegment {
   distance_km: number;
   classification: string;
   route_coords?: [number, number][];
+  is_detour?: boolean;
+  detour_stop_ids?: string[];
+  direct_km?: number;
+  with_stops_km?: number;
 }
 
 export interface GeocodeResponse {
@@ -1491,6 +1510,16 @@ export const travel = {
       }),
     delete: (id: string) =>
       request<void>(`/travel/trip-logs/${id}`, { method: 'DELETE' }),
+  },
+
+  // Yearly Mileage
+  yearlyMileage: {
+    list: () => request<TravelYearlyMileage[]>('/travel/yearly-mileage'),
+    upsert: (year: number, total_km: number) =>
+      request<TravelYearlyMileage>(`/travel/yearly-mileage/${year}`, {
+        method: 'PUT',
+        body: JSON.stringify({ total_km }),
+      }),
   },
 
   rematchVisits: (date: string, radiusMeters: number) =>

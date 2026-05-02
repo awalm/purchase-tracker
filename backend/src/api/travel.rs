@@ -40,6 +40,9 @@ pub fn router() -> Router<AppState> {
         .route("/trip-logs", get(list_trip_logs).post(create_trip_log))
         .route("/trip-logs/receipt", post(create_receipt_trip_log))
         .route("/trip-logs/{id}", get(get_trip_log).patch(update_trip_log).delete(delete_trip_log))
+        // Yearly Mileage
+        .route("/yearly-mileage", get(list_yearly_mileage))
+        .route("/yearly-mileage/{year}", axum::routing::put(upsert_yearly_mileage))
         // Summary
         .route("/summary", get(get_summary))
         // Directions
@@ -697,4 +700,31 @@ async fn get_directions(
         .await
         .map(Json)
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))
+}
+
+// ----- Yearly Mileage -----
+
+async fn list_yearly_mileage(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<TravelYearlyMileage>>, (StatusCode, String)> {
+    queries::list_yearly_mileage(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertYearlyMileageBody {
+    total_km: f64,
+}
+
+async fn upsert_yearly_mileage(
+    State(state): State<AppState>,
+    Path(year): Path<i32>,
+    Json(body): Json<UpsertYearlyMileageBody>,
+) -> Result<Json<TravelYearlyMileage>, (StatusCode, String)> {
+    queries::upsert_yearly_mileage(&state.pool, year, body.total_km)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
