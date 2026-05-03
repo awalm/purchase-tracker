@@ -947,8 +947,8 @@ pub struct TravelSegment {
     pub activity_id: Option<Uuid>,
     pub distance_meters: Option<f64>,
     pub visit_id: Option<Uuid>,
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
+    pub start_time: Option<DateTime<Utc>>,
+    pub end_time: Option<DateTime<Utc>>,
     pub from_location: Option<String>,
     pub to_location: Option<String>,
     pub classification: String,
@@ -976,6 +976,12 @@ pub struct TravelSegmentWithDetails {
     pub start_lng: Option<f64>,
     pub end_lat: Option<f64>,
     pub end_lng: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TravelSegmentDateSummary {
+    pub date: NaiveDate,
+    pub business_visits: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1010,6 +1016,7 @@ pub struct CreateTravelLocation {
     pub address: String,
     pub location_type: String,
     pub excluded: Option<bool>,
+    pub skip_geocode: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1019,6 +1026,7 @@ pub struct UpdateTravelLocation {
     pub address: Option<String>,
     pub location_type: Option<String>,
     pub excluded: Option<bool>,
+    pub skip_geocode: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

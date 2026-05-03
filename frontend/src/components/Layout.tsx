@@ -32,6 +32,7 @@ const navItems = [
     children: [
       { to: "/reports/unreconciled", label: "Unreconciled" },
       { to: "/reports/tax", label: "Tax Report" },
+      { to: "/reports/mileage", label: "Mileage" },
     ],
   },
   {
@@ -41,7 +42,7 @@ const navItems = [
     children: [
       { to: "/services/travel/log", label: "Mileage Log" },
       { to: "/services/travel/import/google-timeline", label: "Timeline Import" },
-      { to: "/services/travel/import/receipt", label: "Receipt Import" },
+      { to: "/services/travel/import/receipt", label: "Import Mileage Logs" },
       { to: "/services/travel/locations", label: "Locations" },
     ],
   },
@@ -70,7 +71,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
     else if (path === "/reports/tax") title = "Tax Report — BG Tracker"
     else if (path === "/services/travel/log") title = "Mileage Log — BG Tracker"
     else if (path === "/services/travel/import/google-timeline") title = "Timeline Import — BG Tracker"
-    else if (path === "/services/travel/import/receipt") title = "Receipt Import — BG Tracker"
+    else if (path === "/services/travel/import/receipt") title = "Import Mileage Logs — BG Tracker"
     else if (path === "/services/travel/locations") title = "Travel Locations — BG Tracker"
     else if (path === "/options") title = "Options — BG Tracker"
     document.title = title

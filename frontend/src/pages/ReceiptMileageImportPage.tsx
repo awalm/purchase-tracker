@@ -8,6 +8,7 @@ import {
   useTravelLocations,
   useUpdateReceipt,
   useTravelSegmentsForDate,
+  useTravelSegmentDates,
   useCreateTravelLocation,
   useUpdateTripLog,
 } from "@/hooks/useApi"
@@ -15,6 +16,17 @@ import { useQueryClient, useQuery } from "@tanstack/react-query"
 import { travel } from "@/api"
 import type { TravelTripLog, TravelLocation, TravelSegment } from "@/api"
 import type { ReceiptWithVendor } from "@/types"
+import {
+  type SegmentDraft,
+  emptySegment,
+  haversineKm,
+  optimalStopIndex,
+  labelTimelineSegments,
+  suggestSegmentsFromTimeline,
+  findAutoFillStopIds,
+  buildSegmentPayload,
+  sortStopsByShortestRoute,
+} from "@/lib/mileageLogic"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { DateInput } from "@/components/ui/date-input"
@@ -46,6 +58,9 @@ import {
   FileText,
   GripVertical,
   Undo2,
+  ChevronDown,
+  ChevronRight,
+  ArrowLeftRight,
 } from "lucide-react"
 import { MapContainer, Polyline, CircleMarker, Tooltip, useMap } from "react-leaflet"
 import L from "leaflet"
@@ -58,24 +73,35 @@ function FitBounds({ bounds }: { bounds: [number, number][] }) {
   const map = useMap()
   const prevKeyRef = useRef("")
   useEffect(() => {
-    const key = bounds.map(([a, b]) => `${a.toFixed(4)},${b.toFixed(4)}`).join("|")
-    if (key === prevKeyRef.current) return
-    prevKeyRef.current = key
-    if (bounds.length > 1) {
-      map.fitBounds(L.latLngBounds(bounds), { padding: [20, 20] })
-    } else if (bounds.length === 1) {
-      map.setView(bounds[0], 13)
+    if (bounds.length === 0) return
+    try {
+      const key = bounds.map(([a, b]) => `${a.toFixed(4)},${b.toFixed(4)}`).join("|")
+      if (key === prevKeyRef.current) return
+      prevKeyRef.current = key
+      if (bounds.length > 1) {
+        const lb = L.latLngBounds(bounds.map(([a, b]) => L.latLng(a, b)))
+        if (lb.isValid()) map.fitBounds(lb, { padding: [20, 20] })
+      } else if (bounds.length === 1) {
+        map.setView(bounds[0], 13)
+      }
+    } catch (e) {
+      console.warn("FitBounds error:", e)
     }
   }, [map, bounds])
   return null
 }
 
-class MapErrorBoundary extends Component<{ children: ReactNode }, { error: string | null }> {
+class MapErrorBoundary extends Component<{ children: ReactNode; resetKey?: string }, { error: string | null }> {
   state = { error: null as string | null }
   static getDerivedStateFromError(error: Error) { return { error: error.message } }
   componentDidCatch(error: Error, info: ErrorInfo) { console.error("Map render error:", error, info) }
+  componentDidUpdate(prevProps: { resetKey?: string }) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.error) {
+      this.setState({ error: null })
+    }
+  }
   render() {
-    if (this.state.error) return <div className="text-xs text-red-600 py-2">Map failed: {this.state.error}</div>
+    if (this.state.error) return <div className="text-xs text-red-600 py-2">Map failed to render: {this.state.error}</div>
     return this.props.children
   }
 }
@@ -88,9 +114,32 @@ const TIMELINE_COLORS: Record<string, { line: string; marker: string }> = {
   personal: { line: "#93c5fd", marker: "#60a5fa" },
 }
 
+/** Filter out invalid coordinate pairs that would crash Leaflet */
+function validPositions(pts: [number, number][]): [number, number][] {
+  return pts.filter(([a, b]) => a != null && b != null && isFinite(a) && isFinite(b))
+}
+
 function fmtTime(ts: string | null | undefined): string {
   if (!ts) return ""
   return new Date(ts).toLocaleTimeString("en-CA", { hour: "2-digit", minute: "2-digit", hour12: false })
+}
+
+/** Format a time, adding ⁺¹ if it falls on a different day than the reference date */
+function fmtTimeWithDay(ts: string | null | undefined, refDate: string | null): { text: string; nextDay: boolean } {
+  if (!ts) return { text: "", nextDay: false }
+  const d = new Date(ts)
+  const text = d.toLocaleTimeString("en-CA", { hour: "2-digit", minute: "2-digit", hour12: false })
+  if (!refDate) return { text, nextDay: false }
+  // Compare in local timezone to avoid UTC offset causing false +1
+  const localDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
+  const nextDay = localDate !== refDate
+  return { text, nextDay }
+}
+
+function TimeWithDay({ ts, refDate }: { ts: string | null | undefined; refDate: string | null }) {
+  const { text, nextDay } = fmtTimeWithDay(ts, refDate)
+  if (!text) return null
+  return <>{text}{nextDay && <sup className="text-[8px] text-orange-600 ml-px">+1</sup>}</>
 }
 
 function fmtDateWithDay(dateStr: string): string {
@@ -99,189 +148,8 @@ function fmtDateWithDay(dateStr: string): string {
   return `${dateStr} (${day})`
 }
 
-/** Number "Unknown" labels and infer missing drive endpoints from adjacent visits */
-function labelTimelineSegments(segs: TravelSegment[]): Map<string, string> {
-  const labels = new Map<string, string>()
-  let unknownCounter = 0
-  const visitLabelAt = (idx: number, direction: "before" | "after"): string => {
-    const step = direction === "before" ? -1 : 1
-    for (let j = idx + step; j >= 0 && j < segs.length; j += step) {
-      if (segs[j].segment_type === "visit") return segs[j].visit_location_label || segs[j].from_location || ""
-    }
-    return ""
-  }
-  for (let i = 0; i < segs.length; i++) {
-    const s = segs[i]
-    if (labels.has(s.id)) continue
-    let rawLabel: string
-    if (s.segment_type === "visit") {
-      rawLabel = s.visit_location_label || s.from_location || ""
-    } else {
-      rawLabel = s.from_location || visitLabelAt(i, "before")
-    }
-    if (!rawLabel || rawLabel.startsWith("Unknown") || rawLabel === "?") {
-      unknownCounter++
-      labels.set(s.id, `Unknown (${unknownCounter})`)
-    } else {
-      labels.set(s.id, rawLabel)
-    }
-    if (s.segment_type === "drive") {
-      let toLabel = s.to_location || visitLabelAt(i, "after")
-      if (!toLabel || toLabel.startsWith("Unknown") || toLabel === "?") {
-        unknownCounter++
-        labels.set(s.id + "_to", `Unknown (${unknownCounter})`)
-      } else {
-        labels.set(s.id + "_to", toLabel)
-      }
-    }
-  }
-  return labels
-}
 
-/**
- * Auto-suggest segments from timeline data.
- * Finds Personal → [business visits...] → Personal brackets and creates
- * individual segments for each leg:
- *   Personal → Business₁  (business)
- *   Business₁ → Business₂ (business)
- *   ...
- *   BusinessN → Personal   (personal)
- *
- * If there are no business stops between two personal visits, creates
- * a single Personal → Personal (personal) segment.
- */
-function suggestDetourSegments(
-  segs: TravelSegment[],
-  locations: TravelLocation[],
-): SegmentDraft[] {
-  // Extract matched visits in chronological order
-  const visits = segs.filter(
-    (s) => s.segment_type === "visit" && s.visit_location_label && !s.visit_location_label.startsWith("Unknown")
-  )
-  if (visits.length < 2) return []
 
-  const findLocId = (label: string) => locations.find((l) => l.label === label)?.id || ""
-
-  const drafts: SegmentDraft[] = []
-  let i = 0
-  while (i < visits.length) {
-    // Look for a personal visit to start a bracket
-    if (visits[i].classification !== "personal") { i++; continue }
-    const startVisit = visits[i]
-
-    // Collect consecutive business visits after it
-    const businessStops: TravelSegment[] = []
-    let j = i + 1
-    while (j < visits.length && visits[j].classification === "business") {
-      businessStops.push(visits[j])
-      j++
-    }
-
-    // Need a personal visit to close the bracket
-    if (j >= visits.length || visits[j].classification !== "personal") { i++; continue }
-    const endVisit = visits[j]
-
-    if (businessStops.length === 0) {
-      // Personal → Personal (no business stops)
-      const fromId = findLocId(startVisit.visit_location_label!)
-      const toId = findLocId(endVisit.visit_location_label!)
-      if (fromId && toId) {
-        drafts.push({
-          ...emptySegment(fromId),
-          to_id: toId,
-          classification: "personal",
-          source: "suggested",
-        })
-      }
-    } else {
-      // Build chain: Personal, Business₁, ..., BusinessN, Personal
-      const chain = [startVisit, ...businessStops, endVisit]
-      for (let k = 0; k < chain.length - 1; k++) {
-        const from = chain[k]
-        const to = chain[k + 1]
-        const fromId = findLocId(from.visit_location_label!)
-        const toId = findLocId(to.visit_location_label!)
-        if (!fromId || !toId) continue
-        // Last leg (BusinessN → Personal) is personal, rest are business
-        const classification = k === chain.length - 2 ? "personal" : "business"
-        drafts.push({
-          ...emptySegment(fromId),
-          to_id: toId,
-          classification,
-          source: "suggested",
-        })
-      }
-    }
-    i = j // continue from closing personal visit (can start new bracket)
-  }
-  return drafts
-}
-
-// ----- Segment Types (simple) -----
-
-/** Haversine distance in km between two lat/lng points */
-function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6371
-  const p = Math.PI / 180
-  const a = Math.sin((lat2 - lat1) * p / 2) ** 2 + Math.cos(lat1 * p) * Math.cos(lat2 * p) * Math.sin((lng2 - lng1) * p / 2) ** 2
-  return R * 2 * Math.asin(Math.sqrt(a))
-}
-
-/** Find the optimal insertion index for a new stop that minimizes total route distance */
-function optimalStopIndex(
-  fromLoc: { latitude: number; longitude: number },
-  toLoc: { latitude: number; longitude: number },
-  existingStops: { latitude: number; longitude: number }[],
-  newStop: { latitude: number; longitude: number },
-): number {
-  // Build the full waypoint chain: [from, ...stops, to]
-  const chain = [fromLoc, ...existingStops, toLoc]
-  let bestIdx = 0
-  let bestCost = Infinity
-  // Try inserting at each position among stops (index 0..existingStops.length)
-  for (let pos = 0; pos <= existingStops.length; pos++) {
-    // Insert after chain[pos] (which is from or a stop) and before chain[pos+1]
-    const prev = chain[pos]
-    const next = chain[pos + 1]
-    // Cost of inserting here = dist(prev→new) + dist(new→next) - dist(prev→next)
-    const added = haversineKm(prev.latitude, prev.longitude, newStop.latitude, newStop.longitude)
-      + haversineKm(newStop.latitude, newStop.longitude, next.latitude, next.longitude)
-      - haversineKm(prev.latitude, prev.longitude, next.latitude, next.longitude)
-    if (added < bestCost) {
-      bestCost = added
-      bestIdx = pos
-    }
-  }
-  return bestIdx
-}
-
-interface SegmentDraft {
-  from_id: string
-  to_id: string
-  distance_km: string
-  computed_km: string
-  classification: string
-  routeCoords: [number, number][]
-  computing: boolean
-  routeError: string | null
-  source: string
-  // Detour fields
-  isDetour: boolean
-  detourStopIds: string[]
-  directKm: string
-  withStopsKm: string
-  directCoords: [number, number][]
-  withStopsCoords: [number, number][]
-}
-
-function emptySegment(fromId?: string): SegmentDraft {
-  return {
-    from_id: fromId || "", to_id: "", distance_km: "", computed_km: "",
-    classification: "business", routeCoords: [], computing: false, routeError: null, source: "manual",
-    isDetour: false, detourStopIds: [], directKm: "", withStopsKm: "",
-    directCoords: [], withStopsCoords: [],
-  }
-}
 
 // ----- Route fetching (cached — same coords always give same Google route) -----
 
@@ -295,7 +163,10 @@ async function fetchRoute(
   const key = `${fromLat},${fromLng}-${toLat},${toLng}|${wpKey}`
   if (routeCache.has(key)) return routeCache.get(key)!
   const data = await travel.directions(fromLat, fromLng, toLat, toLng, waypoints)
-  const result = { distance: data.distance_meters, coords: data.coords.map(([lat, lng]) => [lat, lng] as [number, number]) }
+  const coords = data.coords
+    .map(([lat, lng]) => [lat, lng] as [number, number])
+    .filter(([lat, lng]) => lat != null && lng != null && isFinite(lat) && isFinite(lng))
+  const result = { distance: data.distance_meters, coords }
   routeCache.set(key, result)
   return result
 }
@@ -394,7 +265,10 @@ function RouteMap({
       .map((r) => ({ pos: [r.store_latitude!, r.store_longitude!] as [number, number], label: `${r.vendor_name} ($${parseFloat(r.total).toFixed(2)})`, address: r.store_label || r.store_address }))
     for (const rm of rcpt) pts.push(rm.pos)
 
-    return { allPoints: pts, manualDrives: manual, detourDrives: detours, timelineDrives: tlDrives, timelineVisits: tlVisits, receiptMarkers: rcpt }
+    // Filter out any invalid points that could crash Leaflet
+    const validPts = pts.filter(([a, b]) => a != null && b != null && !isNaN(a) && !isNaN(b))
+
+    return { allPoints: validPts, manualDrives: manual, detourDrives: detours, timelineDrives: tlDrives, timelineVisits: tlVisits, receiptMarkers: rcpt }
   }, [segments, locations, receiptLocations, timelineSegments])
 
   // Road-snap timeline drives via Directions API
@@ -435,16 +309,17 @@ function RouteMap({
   })
 
   return (
-    <MapErrorBoundary>
+    <MapErrorBoundary resetKey={`${allPoints.length}-${manualDrives.length}-${timelineDrives.length}`}>
       <div className="h-80 w-full rounded border overflow-hidden relative z-0">
-        <MapContainer center={allPoints[0]} zoom={10} className="h-full w-full" scrollWheelZoom={false}>
+        <MapContainer key={`map-${allPoints.length}`} center={allPoints[0] || [43.65, -79.38]} zoom={10} className="h-full w-full" scrollWheelZoom={false}>
           <GoogleTileLayer />
           <FitBounds bounds={allPoints} />
 
           {/* Timeline drives — road-snapped */}
           {timelineDrives.map((d, i) => {
             const isHovered = hoveredSegmentId === d.segId
-            const positions = snappedRoutes.get(d.key) || [d.start, d.end]
+            const positions = validPositions(snappedRoutes.get(d.key) || [d.start, d.end])
+            if (positions.length < 2) return null
             return (
               <Polyline key={`tl-${i}`} positions={positions}
                 color={isHovered ? "#f59e0b" : d.color} weight={isHovered ? 5 : 4} opacity={isHovered ? 1 : 0.85}
@@ -476,18 +351,26 @@ function RouteMap({
           })}
 
           {/* Manual segments */}
-          {manualDrives.map((d, i) => (
-            <Polyline key={`seg-${i}-${d.color}`} positions={d.positions} color={d.color} weight={4} opacity={0.9}>
-              <Tooltip>{d.label}</Tooltip>
-            </Polyline>
-          ))}
+          {manualDrives.map((d, i) => {
+            const pos = validPositions(d.positions)
+            if (pos.length < 2) return null
+            return (
+              <Polyline key={`seg-${i}-${d.color}`} positions={pos} color={d.color} weight={4} opacity={0.9}>
+                <Tooltip>{d.label}</Tooltip>
+              </Polyline>
+            )
+          })}
 
           {/* Detour segments */}
-          {detourDrives.map((d, i) => (
-            <Polyline key={`det-${i}`} positions={d.positions} color={d.color} weight={4} opacity={0.9}>
-              <Tooltip>{d.label}</Tooltip>
-            </Polyline>
-          ))}
+          {detourDrives.map((d, i) => {
+            const pos = validPositions(d.positions)
+            if (pos.length < 2) return null
+            return (
+              <Polyline key={`det-${i}`} positions={pos} color={d.color} weight={4} opacity={0.9}>
+                <Tooltip>{d.label}</Tooltip>
+              </Polyline>
+            )
+          })}
 
           {/* Receipt store markers */}
           {receiptMarkers.map((r, i) => (
@@ -569,7 +452,7 @@ function DetourStopList({
   return (
     <div className="space-y-1.5 pl-1">
       <div className="text-[11px] text-muted-foreground">
-        Stops on this personal route (drag to reorder):
+        {seg.isDetour ? "Stops on this personal route (drag to reorder):" : "Intermediate stops (drag to reorder):"}
       </div>
       <div className="space-y-0.5">
         {seg.detourStopIds.map((stopId, si) => {
@@ -625,9 +508,11 @@ export default function ReceiptMileageImportPage() {
   const [purpose, setPurpose] = useState("")
   const [notes, setNotes] = useState("")
   const [hoveredSegmentId, setHoveredSegmentId] = useState<string | null>(null)
+  const [expandedTimelineId, setExpandedTimelineId] = useState<string | null>(null)
   const [matchRadius, setMatchRadius] = useState(250)
   const [rematching, setRematching] = useState(false)
   const [yearFilter, setYearFilter] = useState<string>("all")
+  const [unsavedOnly, setUnsavedOnly] = useState(false)
   const [editingYearlyKm, setEditingYearlyKm] = useState<string>("")
 
   // Snapshot of the last confirmed/saved state (for revert)
@@ -637,6 +522,7 @@ export default function ReceiptMileageImportPage() {
   const { data: allLogs } = useTripLogs()
   const { data: yearlyMileageData } = useQuery({ queryKey: ["travel", "yearly-mileage"], queryFn: () => travel.yearlyMileage.list() })
   const { data: travelLocations = [] } = useTravelLocations()
+  const { data: timelineDates } = useTravelSegmentDates()
   const createReceiptTripLog = useCreateReceiptTripLog()
   const createTravelLocation = useCreateTravelLocation()
   const queryClient = useQueryClient()
@@ -675,38 +561,64 @@ export default function ReceiptMileageImportPage() {
     const years = new Set<number>()
     if (allLogs) for (const log of allLogs) years.add(parseInt(log.trip_date.slice(0, 4)))
     if (receipts) for (const r of receipts) years.add(parseInt(r.receipt_date.slice(0, 4)))
+    if (timelineDates) for (const td of timelineDates) years.add(parseInt(td.date.slice(0, 4)))
     return Array.from(years).sort((a, b) => b - a)
-  }, [allLogs, receipts])
+  }, [allLogs, receipts, timelineDates])
 
   // Effective date range (year filter overrides from/to)
   const effectiveFromDate = yearFilter !== "all" ? `${yearFilter}-01-01` : fromDate
   const effectiveToDate = yearFilter !== "all" ? `${yearFilter}-12-31` : toDate
 
-  const receiptsByDate = useMemo(() => {
-    if (!receipts) return []
-    const map = new Map<string, ReceiptWithVendor[]>()
-    for (const r of receipts) {
-      if (effectiveFromDate && r.receipt_date < effectiveFromDate) continue
-      if (effectiveToDate && r.receipt_date > effectiveToDate) continue
-      if (!r.store_location_id) continue
-      if (r.store_location_id === onlineLocation?.id) continue
-      const existing = map.get(r.receipt_date) || []
-      existing.push(r)
-      map.set(r.receipt_date, existing)
+  const dateEntries = useMemo(() => {
+    // Build receipt map
+    const receiptMap = new Map<string, ReceiptWithVendor[]>()
+    if (receipts) {
+      for (const r of receipts) {
+        if (effectiveFromDate && r.receipt_date < effectiveFromDate) continue
+        if (effectiveToDate && r.receipt_date > effectiveToDate) continue
+        if (!r.store_location_id) continue
+        if (r.store_location_id === onlineLocation?.id) continue
+        const existing = receiptMap.get(r.receipt_date) || []
+        existing.push(r)
+        receiptMap.set(r.receipt_date, existing)
+      }
     }
-    return Array.from(map.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([date, recs]) => ({
-        date, receipts: recs,
-        totalSpent: recs.reduce((sum, r) => sum + parseFloat(r.total), 0),
-        vendors: [...new Set(recs.map((r) => r.vendor_name))],
-        storeCount: new Set(recs.map((r) => r.store_location_id)).size,
-        hasLog: logsByDate.has(date),
-        log: logsByDate.get(date),
-      }))
-  }, [receipts, effectiveFromDate, effectiveToDate, logsByDate, onlineLocation])
+    // Build timeline business visits map
+    const timelineVisitsMap = new Map<string, string[]>()
+    if (timelineDates) {
+      for (const td of timelineDates) {
+        if (effectiveFromDate && td.date < effectiveFromDate) continue
+        if (effectiveToDate && td.date > effectiveToDate) continue
+        timelineVisitsMap.set(td.date, td.business_visits)
+      }
+    }
+    // Collect all dates (receipts + timeline)
+    const allDates = new Set<string>([...receiptMap.keys(), ...timelineVisitsMap.keys()])
+    return Array.from(allDates)
+      .sort((a, b) => b.localeCompare(a))
+      .map((date) => {
+        const recs = receiptMap.get(date) || []
+        const businessVisits = timelineVisitsMap.get(date) || []
+        return {
+          date,
+          receipts: recs,
+          totalSpent: recs.reduce((sum, r) => sum + parseFloat(r.total), 0),
+          vendors: [...new Set(recs.map((r) => r.vendor_name))],
+          storeCount: new Set(recs.map((r) => r.store_location_id)).size,
+          hasLog: logsByDate.has(date),
+          log: logsByDate.get(date),
+          timelineOnly: recs.length === 0,
+          businessVisits,
+        }
+      })
+  }, [receipts, effectiveFromDate, effectiveToDate, logsByDate, onlineLocation, timelineDates])
 
-  const selectedDateData = useMemo(() => receiptsByDate.find((d) => d.date === selectedDate), [receiptsByDate, selectedDate])
+  const filteredDateEntries = useMemo(() => {
+    if (!unsavedOnly) return dateEntries
+    return dateEntries.filter((d) => !d.hasLog || d.log?.status === "draft")
+  }, [dateEntries, unsavedOnly])
+
+  const selectedDateData = useMemo(() => dateEntries.find((d) => d.date === selectedDate), [dateEntries, selectedDate])
 
   const unlinkedByDate = useMemo(() => {
     if (!receipts) return []
@@ -766,19 +678,18 @@ export default function ReceiptMileageImportPage() {
 
   const handleSelectDate = useCallback((date: string) => {
     setSelectedDate(date)
-    const data = receiptsByDate.find((d) => d.date === date)
-    if (!data) return
-    if (!data.hasLog) {
-      setPurpose(`Business: ${data.vendors.join(", ")}`)
-      setNotes("")
-    }
+    const data = dateEntries.find((d) => d.date === date)
+    // Set default purpose from vendors; loading effect will override with log value if present
+    const vendors = data?.vendors ?? []
+    setPurpose(vendors.length > 0 ? `Business: ${vendors.join(", ")}` : "Business")
+    setNotes("")
     setSegments([emptySegment()])
     setAutoSaveStatus("idle")
     lastSavedKey.current = ""
     setDraftLogId(null)
     savedSnapshot.current = null
     loadedLogDateRef.current = null
-  }, [receiptsByDate])
+  }, [dateEntries])
 
   // When selecting a date that has an existing log, load its data
   const loadedLogDateRef = useRef<string | null>(null)
@@ -792,7 +703,7 @@ export default function ReceiptMileageImportPage() {
       setPurpose(log.purpose || "")
       setNotes(log.notes || "")
       setDraftLogId(log.id)
-      setAutoSaveStatus(log.status === "confirmed" ? "saved" : "idle")
+      setAutoSaveStatus("idle")
       lastSavedKey.current = "loaded"
     }
 
@@ -830,28 +741,12 @@ export default function ReceiptMileageImportPage() {
           savedSnapshot.current = { segments: drafts, purpose: selectedDateData.log?.purpose || "", notes: selectedDateData.log?.notes || "" }
         }
         // Update lastSavedKey to match loaded state so auto-save doesn't re-fire
-        const validSegs = drafts.filter((s) => s.from_id && s.to_id && parseFloat(s.distance_km) > 0).map((s) => ({
-          from_location: locationOptions.find((l) => l.id === s.from_id)?.label || "",
-          to_location: locationOptions.find((l) => l.id === s.to_id)?.label || "",
-          distance_km: parseFloat(s.distance_km),
-          classification: s.classification,
-          route_coords: s.routeCoords.length > 0 ? s.routeCoords : undefined,
-          is_detour: s.isDetour || undefined,
-          detour_stop_ids: s.detourStopIds.length > 0 ? s.detourStopIds : undefined,
-          direct_km: s.directKm ? parseFloat(s.directKm) : undefined,
-          with_stops_km: s.withStopsKm ? parseFloat(s.withStopsKm) : undefined,
-        }))
+        const validSegs = buildSegmentPayload(drafts, locationOptions)
         const purpose_ = selectedDateData.log?.purpose || ""
         const notes_ = selectedDateData.log?.notes || ""
         lastSavedKey.current = JSON.stringify({ date: selectedDate, purpose: purpose_ || undefined, notes: notes_ || undefined, segs: validSegs })
       } else {
-        // No existing manual segments — try auto-suggesting detour segments from timeline
-        if (timelineSegments && timelineSegments.length > 0) {
-          const suggested = suggestDetourSegments(timelineSegments, locationOptions)
-          if (suggested.length > 0) {
-            setSegments([...suggested, emptySegment()])
-          }
-        }
+        // No existing manual segments — user can click "Generate from timeline" to auto-suggest
         loadedLogDateRef.current = selectedDate
       }
     }
@@ -868,31 +763,46 @@ export default function ReceiptMileageImportPage() {
       return
     }
     try {
-      if (seg.isDetour && seg.detourStopIds.length > 0) {
-        // Detour mode: compute direct route AND route with stops
+      if (seg.detourStopIds.length > 0) {
         const waypoints: [number, number][] = seg.detourStopIds
           .map((id) => locationOptions.find((l) => l.id === id))
           .filter((l): l is TravelLocation => l != null && l.latitude != null && l.longitude != null)
           .map((l) => [l.latitude!, l.longitude!])
-        const [direct, withStops] = await Promise.all([
-          fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude),
-          waypoints.length > 0
-            ? fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude, waypoints)
-            : fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude),
-        ])
-        const directKm = direct.distance / 1000
-        const withStopsKm = withStops.distance / 1000
-        const detourKm = Math.max(0, withStopsKm - directKm)
-        setSegments((prev) => prev.map((s, i) => i === index ? {
-          ...s, computing: false, routeError: null,
-          directKm: directKm.toFixed(1),
-          withStopsKm: withStopsKm.toFixed(1),
-          directCoords: direct.coords,
-          withStopsCoords: withStops.coords,
-          computed_km: detourKm.toFixed(1),
-          distance_km: detourKm.toFixed(1),
-          routeCoords: withStops.coords,
-        } : s))
+
+        if (seg.isDetour) {
+          // Detour mode: compute direct route AND route with stops, distance = extra km
+          const [direct, withStops] = await Promise.all([
+            fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude),
+            waypoints.length > 0
+              ? fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude, waypoints)
+              : fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude),
+          ])
+          const directKm = direct.distance / 1000
+          const withStopsKm = withStops.distance / 1000
+          const detourKm = Math.max(0, withStopsKm - directKm)
+          setSegments((prev) => prev.map((s, i) => i === index ? {
+            ...s, computing: false, routeError: null,
+            directKm: directKm.toFixed(1),
+            withStopsKm: withStopsKm.toFixed(1),
+            directCoords: direct.coords,
+            withStopsCoords: withStops.coords,
+            computed_km: detourKm.toFixed(1),
+            distance_km: detourKm.toFixed(1),
+            routeCoords: withStops.coords,
+          } : s))
+        } else {
+          // Regular segment with waypoints: route through stops, total km
+          const result = waypoints.length > 0
+            ? await fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude, waypoints)
+            : await fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude)
+          setSegments((prev) => prev.map((s, i) => i === index ? {
+            ...s, computing: false, routeError: null,
+            computed_km: (result.distance / 1000).toFixed(1),
+            distance_km: s.distance_km || (result.distance / 1000).toFixed(1),
+            routeCoords: result.coords,
+            directKm: "", withStopsKm: "", directCoords: [], withStopsCoords: [],
+          } : s))
+        }
       } else {
         // Normal mode
         const result = await fetchRoute(fromLoc.latitude, fromLoc.longitude, toLoc.latitude, toLoc.longitude)
@@ -928,7 +838,15 @@ export default function ReceiptMileageImportPage() {
     const lastTo = prev[prev.length - 1]?.to_id || ""
     return [...prev, emptySegment(lastTo)]
   })
-  const removeSegment = (index: number) => setSegments((prev) => prev.length > 1 ? prev.filter((_, i) => i !== index) : prev)
+  const removeSegment = (index: number) => setSegments((prev) => prev.length > 1 ? prev.filter((_, i) => i !== index) : [emptySegment()])
+
+  const generateFromTimeline = () => {
+    if (!timelineSegments || timelineSegments.length === 0) return
+    const suggested = suggestSegmentsFromTimeline(timelineSegments, locationOptions)
+    if (suggested.length > 0) {
+      setSegments([...suggested, emptySegment()])
+    }
+  }
 
   // Drag-and-drop segment reordering
   const [dragSegIdx, setDragSegIdx] = useState<number | null>(null)
@@ -1006,39 +924,17 @@ export default function ReceiptMileageImportPage() {
     if (!timelineSegments) return
     const seg = segments[segIndex]
     if (!seg.from_id || !seg.to_id) return
-
     const fromLoc = locationOptions.find((l) => l.id === seg.from_id)
     const toLoc = locationOptions.find((l) => l.id === seg.to_id)
     if (!fromLoc || !toLoc) return
-
-    // Find high-confidence timeline visits in order
-    const visits = timelineSegments.filter(
-      (s) => s.segment_type === "visit" && s.visit_location_label && !s.visit_location_label.startsWith("Unknown")
+    const stopIds = findAutoFillStopIds(
+      timelineSegments, fromLoc.label, toLoc.label,
+      new Set([seg.from_id, seg.to_id]), locationOptions,
     )
-
-    // Find the LATEST matching pair: last "to" match, then last "from" match before it
-    let toIdx = -1
-    for (let i = visits.length - 1; i >= 0; i--) {
-      if (visits[i].visit_location_label === toLoc.label) { toIdx = i; break }
-    }
-    if (toIdx < 0) return
-    let fromIdx = -1
-    for (let i = toIdx - 1; i >= 0; i--) {
-      if (visits[i].visit_location_label === fromLoc.label) { fromIdx = i; break }
-    }
-    if (fromIdx < 0 || toIdx <= fromIdx + 1) return
-
-    // Get visits between from and to
-    const between = visits.slice(fromIdx + 1, toIdx)
-    const stopIds = between
-      .map((v) => locationOptions.find((l) => l.label === v.visit_location_label!)?.id)
-      .filter((id): id is string => !!id && id !== seg.from_id && id !== seg.to_id)
-    const uniqueIds = [...new Set(stopIds)]
-    if (uniqueIds.length === 0) return
-
+    if (stopIds.length === 0) return
     setSegments((prev) => prev.map((s, i) => {
       if (i !== segIndex) return s
-      return { ...s, detourStopIds: uniqueIds, computed_km: "", distance_km: "", routeCoords: [] }
+      return { ...s, detourStopIds: stopIds, computed_km: "", distance_km: "", routeCoords: [] }
     }))
   }
 
@@ -1083,23 +979,7 @@ export default function ReceiptMileageImportPage() {
 
   // Build valid segment payloads for saving
   const buildSavePayload = useCallback(() => {
-    return segments
-      .filter((s) => s.from_id && s.to_id && parseFloat(s.distance_km) > 0)
-      .map((s) => {
-        const fromLoc = locationOptions.find((l) => l.id === s.from_id)
-        const toLoc = locationOptions.find((l) => l.id === s.to_id)
-        return {
-          from_location: fromLoc?.label || "",
-          to_location: toLoc?.label || "",
-          distance_km: parseFloat(s.distance_km),
-          classification: s.classification,
-          route_coords: s.routeCoords.length > 0 ? s.routeCoords : undefined,
-          is_detour: s.isDetour || undefined,
-          detour_stop_ids: s.detourStopIds.length > 0 ? s.detourStopIds : undefined,
-          direct_km: s.directKm ? parseFloat(s.directKm) : undefined,
-          with_stops_km: s.withStopsKm ? parseFloat(s.withStopsKm) : undefined,
-        }
-      })
+    return buildSegmentPayload(segments, locationOptions)
   }, [segments, locationOptions])
 
   // Auto-save as draft: create draft once when segments become valid,
@@ -1153,7 +1033,7 @@ export default function ReceiptMileageImportPage() {
 
     const onDone = (newId?: string) => {
       if (newId) setDraftLogId(newId)
-      setAutoSaveStatus("saved")
+      setAutoSaveStatus("idle")
       lastSavedKey.current = saveKey
       // Snapshot the confirmed state for future reverts
       savedSnapshot.current = { segments: [...segments], purpose, notes }
@@ -1175,6 +1055,33 @@ export default function ReceiptMileageImportPage() {
     }
   }
 
+  // "Skip" saves a confirmed log with no segments (marks date as handled)
+  const handleSkip = () => {
+    if (!selectedDate) return
+    if (autoSaveTimer.current) { clearTimeout(autoSaveTimer.current); autoSaveTimer.current = null }
+
+    const logId = draftLogId || selectedDateData?.log?.id
+    const onDone = (newId?: string) => {
+      if (newId) setDraftLogId(newId)
+      setAutoSaveStatus("idle")
+      lastSavedKey.current = "skipped"
+      savedSnapshot.current = null
+      loadedLogDateRef.current = null
+    }
+
+    if (logId) {
+      updateTripLog.mutate(
+        { id: logId, purpose: "No trip", notes: undefined, status: "confirmed", segments: [] },
+        { onSuccess: () => onDone() },
+      )
+    } else {
+      createReceiptTripLog.mutate(
+        { trip_date: selectedDate, purpose: "No trip", notes: undefined, segments: [] },
+        { onSuccess: (result) => onDone(result.id) },
+      )
+    }
+  }
+
   const handleRevert = () => {
     if (!savedSnapshot.current || !draftLogId) return
     // Cancel any pending auto-save
@@ -1183,20 +1090,7 @@ export default function ReceiptMileageImportPage() {
     setSegments(snap.segments)
     setPurpose(snap.purpose)
     setNotes(snap.notes)
-    // Build payload from the snapshot (can't use buildSavePayload — React batching)
-    const validSegs = snap.segments
-      .filter((s) => s.from_id && s.to_id && parseFloat(s.distance_km) > 0)
-      .map((s) => ({
-        from_location: locationOptions.find((l) => l.id === s.from_id)?.label || "",
-        to_location: locationOptions.find((l) => l.id === s.to_id)?.label || "",
-        distance_km: parseFloat(s.distance_km),
-        classification: s.classification,
-        route_coords: s.routeCoords.length > 0 ? s.routeCoords : undefined,
-        is_detour: s.isDetour || undefined,
-        detour_stop_ids: s.detourStopIds.length > 0 ? s.detourStopIds : undefined,
-        direct_km: s.directKm ? parseFloat(s.directKm) : undefined,
-        with_stops_km: s.withStopsKm ? parseFloat(s.withStopsKm) : undefined,
-      }))
+    const validSegs = buildSegmentPayload(snap.segments, locationOptions)
     const saveKey = JSON.stringify({ date: selectedDate, purpose: snap.purpose, notes: snap.notes, segs: validSegs })
     updateTripLog.mutate(
       { id: draftLogId, purpose: snap.purpose || undefined, notes: snap.notes || undefined, status: "confirmed", segments: validSegs },
@@ -1209,7 +1103,7 @@ export default function ReceiptMileageImportPage() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Receipt Mileage Import</h1>
+        <h1 className="text-2xl font-bold">Import Mileage Logs</h1>
       </div>
 
       {/* Year Filter + Date Filters */}
@@ -1353,30 +1247,51 @@ export default function ReceiptMileageImportPage() {
       )}
 
       <div className="grid grid-cols-5 gap-6">
-        {/* Left: Receipt dates */}
+        {/* Left: Trip dates */}
         <Card className="col-span-2">
-          <CardHeader><CardTitle className="text-sm">Receipt Dates ({receiptsByDate.length})</CardTitle></CardHeader>
+          <CardHeader>
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-sm">Trip Dates ({filteredDateEntries.length})</CardTitle>
+              <label className="flex items-center gap-1.5 text-xs font-normal cursor-pointer">
+                <input type="checkbox" checked={unsavedOnly} onChange={(e) => setUnsavedOnly(e.target.checked)} className="rounded" />
+                Unsaved only
+              </label>
+            </div>
+          </CardHeader>
           <CardContent className="p-0">
-            {receiptsByDate.length > 0 ? (
+            {filteredDateEntries.length > 0 ? (
               <Table>
                 <TableHeader><TableRow><TableHead>Date</TableHead><TableHead>Vendors</TableHead><TableHead className="text-right">Spent</TableHead><TableHead className="w-10"></TableHead></TableRow></TableHeader>
                 <TableBody>
-                  {receiptsByDate.map(({ date, receipts: dateReceipts, vendors, totalSpent, storeCount, hasLog }) => (
+                  {filteredDateEntries.map(({ date, receipts: dateReceipts, vendors, totalSpent, storeCount, hasLog, log, timelineOnly, businessVisits }) => (
                     <TableRow key={date} className={`cursor-pointer hover:bg-slate-50 ${selectedDate === date ? "bg-blue-50" : ""}`} onClick={() => handleSelectDate(date)}>
                       <TableCell className="font-medium text-sm">{fmtDateWithDay(date)}</TableCell>
                       <TableCell className="text-xs text-muted-foreground truncate max-w-[180px]">
-                        {vendors.join(", ")}
-                        <span className="ml-1"><FileText className="h-3 w-3 inline" />{dateReceipts.length}</span>
-                        {storeCount > 1 && <span className="ml-1"><MapPin className="h-3 w-3 inline" />{storeCount}</span>}
+                        {timelineOnly ? (
+                          businessVisits.length > 0 ? (
+                            <span className="flex items-center gap-1"><Car className="h-3 w-3 flex-shrink-0" />{businessVisits.join(", ")}</span>
+                          ) : (
+                            <span title="Timeline only"><Car className="h-3 w-3" /></span>
+                          )
+                        ) : (
+                          <>
+                            {vendors.join(", ")}
+                            <span className="ml-1"><FileText className="h-3 w-3 inline" />{dateReceipts.length}</span>
+                            {storeCount > 1 && <span className="ml-1"><MapPin className="h-3 w-3 inline" />{storeCount}</span>}
+                          </>
+                        )}
                       </TableCell>
-                      <TableCell className="text-right text-sm">${totalSpent.toFixed(2)}</TableCell>
-                      <TableCell>{hasLog && <CheckCircle className="h-3.5 w-3.5 text-green-600" />}</TableCell>
+                      <TableCell className="text-right text-sm">{totalSpent > 0 ? `$${totalSpent.toFixed(2)}` : ""}</TableCell>
+                      <TableCell>
+                        {hasLog && log?.status === "confirmed" && <CheckCircle className="h-3.5 w-3.5 text-green-600" />}
+                        {hasLog && log?.status === "draft" && <div className="h-3.5 w-3.5 rounded-full bg-yellow-400 border border-yellow-500" title="Draft" />}
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
               </Table>
             ) : (
-              <div className="p-8 text-center text-muted-foreground text-sm">No in-store receipts found.</div>
+              <div className="p-8 text-center text-muted-foreground text-sm">No trip dates found.</div>
             )}
           </CardContent>
         </Card>
@@ -1404,6 +1319,9 @@ export default function ReceiptMileageImportPage() {
                       <Undo2 className="h-3.5 w-3.5 mr-1" />Revert
                     </Button>
                   )}
+                  <Button size="sm" variant="outline" disabled={createReceiptTripLog.isPending || updateTripLog.isPending} onClick={handleSkip}>
+                    Skip
+                  </Button>
                   <Button size="sm" disabled={!canSave || createReceiptTripLog.isPending || updateTripLog.isPending} onClick={handleSave}>
                     <Save className="h-3.5 w-3.5 mr-1" />
                     {createReceiptTripLog.isPending || updateTripLog.isPending ? "Saving…" : "Save to Log"}
@@ -1423,6 +1341,7 @@ export default function ReceiptMileageImportPage() {
                 )}
 
                 {/* Receipts */}
+                {selectedDateData.receipts.length > 0 && (
                 <div>
                   <div className="text-xs font-medium mb-1">Receipts ({selectedDateData.receipts.length})</div>
                   <div className="space-y-1">
@@ -1441,6 +1360,7 @@ export default function ReceiptMileageImportPage() {
                     })}
                   </div>
                 </div>
+                )}
 
                 {/* Timeline Activity */}
                 {timelineSegments && timelineSegments.length > 0 && (() => {
@@ -1449,7 +1369,7 @@ export default function ReceiptMileageImportPage() {
                     <div>
                       <div className="flex items-center justify-between mb-1">
                         <div className="text-xs font-medium">
-                          Timeline Activity ({timelineSegments.length} segments)
+                          Timeline Activity ({timelineSegments.filter((s: TravelSegment) => s.classification_reason !== "manual").length} segments)
                           <span className="font-normal text-muted-foreground ml-1">— Google data, may have gaps</span>
                         </div>
                         <div className="flex items-center gap-1.5">
@@ -1472,36 +1392,72 @@ export default function ReceiptMileageImportPage() {
                           </Button>
                         </div>
                       </div>
-                      <div className="space-y-0.5 max-h-[200px] overflow-y-auto border rounded p-1.5 bg-white">
-                        {timelineSegments.map((seg: TravelSegment) => {
-                          const timeRange = `${fmtTime(seg.start_time)}\u2013${fmtTime(seg.end_time)}`
+                      <div className="space-y-0.5 max-h-[300px] overflow-y-auto border rounded p-1.5 bg-white">
+                        {timelineSegments.filter((seg: TravelSegment) => seg.classification_reason !== "manual").map((seg: TravelSegment) => {
                           const classColor = seg.classification === "business" ? "text-green-700" : seg.classification === "personal" ? "text-blue-700" : "text-gray-500"
+                          const isExpanded = expandedTimelineId === seg.id
+                          const toggleExpand = () => setExpandedTimelineId(isExpanded ? null : seg.id)
                           if (seg.segment_type === "drive") {
                             const fromLabel = tlLabelsLocal.get(seg.id) || seg.from_location || "?"
                             const toLabel = tlLabelsLocal.get(seg.id + "_to") || seg.to_location || "?"
                             return (
-                              <div key={seg.id}
-                                className={`flex items-center gap-2 text-xs px-1.5 py-0.5 cursor-pointer transition-colors ${hoveredSegmentId === seg.id ? "bg-amber-100" : "hover:bg-slate-50"}`}
-                                onMouseEnter={() => setHoveredSegmentId(seg.id)} onMouseLeave={() => setHoveredSegmentId(null)}
-                              >
-                                <span className="text-muted-foreground w-[90px] flex-shrink-0 font-mono">{timeRange}</span>
-                                <Car className="h-3 w-3 text-muted-foreground flex-shrink-0" />
-                                <span className="truncate">{fromLabel} {"\u2192"} {toLabel}</span>
-                                {seg.distance_meters != null && <span className="text-muted-foreground ml-auto flex-shrink-0">{(seg.distance_meters / 1000).toFixed(1)} km</span>}
-                                <span className={`flex-shrink-0 ${classColor}`}>{seg.classification}</span>
+                              <div key={seg.id}>
+                                <div
+                                  className={`flex items-center gap-2 text-xs px-1.5 py-0.5 cursor-pointer transition-colors ${hoveredSegmentId === seg.id ? "bg-amber-100" : "hover:bg-slate-50"}`}
+                                  onMouseEnter={() => setHoveredSegmentId(seg.id)} onMouseLeave={() => setHoveredSegmentId(null)}
+                                  onClick={toggleExpand}
+                                >
+                                  {isExpanded ? <ChevronDown className="h-3 w-3 text-muted-foreground flex-shrink-0" /> : <ChevronRight className="h-3 w-3 text-muted-foreground flex-shrink-0" />}
+                                  <span className="text-muted-foreground w-[100px] flex-shrink-0 font-mono">
+                                    <TimeWithDay ts={seg.start_time} refDate={selectedDate} />–<TimeWithDay ts={seg.end_time} refDate={selectedDate} />
+                                  </span>
+                                  <Car className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                                  <span className="truncate">{fromLabel} {"\u2192"} {toLabel}</span>
+                                  {seg.distance_meters != null && <span className="text-muted-foreground ml-auto flex-shrink-0">{(seg.distance_meters / 1000).toFixed(1)} km</span>}
+                                  <span className={`flex-shrink-0 ${classColor}`}>{seg.classification}</span>
+                                </div>
+                                {isExpanded && (
+                                  <div className="ml-7 mb-1 px-2 py-1 bg-slate-50 border rounded text-[10px] text-muted-foreground space-y-0.5">
+                                    {seg.start_time && <div>Time: {new Date(seg.start_time).toLocaleTimeString("en-CA", { hour: "2-digit", minute: "2-digit", hour12: false })}–{seg.end_time ? new Date(seg.end_time).toLocaleTimeString("en-CA", { hour: "2-digit", minute: "2-digit", hour12: false }) : "?"}</div>}
+                                    {seg.start_lat != null && <div>Start: {seg.start_lat.toFixed(6)}, {seg.start_lng?.toFixed(6)}</div>}
+                                    {seg.end_lat != null && <div>End: {seg.end_lat.toFixed(6)}, {seg.end_lng?.toFixed(6)}</div>}
+                                    {seg.distance_meters != null && <div>Distance: {seg.distance_meters.toFixed(0)} m ({(seg.distance_meters / 1000).toFixed(2)} km)</div>}
+                                    {seg.from_location && <div>From (raw): {seg.from_location}</div>}
+                                    {seg.to_location && <div>To (raw): {seg.to_location}</div>}
+                                    <div>Classification: {seg.classification} ({seg.classification_reason || "auto"})</div>
+                                    <div>ID: {seg.id}</div>
+                                  </div>
+                                )}
                               </div>
                             )
                           }
                           const visitLabel = tlLabelsLocal.get(seg.id) || seg.visit_location_label || seg.from_location || "Unknown"
                           return (
-                            <div key={seg.id}
-                              className={`flex items-center gap-2 text-xs px-1.5 py-0.5 transition-colors ${hoveredSegmentId === seg.id ? "bg-amber-100" : "bg-slate-50 hover:bg-slate-100"}`}
-                              onMouseEnter={() => setHoveredSegmentId(seg.id)} onMouseLeave={() => setHoveredSegmentId(null)}
-                            >
-                              <span className="text-muted-foreground w-[90px] flex-shrink-0 font-mono">{timeRange}</span>
-                              <MapPin className="h-3 w-3 text-muted-foreground flex-shrink-0" />
-                              <span className="truncate">{visitLabel}{seg.visit_duration_minutes != null && <span className="text-muted-foreground ml-1">({seg.visit_duration_minutes} min)</span>}</span>
-                              <span className={`ml-auto flex-shrink-0 ${classColor}`}>{seg.classification}</span>
+                            <div key={seg.id}>
+                              <div
+                                className={`flex items-center gap-2 text-xs px-1.5 py-0.5 cursor-pointer transition-colors ${hoveredSegmentId === seg.id ? "bg-amber-100" : "bg-slate-50 hover:bg-slate-100"}`}
+                                onMouseEnter={() => setHoveredSegmentId(seg.id)} onMouseLeave={() => setHoveredSegmentId(null)}
+                                onClick={toggleExpand}
+                              >
+                                {isExpanded ? <ChevronDown className="h-3 w-3 text-muted-foreground flex-shrink-0" /> : <ChevronRight className="h-3 w-3 text-muted-foreground flex-shrink-0" />}
+                                <span className="text-muted-foreground w-[100px] flex-shrink-0 font-mono">
+                                  <TimeWithDay ts={seg.start_time} refDate={selectedDate} />–<TimeWithDay ts={seg.end_time} refDate={selectedDate} />
+                                </span>
+                                <MapPin className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                                <span className="truncate">{visitLabel}{seg.visit_duration_minutes != null && <span className="text-muted-foreground ml-1">({seg.visit_duration_minutes} min)</span>}</span>
+                                <span className={`ml-auto flex-shrink-0 ${classColor}`}>{seg.classification}</span>
+                              </div>
+                              {isExpanded && (
+                                <div className="ml-7 mb-1 px-2 py-1 bg-slate-50 border rounded text-[10px] text-muted-foreground space-y-0.5">
+                                  {seg.start_time && <div>Time: {new Date(seg.start_time).toLocaleTimeString("en-CA", { hour: "2-digit", minute: "2-digit", hour12: false })}–{seg.end_time ? new Date(seg.end_time).toLocaleTimeString("en-CA", { hour: "2-digit", minute: "2-digit", hour12: false }) : "?"}</div>}
+                                  {seg.start_lat != null && <div>Coordinates: {seg.start_lat.toFixed(6)}, {seg.start_lng?.toFixed(6)}</div>}
+                                  {seg.visit_location_label && <div>Matched: {seg.visit_location_label}{seg.visit_location_chain ? ` (${seg.visit_location_chain})` : ""}</div>}
+                                  {seg.from_location && <div>Raw label: {seg.from_location}</div>}
+                                  {seg.visit_duration_minutes != null && <div>Duration: {seg.visit_duration_minutes} min</div>}
+                                  <div>Classification: {seg.classification} ({seg.classification_reason || "auto"})</div>
+                                  <div>ID: {seg.id}</div>
+                                </div>
+                              )}
                             </div>
                           )
                         })}
@@ -1514,9 +1470,23 @@ export default function ReceiptMileageImportPage() {
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <label className="text-xs font-medium">Drive Segments</label>
-                    <Button variant="outline" size="sm" className="h-6 text-xs" onClick={addSegment}>
-                      <Plus className="h-3 w-3 mr-1" /> Add Segment
-                    </Button>
+                    <div className="flex gap-1">
+                      <Button variant="outline" size="sm" className="h-6 text-xs"
+                        disabled={!timelineSegments || timelineSegments.length === 0}
+                        title={!timelineSegments || timelineSegments.length === 0 ? "No timeline data for this date" : "Generate drive segments from timeline activity"}
+                        onClick={generateFromTimeline}
+                      >
+                        <RotateCw className="h-3 w-3 mr-1" /> Generate from timeline
+                      </Button>
+                      {segments.length > 1 && (
+                        <Button variant="outline" size="sm" className="h-6 text-xs text-red-500 hover:text-red-700" onClick={() => setSegments([emptySegment()])}>
+                          <Trash2 className="h-3 w-3 mr-1" /> Clear All
+                        </Button>
+                      )}
+                      <Button variant="outline" size="sm" className="h-6 text-xs" onClick={addSegment}>
+                        <Plus className="h-3 w-3 mr-1" /> Add Segment
+                      </Button>
+                    </div>
                   </div>
                   <div className="space-y-2">
                     {segments.map((seg, i) => (
@@ -1538,7 +1508,10 @@ export default function ReceiptMileageImportPage() {
                             onValueChange={(v) => updateSegment(i, "from_id", v)} placeholder="From..." className="flex-1" triggerClassName="h-7"
                             onAddNew={() => { setNewLocTarget({ segIndex: i, field: "from_id" }); setNewLocLabel(""); setNewLocAddress(""); setNewLocType("personal") }}
                           />
-                          <span className="text-xs text-muted-foreground">{"\u2192"}</span>
+                          <Button variant="ghost" size="sm" className="h-7 w-7 p-0 flex-shrink-0" title="Swap start and end"
+                            onClick={() => setSegments((prev) => prev.map((s, j) => j === i ? { ...s, from_id: s.to_id, to_id: s.from_id, computed_km: "", distance_km: "", routeCoords: [], routeError: null } : s))}>
+                            <ArrowLeftRight className="h-3.5 w-3.5" />
+                          </Button>
                           <LocationSearch locations={locationOptions} groups={segmentLocationGroups} value={seg.to_id}
                             onValueChange={(v) => updateSegment(i, "to_id", v)} placeholder="To..." className="flex-1" triggerClassName="h-7"
                             onAddNew={() => { setNewLocTarget({ segIndex: i, field: "to_id" }); setNewLocLabel(""); setNewLocAddress(""); setNewLocType("personal") }}
@@ -1573,13 +1546,11 @@ export default function ReceiptMileageImportPage() {
                             className={`h-6 text-[11px] px-2`}
                             onClick={() => toggleDetour(i)} title="Detour: business km = route with stops − direct route"
                           >Detour</Button>
-                          {segments.length > 1 && (
-                            <Button variant="ghost" size="sm" className="h-6 px-1 text-red-500" onClick={() => removeSegment(i)}><Trash2 className="h-3 w-3" /></Button>
-                          )}
+                          <Button variant="ghost" size="sm" className="h-6 px-1 text-red-500" onClick={() => removeSegment(i)}><Trash2 className="h-3 w-3" /></Button>
                         </div>
 
-                        {/* Detour stop picker + breakdown */}
-                        {seg.isDetour && (
+                        {/* Stops + breakdown */}
+                        {(seg.isDetour || seg.detourStopIds.length > 0 || (seg.from_id && seg.to_id)) && (
                           <div className="space-y-1.5">
                             <DetourStopList
                               seg={seg}
@@ -1603,14 +1574,38 @@ export default function ReceiptMileageImportPage() {
                                 : hasStops ? "Clear existing stops first"
                                 : "Fill detour stops from timeline visits"
                               return (
-                                <Button variant="outline" size="sm" className="h-5 text-[10px] px-2 ml-5" disabled={disabled} title={title} onClick={() => autoFillDetourStops(i)}>
-                                  Auto-fill from timeline
-                                </Button>
+                                <div className="flex gap-1 ml-5">
+                                  <Button variant="outline" size="sm" className="h-5 text-[10px] px-2" disabled={disabled} title={title} onClick={() => autoFillDetourStops(i)}>
+                                    Auto-fill from timeline
+                                  </Button>
+                                  <Button variant="outline" size="sm" className="h-5 text-[10px] px-2"
+                                    disabled={seg.detourStopIds.length < 2 || !seg.from_id || !seg.to_id}
+                                    title={seg.detourStopIds.length < 2 ? "Need at least 2 stops" : !seg.from_id || !seg.to_id ? "Set both endpoints first" : "Reorder stops to minimize total route distance"}
+                                    onClick={() => {
+                                      const fromLoc = locationOptions.find((l) => l.id === seg.from_id)
+                                      const toLoc = locationOptions.find((l) => l.id === seg.to_id)
+                                      if (!fromLoc?.latitude || !toLoc?.latitude) return
+                                      const sorted = sortStopsByShortestRoute(
+                                        { latitude: fromLoc.latitude, longitude: fromLoc.longitude! },
+                                        { latitude: toLoc.latitude, longitude: toLoc.longitude! },
+                                        seg.detourStopIds, locationOptions,
+                                      )
+                                      setSegments((prev) => prev.map((s, j) => j === i ? { ...s, detourStopIds: sorted, computed_km: "", distance_km: "", routeCoords: [] } : s))
+                                    }}
+                                  >
+                                    Sort by shortest route
+                                  </Button>
+                                </div>
                               )
                             })()}
-                            {seg.directKm && seg.withStopsKm && (
+                            {seg.directKm && seg.withStopsKm && seg.isDetour && (
                               <div className="text-[11px] text-muted-foreground font-mono">
                                 Direct: {seg.directKm} km · With stops: {seg.withStopsKm} km · <span className="text-green-700 font-semibold">Business detour: {seg.distance_km} km</span>
+                              </div>
+                            )}
+                            {!seg.isDetour && seg.detourStopIds.length > 0 && seg.distance_km && (
+                              <div className="text-[11px] text-muted-foreground font-mono">
+                                Route with {seg.detourStopIds.length} stop{seg.detourStopIds.length !== 1 ? "s" : ""}: <span className="font-semibold">{seg.distance_km} km</span>
                               </div>
                             )}
                           </div>

@@ -33,6 +33,7 @@ pub fn router() -> Router<AppState> {
         .route("/uploads/{id}/reparse", post(reparse_upload))
         // Segments & Trips
         .route("/segments", get(get_segments))
+        .route("/segments/dates", get(get_segment_dates))
         .route("/segments/{id}", patch(classify_segment))
         .route("/segments/{id}/link-receipt", post(link_receipt))
         .route("/segments/rematch", post(rematch_visits))
@@ -444,6 +445,15 @@ async fn get_segments(
     } else {
         Err((StatusCode::BAD_REQUEST, "upload_id or from date is required".to_string()))
     }
+}
+
+async fn get_segment_dates(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<TravelSegmentDateSummary>>, (StatusCode, String)> {
+    queries::get_segment_dates(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 async fn classify_segment(

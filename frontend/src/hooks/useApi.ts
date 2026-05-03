@@ -436,7 +436,7 @@ export function useTravelLocations() {
 export function useCreateTravelLocation() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (data: { label: string; chain?: string; address: string; location_type: string; excluded?: boolean }) =>
+    mutationFn: (data: { label: string; chain?: string; address: string; location_type: string; excluded?: boolean; skip_geocode?: boolean }) =>
       travel.locations.create(data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["travel", "locations"] }),
   })
@@ -445,7 +445,7 @@ export function useCreateTravelLocation() {
 export function useUpdateTravelLocation() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, ...data }: { id: string; label?: string; chain?: string; address?: string; location_type?: string; excluded?: boolean }) =>
+    mutationFn: ({ id, ...data }: { id: string; label?: string; chain?: string; address?: string; location_type?: string; excluded?: boolean; skip_geocode?: boolean }) =>
       travel.locations.update(id, data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["travel", "locations"] }),
   })
@@ -532,6 +532,13 @@ export function useTravelSegmentsForDate(date: string | null) {
     queryKey: ["travel", "segments-by-date", date],
     queryFn: () => travel.segments.listByDate(date!),
     enabled: !!date,
+  })
+}
+
+export function useTravelSegmentDates() {
+  return useQuery({
+    queryKey: ["travel", "segment-dates"],
+    queryFn: () => travel.segments.dates(),
   })
 }
 

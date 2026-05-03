@@ -9,7 +9,6 @@ import {
   useReparseTravelUpload,
   useClassifySegment,
   useTripLogs,
-  useCreateTripLog,
   useUpdateTripLog,
   useDeleteTripLog,
   useReceiptLocations,
@@ -47,13 +46,10 @@ import {
   ChevronDown,
   ChevronRight,
   Trash2,
-  MapPin,
   RefreshCw,
   Car,
-  Save,
   CheckCircle,
   FileText,
-  Receipt,
   AlertTriangle,
 } from "lucide-react"
 import { MapContainer, Polyline, CircleMarker, Tooltip, useMap } from "react-leaflet"
@@ -216,7 +212,7 @@ function TripMap({ segments, receiptLocations }: { segments: TravelSegment[]; re
     const tripDate = segments[0]?.trip_date
     if (!tripDate) return []
     return receiptLocations
-      .filter((r) => r.receipt_date === tripDate && r.store_location_id != null)
+      .filter((r) => r.receipt_date === tripDate && r.store_location_id != null && r.store_latitude != null && r.store_longitude != null)
       .map((r) => ({
         pos: [r.store_latitude!, r.store_longitude!] as [number, number],
         label: `${r.vendor_name} — ${r.receipt_number} ($${parseFloat(r.total).toFixed(2)})`,
@@ -302,7 +298,6 @@ export default function TravelReportPage() {
   const [editingLogId, setEditingLogId] = useState<string | null>(null)
   const [logPurpose, setLogPurpose] = useState("")
   const [logNotes, setLogNotes] = useState("")
-  const [savingAllLogs, setSavingAllLogs] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const { data: uploads, isLoading: uploadsLoading } = useTravelUploads()
@@ -327,7 +322,6 @@ export default function TravelReportPage() {
   const deleteMutation = useDeleteTravelUpload()
   const reparseMutation = useReparseTravelUpload()
   const classifyMutation = useClassifySegment()
-  const createTripLogMutation = useCreateTripLog()
   const updateTripLogMutation = useUpdateTripLog()
   const deleteTripLogMutation = useDeleteTripLog()
 
@@ -353,12 +347,6 @@ export default function TravelReportPage() {
     }
     return map
   }, [segments])
-
-  // Auto-generate a purpose string from store visits
-  const generatePurpose = useCallback((visits: string[]) => {
-    if (visits.length === 0) return ""
-    return `Business: ${visits.join(", ")}`
-  }, [])
 
   const toggleTrip = useCallback((date: string) => {
     setExpandedTrips((prev) => {
@@ -392,26 +380,6 @@ export default function TravelReportPage() {
         if (selectedUploadId === upload.id) setSelectedUploadId("")
       },
     })
-  }
-
-  const handleSaveAllLogs = async () => {
-    if (!summary || !effectiveUploadId || savingAllLogs) return
-    const unloggedTrips = summary.trips.filter(
-      (t) => t.business_km > 0 && !tripLogsByDate.has(t.trip_date)
-    )
-    if (unloggedTrips.length === 0) return
-    setSavingAllLogs(true)
-    try {
-      for (const trip of unloggedTrips) {
-        await createTripLogMutation.mutateAsync({
-          upload_id: effectiveUploadId,
-          trip_date: trip.trip_date,
-          purpose: generatePurpose(trip.store_visits) || undefined,
-        })
-      }
-    } finally {
-      setSavingAllLogs(false)
-    }
   }
 
   if (uploadsLoading) {
@@ -582,23 +550,6 @@ export default function TravelReportPage() {
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle>Daily Trips</CardTitle>
             <div className="flex items-center gap-4">
-              {summary && (() => {
-                const unloggedCount = summary.trips.filter(
-                  (t) => t.business_km > 0 && !tripLogsByDate.has(t.trip_date)
-                ).length
-                return unloggedCount > 0 ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs"
-                    disabled={savingAllLogs}
-                    onClick={handleSaveAllLogs}
-                  >
-                    <Save className="h-3 w-3 mr-1" />
-                    {savingAllLogs ? "Saving..." : `Save All (${unloggedCount})`}
-                  </Button>
-                ) : null
-              })()}
               <label className="flex items-center gap-2 text-sm font-normal cursor-pointer">
                 <input
                   type="checkbox"
@@ -664,30 +615,7 @@ export default function TravelReportPage() {
                               </span>
                             )
                           ) : trip.business_km > 0 ? (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-6 text-xs"
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                const purpose = generatePurpose(trip.store_visits)
-                                createTripLogMutation.mutate({
-                                  upload_id: effectiveUploadId,
-                                  trip_date: trip.trip_date,
-                                  purpose: purpose || undefined,
-                                }, {
-                                  onSuccess: (newLog) => {
-                                    // Auto-expand the trip and enter edit mode
-                                    setExpandedTrips((prev) => new Set(prev).add(trip.trip_date))
-                                    setEditingLogId(newLog.id)
-                                    setLogPurpose(newLog.purpose || purpose)
-                                    setLogNotes(newLog.notes || "")
-                                  },
-                                })
-                              }}
-                            >
-                              <Save className="h-3 w-3 mr-1" /> Save
-                            </Button>
+                            <span className="text-xs text-muted-foreground italic">Not logged</span>
                           ) : null}
                         </TableCell>
                       </TableRow>

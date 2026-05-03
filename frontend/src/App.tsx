@@ -19,6 +19,7 @@ import TravelReportPage from "@/pages/TravelReportPage"
 import TravelLocationsPage from "@/pages/TravelLocationsPage"
 import MileageLogPage from "@/pages/MileageLogPage"
 import ReceiptMileageImportPage from "@/pages/ReceiptMileageImportPage"
+import MileageReportPage from "@/pages/MileageReportPage"
 import OptionsPage from "@/pages/OptionsPage"
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -189,6 +190,14 @@ export default function App() {
         element={
           <ProtectedRoute>
             <TravelLocationsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/reports/mileage"
+        element={
+          <ProtectedRoute>
+            <MileageReportPage />
           </ProtectedRoute>
         }
       />

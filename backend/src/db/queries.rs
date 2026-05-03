@@ -5290,9 +5290,10 @@ pub async fn get_travel_location_by_id(pool: &PgPool, id: Uuid) -> Result<Option
 
 pub async fn create_travel_location(pool: &PgPool, input: &CreateTravelLocation) -> Result<TravelLocation, sqlx::Error> {
     let config_key = slugify_config_key(&input.label, &input.address);
+    let geocode_status = if input.skip_geocode.unwrap_or(false) { "skipped" } else { "pending" };
     sqlx::query_as::<_, TravelLocation>(
-        r#"INSERT INTO travel_locations (config_key, label, chain, address, location_type, excluded)
-           VALUES ($1, $2, $3, $4, $5, $6)
+        r#"INSERT INTO travel_locations (config_key, label, chain, address, location_type, excluded, geocode_status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
            RETURNING *"#
     )
     .bind(&config_key)
@@ -5301,6 +5302,7 @@ pub async fn create_travel_location(pool: &PgPool, input: &CreateTravelLocation)
     .bind(&input.address)
     .bind(&input.location_type)
     .bind(input.excluded.unwrap_or(false))
+    .bind(geocode_status)
     .fetch_one(pool)
     .await
 }
@@ -5318,8 +5320,12 @@ pub async fn update_travel_location(pool: &PgPool, id: Uuid, input: &UpdateTrave
     let location_type = input.location_type.as_deref().unwrap_or(&existing.location_type);
     let excluded = input.excluded.unwrap_or(existing.excluded);
 
-    // If address changed, reset geocode
-    let (geocode_status, lat, lng) = if input.address.is_some() && input.address.as_deref() != Some(&existing.address) {
+    // If skip_geocode explicitly set, use 'skipped'; if address changed, reset to 'pending'
+    let (geocode_status, lat, lng) = if input.skip_geocode == Some(true) {
+        ("skipped", None, None)
+    } else if input.skip_geocode == Some(false) && existing.geocode_status == "skipped" {
+        ("pending", None, None)
+    } else if input.address.is_some() && input.address.as_deref() != Some(&existing.address) {
         ("pending", None, None)
     } else {
         (existing.geocode_status.as_str(), existing.latitude, existing.longitude)
@@ -5978,15 +5984,13 @@ pub async fn update_trip_log(
 
     // If segments provided, replace manual segments for this date
     if let Some(ref segments) = input.segments {
-        use chrono::Utc;
         // Delete old manual segments for this date
         sqlx::query("DELETE FROM travel_segments WHERE trip_date = $1 AND classification_reason = 'manual'")
             .bind(existing.trip_date)
             .execute(pool)
             .await?;
 
-        // Re-insert
-        let now = Utc::now();
+        // Re-insert (no timestamps — manual segments don't have real times)
         let total_km: f64 = segments.iter().map(|s| s.distance_km).sum();
         let business_km: f64 = segments.iter()
             .filter(|s| s.classification == "business")
@@ -6003,17 +6007,15 @@ pub async fn update_trip_log(
             sqlx::query(
                 r#"INSERT INTO travel_segments
                    (trip_date, segment_order, segment_type, distance_meters,
-                    start_time, end_time, from_location, to_location,
+                    from_location, to_location,
                     classification, classification_reason, route_coords,
                     is_detour, detour_stop_ids, direct_km, with_stops_km, detour_extra_km)
-                   VALUES ($1, $2, 'drive', $3, $4, $5, $6, $7, $8, 'manual', $9,
-                           $10, $11, $12, $13, $14)"#
+                   VALUES ($1, $2, 'drive', $3, $4, $5, $6, 'manual', $7,
+                           $8, $9, $10, $11, $12)"#
             )
             .bind(existing.trip_date)
             .bind(i as i32)
             .bind(seg.distance_km * 1000.0)
-            .bind(now)
-            .bind(now)
             .bind(&seg.from_location)
             .bind(&seg.to_location)
             .bind(&seg.classification)
@@ -6090,7 +6092,6 @@ pub async fn create_receipt_trip_log(
     pool: &PgPool,
     input: &CreateReceiptTripLog,
 ) -> Result<TravelTripLog, sqlx::Error> {
-    use chrono::Utc;
 
     // Compute km from the manual segments
     let total_km: f64 = input.segments.iter().map(|s| s.distance_km).sum();
@@ -6151,8 +6152,7 @@ pub async fn create_receipt_trip_log(
         .await?
     };
 
-    // Insert the manual segments
-    let now = Utc::now();
+    // Insert the manual segments (no timestamps — they don't come from timeline)
     for (i, seg) in input.segments.iter().enumerate() {
         let route_json = seg.route_coords.as_ref().map(|coords| {
             serde_json::to_value(coords).unwrap_or(serde_json::Value::Null)
@@ -6163,17 +6163,15 @@ pub async fn create_receipt_trip_log(
         sqlx::query(
             r#"INSERT INTO travel_segments
                (trip_date, segment_order, segment_type, distance_meters,
-                start_time, end_time, from_location, to_location,
+                from_location, to_location,
                 classification, classification_reason, route_coords,
                 is_detour, detour_stop_ids, direct_km, with_stops_km, detour_extra_km)
-               VALUES ($1, $2, 'drive', $3, $4, $5, $6, $7, $8, 'manual', $9,
-                       $10, $11, $12, $13, $14)"#
+               VALUES ($1, $2, 'drive', $3, $4, $5, $6, 'manual', $7,
+                       $8, $9, $10, $11, $12)"#
         )
         .bind(input.trip_date)
         .bind(i as i32)
         .bind(seg.distance_km * 1000.0) // store as meters
-        .bind(now)
-        .bind(now)
         .bind(&seg.from_location)
         .bind(&seg.to_location)
         .bind(&seg.classification)
@@ -6280,6 +6278,43 @@ pub async fn get_travel_summary(
         total_store_visits: store_visit_count,
         trips: trips_map.into_values().collect(),
     })
+}
+
+/// Returns all distinct trip_dates from travel_segments with business visit labels per date.
+pub async fn get_segment_dates(
+    pool: &PgPool,
+) -> Result<Vec<TravelSegmentDateSummary>, sqlx::Error> {
+    // Get all distinct dates
+    let dates = sqlx::query_scalar::<_, NaiveDate>(
+        "SELECT DISTINCT trip_date FROM travel_segments ORDER BY trip_date"
+    )
+    .fetch_all(pool)
+    .await?;
+
+    // Get business visit labels per date (from matched locations)
+    let visit_rows = sqlx::query_as::<_, (NaiveDate, String)>(
+        r#"SELECT DISTINCT ts.trip_date, tl.label
+           FROM travel_segments ts
+           JOIN travel_visits tv ON ts.visit_id = tv.id
+           JOIN travel_locations tl ON tv.matched_location_id = tl.id
+           WHERE ts.segment_type = 'visit'
+             AND ts.classification = 'business'
+             AND tl.location_type = 'business'
+           ORDER BY ts.trip_date, tl.label"#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    // Group visits by date
+    let mut visits_by_date = std::collections::HashMap::<NaiveDate, Vec<String>>::new();
+    for (date, label) in visit_rows {
+        visits_by_date.entry(date).or_default().push(label);
+    }
+
+    Ok(dates.into_iter().map(|date| TravelSegmentDateSummary {
+        business_visits: visits_by_date.remove(&date).unwrap_or_default(),
+        date,
+    }).collect())
 }
 
 #[cfg(test)]

@@ -1292,8 +1292,8 @@ export interface TravelSegment {
   activity_id: string | null;
   distance_meters: number | null;
   visit_id: string | null;
-  start_time: string;
-  end_time: string;
+  start_time: string | null;
+  end_time: string | null;
   from_location: string | null;
   to_location: string | null;
   classification: string;
@@ -1398,12 +1398,12 @@ export const travel = {
   locations: {
     list: () => request<TravelLocation[]>('/travel/locations'),
     get: (id: string) => request<TravelLocation>(`/travel/locations/${id}`),
-    create: (data: { label: string; chain?: string; address: string; location_type: string; excluded?: boolean }) =>
+    create: (data: { label: string; chain?: string; address: string; location_type: string; excluded?: boolean; skip_geocode?: boolean }) =>
       request<TravelLocation>('/travel/locations', {
         method: 'POST',
         body: JSON.stringify(data),
       }),
-    update: (id: string, data: { label?: string; chain?: string; address?: string; location_type?: string; excluded?: boolean }) =>
+    update: (id: string, data: { label?: string; chain?: string; address?: string; location_type?: string; excluded?: boolean; skip_geocode?: boolean }) =>
       request<TravelLocation>(`/travel/locations/${id}`, {
         method: 'PUT',
         body: JSON.stringify(data),
@@ -1472,6 +1472,7 @@ export const travel = {
         method: 'POST',
         body: JSON.stringify({ receipt_id: receiptId }),
       }),
+    dates: () => request<{ date: string; business_visits: string[] }[]>('/travel/segments/dates'),
   },
 
   // Summary

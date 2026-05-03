@@ -1,4 +1,5 @@
 import { useState, useRef } from "react"
+import { useQueryClient } from "@tanstack/react-query"
 import {
   useTravelLocations,
   useCreateTravelLocation,
@@ -34,11 +35,11 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog"
 import { MapPin, Plus, Pencil, Trash2, Globe, Check, X, AlertCircle, FileUp, Loader2 } from "lucide-react"
-import type { TravelLocation, GeocodeResponse } from "@/api"
+import { travel, type TravelLocation, type GeocodeResponse } from "@/api"
 
 function geocodeStatusBadge(status: string, error: string | null) {
   switch (status) {
-    case "geocoded":
+    case "resolved":
       return <span className="inline-flex items-center gap-1 text-xs text-green-700"><Check className="h-3 w-3" /> Geocoded</span>
     case "pending":
       return <span className="inline-flex items-center gap-1 text-xs text-amber-700"><Globe className="h-3 w-3" /> Pending</span>
@@ -48,6 +49,8 @@ function geocodeStatusBadge(status: string, error: string | null) {
           <AlertCircle className="h-3 w-3" /> Failed
         </span>
       )
+    case "skipped":
+      return <span className="inline-flex items-center gap-1 text-xs text-gray-500">Label only</span>
     default:
       return <span className="text-xs text-gray-500">{status}</span>
   }
@@ -56,10 +59,11 @@ function geocodeStatusBadge(status: string, error: string | null) {
 export default function TravelLocationsPage() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
-  const [form, setForm] = useState({ label: "", chain: "", address: "", location_type: "business" })
+  const [form, setForm] = useState({ label: "", chain: "", address: "", location_type: "business", label_only: false })
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
 
   const { data: locations, isLoading } = useTravelLocations()
+  const queryClient = useQueryClient()
   const createMutation = useCreateTravelLocation()
   const updateMutation = useUpdateTravelLocation()
   const deleteMutation = useDeleteTravelLocation()
@@ -98,7 +102,7 @@ export default function TravelLocationsPage() {
 
   const openCreate = () => {
     setEditingId(null)
-    setForm({ label: "", chain: "", address: "", location_type: "business" })
+    setForm({ label: "", chain: "", address: "", location_type: "business", label_only: false })
     setDialogOpen(true)
   }
 
@@ -109,6 +113,7 @@ export default function TravelLocationsPage() {
       chain: loc.chain || "",
       address: loc.address,
       location_type: loc.location_type,
+      label_only: loc.geocode_status === "skipped",
     })
     setDialogOpen(true)
   }
@@ -119,13 +124,21 @@ export default function TravelLocationsPage() {
       chain: form.chain || undefined,
       address: form.address,
       location_type: form.location_type,
+      skip_geocode: form.label_only,
     }
+    let savedLoc: TravelLocation
     if (editingId) {
-      await updateMutation.mutateAsync({ id: editingId, ...data })
+      savedLoc = await updateMutation.mutateAsync({ id: editingId, ...data })
     } else {
-      await createMutation.mutateAsync(data)
+      savedLoc = await createMutation.mutateAsync(data)
     }
     setDialogOpen(false)
+    // Auto-geocode if not label-only
+    if (!form.label_only && savedLoc.geocode_status === "pending") {
+      travel.locations.geocode([savedLoc.id]).then(() => {
+        queryClient.invalidateQueries({ queryKey: ["travel", "locations"] })
+      })
+    }
   }
 
   const handleDelete = (loc: TravelLocation) => {
@@ -323,7 +336,11 @@ export default function TravelLocationsPage() {
                   <Label>Type</Label>
                   <Select
                     value={form.location_type}
-                    onValueChange={(v) => setForm((f) => ({ ...f, location_type: v }))}
+                    onValueChange={(v) => setForm((f) => ({
+                      ...f,
+                      location_type: v,
+                      label_only: v === "online" ? true : f.label_only,
+                    }))}
                   >
                     <SelectTrigger>
                       <SelectValue />
@@ -331,14 +348,27 @@ export default function TravelLocationsPage() {
                     <SelectContent>
                       <SelectItem value="business">Business</SelectItem>
                       <SelectItem value="personal">Personal</SelectItem>
+                      <SelectItem value="online">Online</SelectItem>
                     </SelectContent>
                   </Select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="label_only"
+                    checked={form.label_only}
+                    onChange={(e) => setForm((f) => ({ ...f, label_only: e.target.checked }))}
+                    className="h-4 w-4 rounded border-gray-300"
+                  />
+                  <Label htmlFor="label_only" className="text-sm font-normal cursor-pointer">
+                    Label only (skip geocoding)
+                  </Label>
                 </div>
               </div>
               <div className="flex justify-end">
                 <Button
                   onClick={handleSave}
-                  disabled={!form.label || !form.address || createMutation.isPending || updateMutation.isPending}
+                  disabled={!form.label || (!form.label_only && !form.address) || createMutation.isPending || updateMutation.isPending}
                 >
                   {editingId ? "Update" : "Create"}
                 </Button>

@@ -1233,3 +1233,13 @@ CREATE TABLE IF NOT EXISTS travel_yearly_mileage (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Expand geocode_status to include 'skipped' (for label-only locations)
+ALTER TABLE travel_locations DROP CONSTRAINT IF EXISTS chk_travel_locations_geocode;
+ALTER TABLE travel_locations ADD CONSTRAINT chk_travel_locations_geocode
+  CHECK (geocode_status IN ('pending', 'resolved', 'failed', 'skipped'));
+
+-- Manual segments don't have real timestamps — allow NULL
+ALTER TABLE travel_segments ALTER COLUMN start_time DROP NOT NULL;
+ALTER TABLE travel_segments ALTER COLUMN end_time DROP NOT NULL;
+UPDATE travel_segments SET start_time = NULL, end_time = NULL WHERE classification_reason = 'manual';
