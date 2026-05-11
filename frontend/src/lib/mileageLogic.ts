@@ -159,6 +159,8 @@ export function getHighConfidenceVisits(segs: TravelSegment[]): TravelSegment[] 
 /**
  * Auto-suggest segments from timeline data.
  * Finds Personal → [business visits...] → Personal brackets.
+ * Also handles days that start with business visits before the first personal
+ * visit by inferring the origin from a later personal location (round-trip).
  * Creates a single segment per bracket with intermediate business visits as stops.
  * - If business stops exist: from=personal, to=personal, stops=business locations, isDetour=true
  * - If no business stops: from=personal, to=personal, classification=personal (just a drive)
@@ -170,6 +172,16 @@ export function suggestSegmentsFromTimeline(
   const visits = getHighConfidenceVisits(segs)
   if (visits.length < 2) return []
 
+  // If visits start with non-personal, infer origin from the first personal visit
+  // (common pattern: left Home, visited business stops, returned Home)
+  if (visits[0].classification !== "personal") {
+    const firstPersonalIdx = visits.findIndex((v) => v.classification === "personal")
+    if (firstPersonalIdx > 0) {
+      // Clone the personal visit as an implied starting point
+      visits.unshift({ ...visits[firstPersonalIdx] })
+    }
+  }
+
   const findLocId = (label: string) => locations.find((l) => l.label === label)?.id || ""
 
   const drafts: SegmentDraft[] = []
@@ -178,9 +190,10 @@ export function suggestSegmentsFromTimeline(
     if (visits[i].classification !== "personal") { i++; continue }
     const startVisit = visits[i]
 
+    // Collect non-personal visits (business or unclassified) as potential stops
     const businessStops: TravelSegment[] = []
     let j = i + 1
-    while (j < visits.length && visits[j].classification === "business") {
+    while (j < visits.length && visits[j].classification !== "personal") {
       businessStops.push(visits[j])
       j++
     }
@@ -197,9 +210,15 @@ export function suggestSegmentsFromTimeline(
       drafts.push({ ...emptySegment(fromId), to_id: toId, classification: "personal", source: "suggested" })
     } else {
       // Business detour: personal endpoints with business stops in between
-      const stopIds = businessStops
-        .map((s) => findLocId(s.visit_location_label!))
-        .filter((id) => id && id !== fromId && id !== toId)
+      const seen = new Set<string>()
+      const stopIds: string[] = []
+      for (const s of businessStops) {
+        const id = findLocId(s.visit_location_label!)
+        if (id && id !== fromId && id !== toId && !seen.has(id)) {
+          seen.add(id)
+          stopIds.push(id)
+        }
+      }
       drafts.push({
         ...emptySegment(fromId),
         to_id: toId,

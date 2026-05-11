@@ -1050,6 +1050,24 @@ pub struct TravelTripLog {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Extended trip log with segment coverage for warning detection
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TravelTripLogWithCoverage {
+    pub id: Uuid,
+    pub upload_id: Option<Uuid>,
+    pub trip_date: NaiveDate,
+    pub purpose: String,
+    pub notes: String,
+    pub total_km: f64,
+    pub business_km: f64,
+    pub status: String,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Location IDs covered by this log's segments (from/to labels resolved + detour_stop_ids)
+    pub covered_location_ids: Vec<Uuid>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct TravelYearlyMileage {
     pub year: i32,
@@ -1105,6 +1123,7 @@ pub struct CreateReceiptTripLog {
     pub trip_date: NaiveDate,
     pub purpose: Option<String>,
     pub notes: Option<String>,
+    pub status: Option<String>,
     pub segments: Vec<CreateManualSegment>,
 }
 

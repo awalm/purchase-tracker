@@ -5818,17 +5818,39 @@ pub async fn get_trip_log_by_date(pool: &PgPool, trip_date: NaiveDate) -> Result
     .await
 }
 
-pub async fn list_trip_logs(pool: &PgPool, upload_id: Option<Uuid>) -> Result<Vec<TravelTripLog>, sqlx::Error> {
+pub async fn list_trip_logs(pool: &PgPool, upload_id: Option<Uuid>) -> Result<Vec<TravelTripLogWithCoverage>, sqlx::Error> {
+    let base_query = r#"
+        SELECT t.*,
+            COALESCE(
+                (SELECT array_agg(DISTINCT loc_id) FILTER (WHERE loc_id IS NOT NULL)
+                 FROM (
+                     SELECT l1.id AS loc_id FROM travel_segments s
+                         LEFT JOIN travel_locations l1 ON l1.label = s.from_location
+                         WHERE s.trip_date = t.trip_date AND l1.id IS NOT NULL
+                     UNION ALL
+                     SELECT l2.id AS loc_id FROM travel_segments s
+                         LEFT JOIN travel_locations l2 ON l2.label = s.to_location
+                         WHERE s.trip_date = t.trip_date AND l2.id IS NOT NULL
+                     UNION ALL
+                     SELECT (stop_id::text)::uuid AS loc_id FROM travel_segments s,
+                         jsonb_array_elements_text(s.detour_stop_ids) AS stop_id
+                         WHERE s.trip_date = t.trip_date AND s.detour_stop_ids IS NOT NULL
+                 ) sub
+                ), ARRAY[]::uuid[]
+            ) AS covered_location_ids
+        FROM travel_trip_logs t
+    "#;
+
     if let Some(uid) = upload_id {
-        sqlx::query_as::<_, TravelTripLog>(
-            "SELECT * FROM travel_trip_logs WHERE upload_id = $1 ORDER BY trip_date"
+        sqlx::query_as::<_, TravelTripLogWithCoverage>(
+            &format!("{} WHERE t.upload_id = $1 ORDER BY t.trip_date", base_query)
         )
         .bind(uid)
         .fetch_all(pool)
         .await
     } else {
-        sqlx::query_as::<_, TravelTripLog>(
-            "SELECT * FROM travel_trip_logs ORDER BY trip_date"
+        sqlx::query_as::<_, TravelTripLogWithCoverage>(
+            &format!("{} ORDER BY t.trip_date", base_query)
         )
         .fetch_all(pool)
         .await
@@ -5982,16 +6004,18 @@ pub async fn update_trip_log(
     let notes = input.notes.as_deref().unwrap_or(&existing.notes);
     let status = input.status.as_deref().unwrap_or(&existing.status);
 
-    // If segments provided, replace manual segments for this date
+    // If segments provided, replace ALL drive segments for this date
     if let Some(ref segments) = input.segments {
-        // Delete old manual segments for this date
-        sqlx::query("DELETE FROM travel_segments WHERE trip_date = $1 AND classification_reason = 'manual'")
+        // Delete all existing drive segments for this date (user is source of truth now)
+        sqlx::query("DELETE FROM travel_segments WHERE trip_date = $1 AND segment_type = 'drive'")
             .bind(existing.trip_date)
             .execute(pool)
             .await?;
 
         // Re-insert (no timestamps — manual segments don't have real times)
-        let total_km: f64 = segments.iter().map(|s| s.distance_km).sum();
+        let total_km: f64 = segments.iter()
+            .filter(|s| s.classification != "excluded")
+            .map(|s| s.distance_km).sum();
         let business_km: f64 = segments.iter()
             .filter(|s| s.classification == "business")
             .map(|s| s.distance_km)
@@ -6093,8 +6117,10 @@ pub async fn create_receipt_trip_log(
     input: &CreateReceiptTripLog,
 ) -> Result<TravelTripLog, sqlx::Error> {
 
-    // Compute km from the manual segments
-    let total_km: f64 = input.segments.iter().map(|s| s.distance_km).sum();
+    // Compute km from the manual segments (excluded segments don't count)
+    let total_km: f64 = input.segments.iter()
+        .filter(|s| s.classification != "excluded")
+        .map(|s| s.distance_km).sum();
     let business_km: f64 = input.segments.iter()
         .filter(|s| s.classification == "business")
         .map(|s| s.distance_km)
@@ -6140,7 +6166,7 @@ pub async fn create_receipt_trip_log(
     } else {
         sqlx::query_as::<_, TravelTripLog>(
             r#"INSERT INTO travel_trip_logs (trip_date, purpose, notes, total_km, business_km, source, status)
-               VALUES ($1, $2, $3, $4, $5, 'receipt', 'draft')
+               VALUES ($1, $2, $3, $4, $5, 'receipt', $6)
                RETURNING *"#
         )
         .bind(input.trip_date)
@@ -6148,9 +6174,16 @@ pub async fn create_receipt_trip_log(
         .bind(input.notes.as_deref().unwrap_or(""))
         .bind(total_km)
         .bind(business_km)
+        .bind(input.status.as_deref().unwrap_or("draft"))
         .fetch_one(pool)
         .await?
     };
+
+    // Delete existing drive segments for this date before inserting new ones
+    sqlx::query("DELETE FROM travel_segments WHERE trip_date = $1 AND segment_type = 'drive'")
+        .bind(input.trip_date)
+        .execute(pool)
+        .await?;
 
     // Insert the manual segments (no timestamps — they don't come from timeline)
     for (i, seg) in input.segments.iter().enumerate() {

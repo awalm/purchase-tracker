@@ -1243,3 +1243,8 @@ ALTER TABLE travel_locations ADD CONSTRAINT chk_travel_locations_geocode
 ALTER TABLE travel_segments ALTER COLUMN start_time DROP NOT NULL;
 ALTER TABLE travel_segments ALTER COLUMN end_time DROP NOT NULL;
 UPDATE travel_segments SET start_time = NULL, end_time = NULL WHERE classification_reason = 'manual';
+
+-- Add 'excluded' classification for trips not in own vehicle
+ALTER TABLE travel_segments DROP CONSTRAINT IF EXISTS chk_travel_segments_class;
+ALTER TABLE travel_segments ADD CONSTRAINT chk_travel_segments_class
+  CHECK (classification IN ('business', 'personal', 'unclassified', 'excluded'));

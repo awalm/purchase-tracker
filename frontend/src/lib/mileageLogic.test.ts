@@ -281,6 +281,40 @@ describe("suggestSegmentsFromTimeline", () => {
     const result = suggestSegmentsFromTimeline(segs, locations)
     expect(result[0].source).toBe("suggested")
   })
+
+  it("deduplicates repeated business visits", () => {
+    const segs = [
+      makeVisit({ id: "v1", visit_location_label: "Home", classification: "personal" }),
+      makeVisit({ id: "v2", visit_location_label: "Costco", classification: "business" }),
+      makeVisit({ id: "v3", visit_location_label: "Walmart", classification: "business" }),
+      makeVisit({ id: "v4", visit_location_label: "Costco", classification: "business" }),
+      makeVisit({ id: "v5", visit_location_label: "Home", classification: "personal" }),
+    ]
+    const result = suggestSegmentsFromTimeline(segs, locations)
+    expect(result).toHaveLength(1)
+    expect(result[0].detourStopIds).toEqual(["loc-costco", "loc-walmart"])
+  })
+
+  it("infers origin when day starts with business visits (no leading personal)", () => {
+    // Real-world pattern: Home visit started previous day (UTC), so Dec 15 segments
+    // show Business, Business, Home — no leading personal visit
+    const segs = [
+      makeVisit({ id: "v1", visit_location_label: "Best Buy", classification: "business" }),
+      makeVisit({ id: "v2", visit_location_label: "Canada Computers", classification: "business" }),
+      makeVisit({ id: "v3", visit_location_label: "Home", classification: "personal" }),
+    ]
+    const locs = [
+      makeLoc("loc-home", "Home"),
+      makeLoc("loc-bestbuy", "Best Buy"),
+      makeLoc("loc-cc", "Canada Computers"),
+    ]
+    const result = suggestSegmentsFromTimeline(segs, locs)
+    expect(result).toHaveLength(1)
+    expect(result[0].from_id).toBe("loc-home")
+    expect(result[0].to_id).toBe("loc-home")
+    expect(result[0].isDetour).toBe(true)
+    expect(result[0].detourStopIds).toEqual(["loc-bestbuy", "loc-cc"])
+  })
 })
 
 // ----- findAutoFillStopIds -----

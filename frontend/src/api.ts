@@ -1360,6 +1360,7 @@ export interface TravelTripLog {
   source: string;
   created_at: string;
   updated_at: string;
+  covered_location_ids: string[];
 }
 
 export interface TravelYearlyMileage {
@@ -1497,7 +1498,7 @@ export const travel = {
         method: 'POST',
         body: JSON.stringify(data),
       }),
-    createFromReceipt: (data: { trip_date: string; purpose?: string; notes?: string; segments: CreateManualSegment[] }) =>
+    createFromReceipt: (data: { trip_date: string; purpose?: string; notes?: string; status?: string; segments: CreateManualSegment[] }) =>
       request<TripLogWithSegments>(`/travel/trip-logs/receipt`, {
         method: 'POST',
         body: JSON.stringify(data),

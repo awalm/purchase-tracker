@@ -599,7 +599,7 @@ export function useCreateTripLog() {
 export function useCreateReceiptTripLog() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (data: { trip_date: string; purpose?: string; notes?: string; segments: CreateManualSegment[] }) =>
+    mutationFn: (data: { trip_date: string; purpose?: string; notes?: string; status?: string; segments: CreateManualSegment[] }) =>
       travel.tripLogs.createFromReceipt(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })

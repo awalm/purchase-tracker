@@ -569,7 +569,7 @@ struct TripLogQuery {
 async fn list_trip_logs(
     State(state): State<AppState>,
     Query(query): Query<TripLogQuery>,
-) -> Result<Json<Vec<TravelTripLog>>, (StatusCode, String)> {
+) -> Result<Json<Vec<TravelTripLogWithCoverage>>, (StatusCode, String)> {
     queries::list_trip_logs(&state.pool, query.upload_id)
         .await
         .map(Json)

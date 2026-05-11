@@ -402,7 +402,7 @@ function RouteMap({
 // ----- Detour Stop List with Drag & Drop -----
 
 function DetourStopList({
-  seg, segIndex, locationOptions, receiptStoreLocations, homeLocationId,
+  seg, segIndex, locationOptions, receiptStoreLocations, homeLocationId, timelineSegments, allSegments,
   onAdd, onRemove, onReorder,
 }: {
   seg: SegmentDraft
@@ -410,6 +410,8 @@ function DetourStopList({
   locationOptions: TravelLocation[]
   receiptStoreLocations: TravelLocation[]
   homeLocationId?: string
+  timelineSegments?: TravelSegment[]
+  allSegments: SegmentDraft[]
   onAdd: (segIndex: number, locationId: string) => void
   onRemove: (segIndex: number, locationId: string) => void
   onReorder: (segIndex: number, newIds: string[]) => void
@@ -443,10 +445,27 @@ function DetourStopList({
   const handleDragEnd = () => { setDragIdx(null); setOverIdx(null) }
 
   const used = new Set([...seg.detourStopIds, seg.from_id, seg.to_id])
+  // All location IDs used across ALL segments (for "unused receipts" filtering)
+  const allSegLocIds = new Set(allSegments.flatMap((s) => [s.from_id, s.to_id, ...s.detourStopIds]).filter(Boolean))
   const receiptIds = new Set(receiptStoreLocations.map((l) => l.id))
+  const unusedReceipts = receiptStoreLocations.filter((l) => !allSegLocIds.has(l.id) && l.id !== homeLocationId)
+  const usedReceipts = receiptStoreLocations.filter((l) => !used.has(l.id) && allSegLocIds.has(l.id) && l.id !== homeLocationId)
+  // Timeline locations from visits on this date
+  const timelineVisitLabels = new Set(
+    (timelineSegments || [])
+      .filter((s) => s.segment_type === "visit" && s.visit_location_label && !s.visit_location_label.startsWith("Unknown"))
+      .map((s) => s.visit_location_label!)
+  )
+  const topIds = new Set([...receiptIds, homeLocationId].filter(Boolean))
+  const timelineLocs = locationOptions.filter(
+    (l) => timelineVisitLabels.has(l.label) && !used.has(l.id) && !topIds.has(l.id)
+  )
+  const groupedIds = new Set([...receiptIds, ...timelineLocs.map((l) => l.id)])
   const groups = [
-    { label: "Receipt Locations", locations: receiptStoreLocations.filter((l) => !used.has(l.id) && l.id !== homeLocationId) },
-    { label: "All Locations", locations: locationOptions.filter((l) => !used.has(l.id) && !receiptIds.has(l.id) && l.id !== homeLocationId) },
+    ...(unusedReceipts.length > 0 ? [{ label: "Unused Receipts", locations: unusedReceipts }] : []),
+    ...(usedReceipts.length > 0 ? [{ label: "Receipt Locations", locations: usedReceipts }] : []),
+    ...(timelineLocs.length > 0 ? [{ label: "Timeline Locations", locations: timelineLocs }] : []),
+    { label: "All Locations", locations: locationOptions.filter((l) => !used.has(l.id) && !groupedIds.has(l.id) && l.id !== homeLocationId) },
   ]
 
   return (
@@ -513,6 +532,8 @@ export default function ReceiptMileageImportPage() {
   const [rematching, setRematching] = useState(false)
   const [yearFilter, setYearFilter] = useState<string>("all")
   const [unsavedOnly, setUnsavedOnly] = useState(false)
+  const [hideNoVendors, setHideNoVendors] = useState(false)
+  const [warningsOnly, setWarningsOnly] = useState(false)
   const [editingYearlyKm, setEditingYearlyKm] = useState<string>("")
 
   // Snapshot of the last confirmed/saved state (for revert)
@@ -609,14 +630,28 @@ export default function ReceiptMileageImportPage() {
           log: logsByDate.get(date),
           timelineOnly: recs.length === 0,
           businessVisits,
+          hasWarning: (() => {
+            const log = logsByDate.get(date)
+            if (!log || log.status !== "confirmed") return false
+            const storeIds = new Set(recs.map((r) => r.store_location_id).filter(Boolean) as string[])
+            if (storeIds.size === 0) return false
+            const covered = new Set(log.covered_location_ids || [])
+            for (const id of storeIds) {
+              if (!covered.has(id)) return true
+            }
+            return false
+          })(),
         }
       })
   }, [receipts, effectiveFromDate, effectiveToDate, logsByDate, onlineLocation, timelineDates])
 
   const filteredDateEntries = useMemo(() => {
-    if (!unsavedOnly) return dateEntries
-    return dateEntries.filter((d) => !d.hasLog || d.log?.status === "draft")
-  }, [dateEntries, unsavedOnly])
+    let entries = dateEntries
+    if (unsavedOnly) entries = entries.filter((d) => !d.hasLog || d.log?.status === "draft")
+    if (hideNoVendors) entries = entries.filter((d) => d.vendors.length > 0 || d.businessVisits.length > 0)
+    if (warningsOnly) entries = entries.filter((d) => d.hasWarning)
+    return entries
+  }, [dateEntries, unsavedOnly, hideNoVendors, warningsOnly])
 
   const selectedDateData = useMemo(() => dateEntries.find((d) => d.date === selectedDate), [dateEntries, selectedDate])
 
@@ -677,6 +712,7 @@ export default function ReceiptMileageImportPage() {
   }, [receiptStoreLocations, locationOptions, homeLocation, segments, timelineSegments])
 
   const handleSelectDate = useCallback((date: string) => {
+    if (date === selectedDate) return // already selected, don't reset
     setSelectedDate(date)
     const data = dateEntries.find((d) => d.date === date)
     // Set default purpose from vendors; loading effect will override with log value if present
@@ -689,7 +725,7 @@ export default function ReceiptMileageImportPage() {
     setDraftLogId(null)
     savedSnapshot.current = null
     loadedLogDateRef.current = null
-  }, [dateEntries])
+  }, [dateEntries, selectedDate])
 
   // When selecting a date that has an existing log, load its data
   const loadedLogDateRef = useRef<string | null>(null)
@@ -707,13 +743,13 @@ export default function ReceiptMileageImportPage() {
       lastSavedKey.current = "loaded"
     }
 
-    // Load existing manual segments from timeline data
+    // Load existing drive segments from timeline data
     if (timelineSegments && timelineSegments.length > 0) {
-      const manualSegs = timelineSegments.filter(
-        (s) => s.classification_reason === "manual" && s.segment_type === "drive"
+      const driveSegs = timelineSegments.filter(
+        (s) => s.segment_type === "drive"
       )
-      if (manualSegs.length > 0) {
-        const drafts: SegmentDraft[] = manualSegs.map((s) => {
+      if (driveSegs.length > 0) {
+        const drafts: SegmentDraft[] = driveSegs.map((s) => {
           const fromLoc = locationOptions.find((l) => l.label === s.from_location)
           const toLoc = locationOptions.find((l) => l.label === s.to_location)
           return {
@@ -746,7 +782,7 @@ export default function ReceiptMileageImportPage() {
         const notes_ = selectedDateData.log?.notes || ""
         lastSavedKey.current = JSON.stringify({ date: selectedDate, purpose: purpose_ || undefined, notes: notes_ || undefined, segs: validSegs })
       } else {
-        // No existing manual segments — user can click "Generate from timeline" to auto-suggest
+        // No existing drive segments — user can click "Generate from timeline" to auto-suggest
         loadedLogDateRef.current = selectedDate
       }
     }
@@ -845,6 +881,17 @@ export default function ReceiptMileageImportPage() {
     const suggested = suggestSegmentsFromTimeline(timelineSegments, locationOptions)
     if (suggested.length > 0) {
       setSegments([...suggested, emptySegment()])
+      // Build purpose from business stop names
+      const stopNames = new Set<string>()
+      for (const seg of suggested) {
+        for (const stopId of seg.detourStopIds) {
+          const loc = locationOptions.find((l) => l.id === stopId)
+          if (loc) stopNames.add(loc.label)
+        }
+      }
+      if (stopNames.size > 0) {
+        setPurpose(`Business: ${[...stopNames].join(", ")}`)
+      }
     }
   }
 
@@ -992,6 +1039,8 @@ export default function ReceiptMileageImportPage() {
 
   useEffect(() => {
     if (!selectedDate || !canSave) return
+    // Don't auto-save over a confirmed log
+    if (selectedDateData?.log?.status === "confirmed" && autoSaveStatus === "idle") return
     const validSegs = buildSavePayload()
     if (validSegs.length === 0) return
     const saveKey = JSON.stringify({ date: selectedDate, purpose, notes, segs: validSegs })
@@ -1019,7 +1068,7 @@ export default function ReceiptMileageImportPage() {
     }, 1500)
 
     return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
-  }, [selectedDate, canSave, buildSavePayload, purpose, notes, draftLogId])
+  }, [selectedDate, canSave, buildSavePayload, purpose, notes, draftLogId, selectedDateData, autoSaveStatus])
 
   // "Save to Log" promotes draft → confirmed
   const handleSave = () => {
@@ -1037,8 +1086,11 @@ export default function ReceiptMileageImportPage() {
       lastSavedKey.current = saveKey
       // Snapshot the confirmed state for future reverts
       savedSnapshot.current = { segments: [...segments], purpose, notes }
-      // Reset so re-selecting this date will reload fresh data
-      loadedLogDateRef.current = null
+      // Keep loadedLogDateRef set so the load effect doesn't fire with stale cache
+      loadedLogDateRef.current = selectedDate
+      // Invalidate so next date selection gets fresh data
+      queryClient.invalidateQueries({ queryKey: ["travel", "segments-by-date", selectedDate] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })
     }
 
     if (logId) {
@@ -1066,7 +1118,10 @@ export default function ReceiptMileageImportPage() {
       setAutoSaveStatus("idle")
       lastSavedKey.current = "skipped"
       savedSnapshot.current = null
-      loadedLogDateRef.current = null
+      loadedLogDateRef.current = selectedDate
+      setSegments([emptySegment()])
+      queryClient.invalidateQueries({ queryKey: ["travel", "segments-by-date", selectedDate] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })
     }
 
     if (logId) {
@@ -1076,7 +1131,37 @@ export default function ReceiptMileageImportPage() {
       )
     } else {
       createReceiptTripLog.mutate(
-        { trip_date: selectedDate, purpose: "No trip", notes: undefined, segments: [] },
+        { trip_date: selectedDate, purpose: "No trip", notes: undefined, status: "confirmed", segments: [] },
+        { onSuccess: (result) => onDone(result.id) },
+      )
+    }
+  }
+
+  // "Exclude" saves a confirmed log marking the date as not-own-vehicle
+  const handleExclude = () => {
+    if (!selectedDate) return
+    if (autoSaveTimer.current) { clearTimeout(autoSaveTimer.current); autoSaveTimer.current = null }
+
+    const logId = draftLogId || selectedDateData?.log?.id
+    const onDone = (newId?: string) => {
+      if (newId) setDraftLogId(newId)
+      setAutoSaveStatus("idle")
+      lastSavedKey.current = "excluded"
+      savedSnapshot.current = null
+      loadedLogDateRef.current = selectedDate
+      setSegments([emptySegment()])
+      queryClient.invalidateQueries({ queryKey: ["travel", "segments-by-date", selectedDate] })
+      queryClient.invalidateQueries({ queryKey: ["travel", "trip-logs"] })
+    }
+
+    if (logId) {
+      updateTripLog.mutate(
+        { id: logId, purpose: "Excluded – not own vehicle", notes: undefined, status: "confirmed", segments: [] },
+        { onSuccess: () => onDone() },
+      )
+    } else {
+      createReceiptTripLog.mutate(
+        { trip_date: selectedDate, purpose: "Excluded – not own vehicle", notes: undefined, status: "confirmed", segments: [] },
         { onSuccess: (result) => onDone(result.id) },
       )
     }
@@ -1252,10 +1337,20 @@ export default function ReceiptMileageImportPage() {
           <CardHeader>
             <div className="flex items-center justify-between">
               <CardTitle className="text-sm">Trip Dates ({filteredDateEntries.length})</CardTitle>
-              <label className="flex items-center gap-1.5 text-xs font-normal cursor-pointer">
-                <input type="checkbox" checked={unsavedOnly} onChange={(e) => setUnsavedOnly(e.target.checked)} className="rounded" />
-                Unsaved only
-              </label>
+              <div className="flex gap-3">
+                <label className="flex items-center gap-1.5 text-xs font-normal cursor-pointer">
+                  <input type="checkbox" checked={unsavedOnly} onChange={(e) => setUnsavedOnly(e.target.checked)} className="rounded" />
+                  Unsaved only
+                </label>
+                <label className="flex items-center gap-1.5 text-xs font-normal cursor-pointer">
+                  <input type="checkbox" checked={hideNoVendors} onChange={(e) => setHideNoVendors(e.target.checked)} className="rounded" />
+                  Has vendors
+                </label>
+                <label className="flex items-center gap-1.5 text-xs font-normal cursor-pointer">
+                  <input type="checkbox" checked={warningsOnly} onChange={(e) => setWarningsOnly(e.target.checked)} className="rounded" />
+                  Warnings
+                </label>
+              </div>
             </div>
           </CardHeader>
           <CardContent className="p-0">
@@ -1263,7 +1358,7 @@ export default function ReceiptMileageImportPage() {
               <Table>
                 <TableHeader><TableRow><TableHead>Date</TableHead><TableHead>Vendors</TableHead><TableHead className="text-right">Spent</TableHead><TableHead className="w-10"></TableHead></TableRow></TableHeader>
                 <TableBody>
-                  {filteredDateEntries.map(({ date, receipts: dateReceipts, vendors, totalSpent, storeCount, hasLog, log, timelineOnly, businessVisits }) => (
+                  {filteredDateEntries.map(({ date, receipts: dateReceipts, vendors, totalSpent, storeCount, hasLog, log, timelineOnly, businessVisits, hasWarning }) => (
                     <TableRow key={date} className={`cursor-pointer hover:bg-slate-50 ${selectedDate === date ? "bg-blue-50" : ""}`} onClick={() => handleSelectDate(date)}>
                       <TableCell className="font-medium text-sm">{fmtDateWithDay(date)}</TableCell>
                       <TableCell className="text-xs text-muted-foreground truncate max-w-[180px]">
@@ -1283,8 +1378,11 @@ export default function ReceiptMileageImportPage() {
                       </TableCell>
                       <TableCell className="text-right text-sm">{totalSpent > 0 ? `$${totalSpent.toFixed(2)}` : ""}</TableCell>
                       <TableCell>
-                        {hasLog && log?.status === "confirmed" && <CheckCircle className="h-3.5 w-3.5 text-green-600" />}
-                        {hasLog && log?.status === "draft" && <div className="h-3.5 w-3.5 rounded-full bg-yellow-400 border border-yellow-500" title="Draft" />}
+                        <div className="flex items-center gap-0.5">
+                          {hasLog && log?.status === "confirmed" && <CheckCircle className="h-3.5 w-3.5 text-green-600" />}
+                          {hasLog && log?.status === "draft" && <div className="h-3.5 w-3.5 rounded-full bg-yellow-400 border border-yellow-500" title="Draft" />}
+                          {hasWarning && <span title="Receipts not accounted for in drive segments"><AlertTriangle className="h-3.5 w-3.5 text-amber-500" /></span>}
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -1322,6 +1420,9 @@ export default function ReceiptMileageImportPage() {
                   <Button size="sm" variant="outline" disabled={createReceiptTripLog.isPending || updateTripLog.isPending} onClick={handleSkip}>
                     Skip
                   </Button>
+                  <Button size="sm" variant="outline" disabled={createReceiptTripLog.isPending || updateTripLog.isPending} onClick={handleExclude}>
+                    Exclude
+                  </Button>
                   <Button size="sm" disabled={!canSave || createReceiptTripLog.isPending || updateTripLog.isPending} onClick={handleSave}>
                     <Save className="h-3.5 w-3.5 mr-1" />
                     {createReceiptTripLog.isPending || updateTripLog.isPending ? "Saving…" : "Save to Log"}
@@ -1333,12 +1434,72 @@ export default function ReceiptMileageImportPage() {
           <CardContent>
             {selectedDate && selectedDateData ? (
               <div className="space-y-4">
-                {selectedDateData.hasLog && (
-                  <div className="bg-amber-50 border border-amber-200 rounded p-2 text-sm text-amber-800 flex items-center gap-2">
-                    <AlertTriangle className="h-4 w-4 flex-shrink-0" />
-                    <span>A {selectedDateData.log?.source} log already exists. Saving will merge.</span>
-                  </div>
-                )}
+                {/* km breakdown / log state at a glance */}
+                {(() => {
+                  const logPurpose = selectedDateData.log?.purpose || ""
+                  const isSkipped = logPurpose === "No trip" && selectedDateData.log?.status === "confirmed"
+                  const isExcluded = logPurpose.startsWith("Excluded") && selectedDateData.log?.status === "confirmed"
+
+                  if (isSkipped) return (
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="font-medium text-muted-foreground">Skipped</span>
+                      <span className="text-muted-foreground">— no trip logged for this date</span>
+                    </div>
+                  )
+                  if (isExcluded) return (
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="font-medium text-muted-foreground">Excluded</span>
+                      <span className="text-muted-foreground">— not own vehicle, km not counted</span>
+                    </div>
+                  )
+
+                  if (!segments.some((s) => parseFloat(s.distance_km) > 0 || parseFloat(s.computed_km) > 0)) return null
+
+                  let business = 0, personal = 0, excluded = 0
+                  for (const s of segments) {
+                    const km = parseFloat(s.distance_km) || parseFloat(s.computed_km) || 0
+                    if (km <= 0) continue
+                    if (s.classification === "personal" || s.isDetour) {
+                      if (s.isDetour) {
+                        const extra = parseFloat(s.distance_km) || 0
+                        const direct = parseFloat(s.directKm) || 0
+                        business += extra
+                        personal += direct
+                      } else {
+                        personal += km
+                      }
+                    } else if (s.classification === "excluded") {
+                      excluded += km
+                    } else {
+                      business += km
+                    }
+                  }
+                  const total = business + personal
+                  return (
+                    <div className="flex items-center gap-3 text-xs">
+                      <span className="font-medium text-green-700">Business: {business.toFixed(1)} km</span>
+                      <span className="text-muted-foreground">Personal: {personal.toFixed(1)} km</span>
+                      {excluded > 0 && <span className="text-muted-foreground">Excluded: {excluded.toFixed(1)} km</span>}
+                      <span className="font-medium">Total: {total.toFixed(1)} km</span>
+                    </div>
+                  )
+                })()}
+                {(() => {
+                  // Don't show warning until segments are loaded from DB
+                  if (selectedDateData.hasLog && segments.length === 1 && !segments[0].from_id && !segments[0].to_id) return null
+                  const receiptsWithLoc = selectedDateData.receipts.filter((r) => r.store_location_id)
+                  if (receiptsWithLoc.length === 0) return null
+                  const allSegLocIds = new Set(segments.flatMap((s) => [s.from_id, s.to_id, ...s.detourStopIds]).filter(Boolean))
+                  const unaccounted = receiptsWithLoc.filter((r) => !allSegLocIds.has(r.store_location_id!))
+                  if (unaccounted.length === 0) return null
+                  const names = [...new Set(unaccounted.map((r) => locationOptions.find((l) => l.id === r.store_location_id)?.label || r.vendor_name))]
+                  return (
+                    <div className="bg-amber-50 border border-amber-200 rounded p-2 text-sm text-amber-800 flex items-center gap-2">
+                      <AlertTriangle className="h-4 w-4 flex-shrink-0" />
+                      <span>Receipts not in drive segments: {names.join(", ")}</span>
+                    </div>
+                  )
+                })()}
 
                 {/* Receipts */}
                 {selectedDateData.receipts.length > 0 && (
@@ -1522,7 +1683,7 @@ export default function ReceiptMileageImportPage() {
                             <input type="number" step="0.1" min="0" className="w-20 text-xs border rounded px-2 py-1 h-7" placeholder="km"
                               value={seg.distance_km} onChange={(e) => updateSegment(i, "distance_km", e.target.value)}
                               readOnly={seg.isDetour}
-                              title={seg.isDetour ? `Detour: ${seg.withStopsKm || "?"} − ${seg.directKm || "?"} = ${seg.distance_km || "?"} km` : undefined}
+                              title={seg.isDetour ? `Detour km = with stops (${seg.withStopsKm || "?"}) − direct (${seg.directKm || "?"})` : undefined}
                             />
                             <span className="text-xs text-muted-foreground">{seg.isDetour ? "detour km" : "km"}</span>
                             {seg.computing && <RotateCw className="h-3 w-3 text-muted-foreground animate-spin" />}
@@ -1539,15 +1700,21 @@ export default function ReceiptMileageImportPage() {
                               <SelectContent>
                                 <SelectItem value="business" className="text-xs">Business</SelectItem>
                                 <SelectItem value="personal" className="text-xs">Personal</SelectItem>
+                                <SelectItem value="excluded" className="text-xs">Excluded</SelectItem>
                               </SelectContent>
                             </Select>
                           )}
                           <Button variant={seg.isDetour ? "default" : "outline"} size="sm"
                             className={`h-6 text-[11px] px-2`}
-                            onClick={() => toggleDetour(i)} title="Detour: business km = route with stops − direct route"
+                            onClick={() => toggleDetour(i)} title="Detour mode: claims only the extra km added by business stops (with stops − direct)"
                           >Detour</Button>
                           <Button variant="ghost" size="sm" className="h-6 px-1 text-red-500" onClick={() => removeSegment(i)}><Trash2 className="h-3 w-3" /></Button>
                         </div>
+                        {seg.isDetour && (
+                          <div className="text-[10px] text-muted-foreground bg-muted/50 rounded px-2 py-1 -mt-1">
+                            Personal trip with business stops. Detour km contributes to business km.
+                          </div>
+                        )}
 
                         {/* Stops + breakdown */}
                         {(seg.isDetour || seg.detourStopIds.length > 0 || (seg.from_id && seg.to_id)) && (
@@ -1558,6 +1725,8 @@ export default function ReceiptMileageImportPage() {
                               locationOptions={locationOptions}
                               receiptStoreLocations={receiptStoreLocations}
                               homeLocationId={homeLocation?.id}
+                              timelineSegments={timelineSegments}
+                              allSegments={segments}
                               onAdd={addDetourStop}
                               onRemove={removeDetourStop}
                               onReorder={(segIdx, newIds) => {
@@ -1567,11 +1736,9 @@ export default function ReceiptMileageImportPage() {
                             {(() => {
                               const noTimeline = !timelineSegments || timelineSegments.length === 0
                               const missingEndpoints = !seg.from_id || !seg.to_id
-                              const hasStops = seg.detourStopIds.length > 0
-                              const disabled = noTimeline || missingEndpoints || hasStops
+                              const disabled = noTimeline || missingEndpoints
                               const title = noTimeline ? "No timeline data for this date"
                                 : missingEndpoints ? "Set both From and To locations first"
-                                : hasStops ? "Clear existing stops first"
                                 : "Fill detour stops from timeline visits"
                               return (
                                 <div className="flex gap-1 ml-5">
@@ -1598,16 +1765,34 @@ export default function ReceiptMileageImportPage() {
                                 </div>
                               )
                             })()}
-                            {seg.directKm && seg.withStopsKm && seg.isDetour && (
-                              <div className="text-[11px] text-muted-foreground font-mono">
-                                Direct: {seg.directKm} km · With stops: {seg.withStopsKm} km · <span className="text-green-700 font-semibold">Business detour: {seg.distance_km} km</span>
-                              </div>
-                            )}
-                            {!seg.isDetour && seg.detourStopIds.length > 0 && seg.distance_km && (
-                              <div className="text-[11px] text-muted-foreground font-mono">
-                                Route with {seg.detourStopIds.length} stop{seg.detourStopIds.length !== 1 ? "s" : ""}: <span className="font-semibold">{seg.distance_km} km</span>
-                              </div>
-                            )}
+                            {seg.directKm && seg.withStopsKm && seg.isDetour && (() => {
+                              const fromLabel = locationOptions.find((l) => l.id === seg.from_id)?.label || "?"
+                              const toLabel = locationOptions.find((l) => l.id === seg.to_id)?.label || "?"
+                              const stopLabels = seg.detourStopIds.map((id) => locationOptions.find((l) => l.id === id)?.label || "?")
+                              return (
+                                <div className="text-[11px] text-muted-foreground space-y-0.5 ml-1 border-l-2 border-green-300 pl-2">
+                                  <div className="font-mono">
+                                    <span className="text-muted-foreground">Direct route:</span> {fromLabel} → {toLabel} = {seg.directKm} km
+                                  </div>
+                                  <div className="font-mono">
+                                    <span className="text-muted-foreground">Actual route:</span> {fromLabel} → {stopLabels.join(" → ")} → {toLabel} = {seg.withStopsKm} km
+                                  </div>
+                                  <div className="font-mono font-semibold text-green-700">
+                                    Business detour: {seg.withStopsKm} − {seg.directKm} = {seg.distance_km} km
+                                  </div>
+                                </div>
+                              )
+                            })()}
+                            {!seg.isDetour && seg.detourStopIds.length > 0 && seg.distance_km && (() => {
+                              const fromLabel = locationOptions.find((l) => l.id === seg.from_id)?.label || "?"
+                              const toLabel = locationOptions.find((l) => l.id === seg.to_id)?.label || "?"
+                              const stopLabels = seg.detourStopIds.map((id) => locationOptions.find((l) => l.id === id)?.label || "?")
+                              return (
+                                <div className="text-[11px] text-muted-foreground ml-1 border-l-2 border-blue-300 pl-2 font-mono">
+                                  {fromLabel} → {stopLabels.join(" → ")} → {toLabel} = <span className="font-semibold">{seg.distance_km} km</span>
+                                </div>
+                              )
+                            })()}
                           </div>
                         )}
                       </div>
